@@ -12,6 +12,11 @@ services:
     #      pull_policy: always
     build:
       context: .
+      args:
+        # Low-memory hosts (<=1GB): set SKIP_TYPECHECK=true to skip `tsc --noEmit`
+        # and/or lower NODE_BUILD_MEMORY. See docs/deploy-login-troubleshooting.md.
+        SKIP_TYPECHECK: ${SKIP_TYPECHECK:-false}
+        NODE_BUILD_MEMORY: ${NODE_BUILD_MEMORY:-768}
     image: ${EASYX_IMAGE:-open-easyx:local}
     # NOTE: no `pull_policy: always` — it would re-pull a remote tag and
     # silently discard the locally built image on every `up`.

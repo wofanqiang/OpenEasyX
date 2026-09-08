@@ -11,7 +11,7 @@ image: ghcr.io/raccommode/open-easyx:latest
 pull_policy: always
 ```
 
-这两行的含义是：从**上游作者（raccommode）**的公共镜像仓库拉取官方镜像，并且**每次 `docker compose up` 都强制重新拉取**。因此：
+这两行的含义是：从**上游作者（raccommode）**&#x7684;公共镜像仓库拉取官方镜像，并且**每次 `docker compose up` 都强制重新拉取**。因此：
 
 - 你本地加的登录功能（`server/auth.ts`、`src/Login.tsx`、`src/AuthGate.tsx`）只存在于本地目录和你的 GitHub 仓库 `wofanqiang/OpenEasyX`，**从未进入容器**；
 - 更糟的是 `pull_policy: always` 会让你即使手动 build 过，下次 `up` 时又被官方镜像覆盖回去；
@@ -29,11 +29,11 @@ pull_policy: always
 curl -s -o /dev/null -w "me=%{http_code}\n" http://127.0.0.1:3210/api/auth/me
 ```
 
-| 返回 | 含义 | 处置 |
-|---|---|---|
-| **404** | 后端根本没有 `/api/auth/me` 路由 → 跑的是**旧版本/官方镜像** | 按 §3 重新部署 |
-| **401** | 后端是新版且门禁生效 → 前端产物问题（未 build / 浏览器缓存） | 按 §3.2 / §4 |
-| **200** | 已有有效会话（浏览器带 Cookie 才会） | 正常，换无痕窗口再测 |
+| 返回          | 含义                                                                 |  | 处置                 |
+| ------------- | -------------------------------------------------------------------- | - | -------------------- |
+| **404** | 后端根本没有`/api/auth/me` 路由 → 跑的是**旧版本/官方镜像** |  | 按 §3 重新部署      |
+| **401** | 后端是新版且门禁生效 → 前端产物问题（未 build / 浏览器缓存）        |  | 按 §3.2 / §4       |
+| **200** | 已有有效会话（浏览器带 Cookie 才会）                                 |  | 正常，换无痕窗口再测 |
 
 再确认容器内是否真的有登录代码：
 
@@ -108,8 +108,7 @@ npm start
 
 1. 推送代码到 `wofanqiang/OpenEasyX` 的 `main` 分支；
 2. 到仓库 **Actions** 页确认工作流跑绿；
-3. 首次推送后把包可见性改为公开（或配置 ghcr 登录）：
-   GitHub 仓库页右侧 **Packages → open-easyx → Package settings → Change visibility → Public**；
+3. 首次推送后把包可见性改为公开（或配置 ghcr 登录）：GitHub 仓库页右侧 **Packages → open-easyx → Package settings → Change visibility → Public**；
 4. VPS 上把 `compose.yaml` 切到该镜像（或直接设环境变量）：
 
 ```bash
@@ -123,6 +122,73 @@ docker compose pull && docker compose up -d
 ```
 
 之后每次更新只需：`git push` → 等 Actions → VPS 上 `docker compose pull && docker compose up -d`。
+
+---
+
+### 3.4 构建失败：`Killed` / exit code 137（内存不足）
+
+`npm run build` = `tsc --noEmit && vite build`，其中**全量类型检查 `tsc` 是最大内存消耗者**。低内存主机构建时会被内核 OOM-kill，典型输出：
+
+```
+=> ERROR [open-easyx build 6/6] RUN npm run build
+143.6 Killed
+failed to solve: process "/bin/sh -c npm run build" did not complete successfully: exit code: 137
+```
+
+先确认确实是内存问题：
+
+```bash
+free -h          # 看可用内存
+swapon --show    # 看是否已有 swap
+dmesg | tail -20 | grep -i "out of memory"   # 有 "Killed process" 即坐实
+```
+
+#### 方案 A：加 swap（最立竿见影，NAS/小内存机器首选）
+
+```bash
+fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+free -h
+```
+
+换用 swap 后构建会变慢，但能跑完。构建完可以保留 swap 供运行时使用。
+
+#### 方案 B：跳过类型检查 + 压低 Node 堆（已内置开关）
+
+镜像已支持两个构建参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `SKIP_TYPECHECK` | `false` | 设 `true` 时只跑 `vite build`，跳过 `tsc --noEmit` |
+| `NODE_BUILD_MEMORY` | `768` | V8 老生代上限(MB)，调低可让 V8 提前 GC 而非被内核杀掉 |
+
+```bash
+# 只跑 vite build（省掉最大的一块内存）
+SKIP_TYPECHECK=true docker compose build
+
+# 仍 OOM 就再压堆
+SKIP_TYPECHECK=true NODE_BUILD_MEMORY=512 docker compose build
+
+# 纯 docker 构建
+docker build --build-arg SKIP_TYPECHECK=true --build-arg NODE_BUILD_MEMORY=512 -t open-easyx:local .
+```
+
+类型检查不会因此缺失 —— 它在 CI（`.github/workflows/docker-image.yml`）以及 `npm run check` 里仍会执行。
+
+#### 方案 C：交给 GitHub Actions（根治，小内存机器推荐）
+
+VPS 完全不参与构建，只负责 pull：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+前提是代码已推送到 `wofanqiang/OpenEasyX` 的 `main`，且 Actions 已构建出 `ghcr.io/wofanqiang/open-easyx:latest`（首次需到仓库 Packages 里把包可见性改为 Public）。
+
+> 提示：完整镜像还会安装 chromium 与 CPU 版 torch，构建时间长且占用磁盘。若不需要字幕转写与浏览器登录，这也是改用 GitHub 构建而非本地构建的理由。
 
 ---
 

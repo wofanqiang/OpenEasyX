@@ -1,9 +1,17 @@
 FROM node:24-bookworm-slim AS build
+# Build-time knobs for low-memory hosts (these do not leak into the runtime stage).
+#   NODE_BUILD_MEMORY  V8 old-space cap (MB). Lowering it makes V8 collect earlier
+#                      instead of growing until the kernel OOM-kills the build.
+#   SKIP_TYPECHECK     Skip `tsc --noEmit`, the single largest memory consumer.
+#                      Type checking still runs in CI (.github/workflows).
+ARG NODE_BUILD_MEMORY=768
+ARG SKIP_TYPECHECK=false
+ENV NODE_OPTIONS="--max-old-space-size=${NODE_BUILD_MEMORY}"
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
-RUN npm run build
+RUN if [ "$SKIP_TYPECHECK" = "true" ]; then npx vite build; else npm run build; fi
 
 FROM node:24-bookworm-slim
 ARG APP_VERSION=dev
