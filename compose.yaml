@@ -1,7 +1,20 @@
 services:
   open-easyx:
-    image: ghcr.io/raccommode/open-easyx:latest
-    pull_policy: always
+    # Build from source so local changes (single-account login gate, download
+    # stability, recording/playback tuning) are actually included.
+    #
+    # Alternatives:
+    #  * Upstream official image (NO login gate):
+    #      image: ghcr.io/raccommode/open-easyx:latest
+    #      pull_policy: always
+    #  * Pre-built image from your own registry (see .github/workflows/docker-image.yml):
+    #      image: ghcr.io/wofanqiang/open-easyx:latest
+    #      pull_policy: always
+    build:
+      context: .
+    image: ${EASYX_IMAGE:-open-easyx:local}
+    # NOTE: no `pull_policy: always` — it would re-pull a remote tag and
+    # silently discard the locally built image on every `up`.
     container_name: open-easyx
     restart: unless-stopped
     ports:
