@@ -263,7 +263,11 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
   const [search, setSearch] = useState(preset.query ?? ""); const [providerId, setProviderId] = useState(preset.providerId ?? "");
   const [gender, setGender] = useState<LiveCamPreset["gender"]>(preset.gender ?? ""); const [favoritesOnly, setFavoritesOnly] = useState(Boolean(preset.favoritesOnly)); const [page, setPage] = useState(preset.page ?? 1);
   const [favorites, setFavorites] = useState<LiveCamFavorite[]>([]);
-  const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
+  const [loading, setLoading] = useState(true); const [refreshing, setRefreshing] = useState(false); const [refresh, setRefresh] = useState(0);
+  const resultRef = useRef<LiveCamResult | null>(null);
+  const filtersKeyRef = useRef<string | null>(null);
+  const pagesFloor = useRef(1); // Keep the highest page count seen for the current filter set so pagination never shrinks mid-refresh.
+  const applyResult = (value: LiveCamResult | null) => { resultRef.current = value; setResult(value); };
   const params = useMemo(() => new URLSearchParams({ page: String(page), pageSize: "24", search, providerId, gender: gender ?? "", favoritesOnly: favoritesOnly ? "1" : "" }), [page, search, providerId, gender, favoritesOnly]);
   useEffect(() => {
     const syncFromLocation = () => {
@@ -281,28 +285,49 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
     return () => window.removeEventListener("easyx:live-favorites", loadFavorites);
   }, []);
   useEffect(() => {
-    const controller = new AbortController(); let events: EventSource | undefined; let complete = false; const timer = window.setTimeout(() => {
-      setLoading(true); setResult(null);
-      const fallback = () => void api<LiveCamResult>(`/api/live-cams?${params}`, { signal: controller.signal }).then(setResult).catch((reason) => {
-        if (reason instanceof DOMException && reason.name === "AbortError") return;
-        setResult({ available: false, reason: reason instanceof Error ? reason.message : String(reason), items: [], total: 0, page, pageSize: 24, pages: 1, providers: [] });
-      }).finally(() => setLoading(false));
+    const filtersKey = `${search}\u0000${providerId}\u0000${gender ?? ""}\u0000${favoritesOnly ? "1" : "0"}`;
+    const filtersChanged = filtersKeyRef.current !== filtersKey;
+    filtersKeyRef.current = filtersKey;
+    if (filtersChanged) pagesFloor.current = 1;
+    // Soft path (auto-refresh or page change): keep the current grid visible and keep pagination usable.
+    // Hard path (filter change or first load): show the loading state.
+    const soft = !filtersChanged && resultRef.current !== null;
+    if (soft) setRefreshing(true); else { setLoading(true); applyResult(null); }
+    const controller = new AbortController(); let events: EventSource | undefined; let complete = false; let gotSnapshot = false; let guard = 0;
+    const finalize = () => { window.clearTimeout(guard); events?.close(); setLoading(false); setRefreshing(false); };
+    const fallback = () => {
+      const abort = new AbortController(); const timeout = window.setTimeout(() => abort.abort(), 20_000);
+      void api<LiveCamResult>(`/api/live-cams?${params}`, { signal: abort.signal }).then((value) => {
+        if (controller.signal.aborted) return;
+        pagesFloor.current = Math.max(pagesFloor.current, value.pages);
+        applyResult(value);
+      }).catch((reason) => {
+        if (controller.signal.aborted || (reason instanceof DOMException && reason.name === "AbortError")) return;
+        applyResult({ available: false, reason: reason instanceof Error ? reason.message : String(reason), items: [], total: 0, page, pageSize: 24, pages: 1, providers: [] });
+      }).finally(() => { window.clearTimeout(timeout); finalize(); });
+    };
+    const timer = window.setTimeout(() => {
       if (!("EventSource" in window)) { fallback(); return; }
       events = new EventSource(`/api/live-cams/events?${params}`);
       events.onmessage = (event) => {
         const next = JSON.parse(event.data) as Omit<LiveCamResult, "available">;
-        setResult({ available: true, ...next });
-        if (next.complete) { complete = true; setLoading(false); events?.close(); }
+        gotSnapshot = true; pagesFloor.current = Math.max(pagesFloor.current, next.pages);
+        applyResult({ available: true, ...next });
+        if (next.complete) { complete = true; finalize(); }
       };
-      events.onerror = () => { events?.close(); if (!complete) fallback(); };
+      // Deadlock guards: a hung provider means `complete` never arrives, which used to leave the
+      // pagination (and Refresh) disabled forever. If we already have data, use it; otherwise fall
+      // back to the one-shot REST endpoint (which itself has a 20s timeout).
+      events.onerror = () => { events?.close(); if (complete) return; if (gotSnapshot) finalize(); else fallback(); };
+      guard = window.setTimeout(() => { events?.close(); if (complete) return; if (gotSnapshot) finalize(); else fallback(); }, 30_000);
     }, 180);
-    return () => { window.clearTimeout(timer); controller.abort(); events?.close(); };
+    return () => { window.clearTimeout(timer); window.clearTimeout(guard); controller.abort(); events?.close(); };
   }, [params, refresh]);
   useEffect(() => {
-    if (loading) return;
+    if (loading || refreshing) return;
     const timer = window.setInterval(() => { if (!document.hidden) setRefresh((value) => value + 1); }, 30_000);
     return () => window.clearInterval(timer);
-  }, [loading]);
+  }, [loading, refreshing]);
   const reset = (action: () => void) => { action(); setPage(1); };
   const providers = result?.providers ?? []; const allCount = providers.filter((provider) => provider.ok && !provider.pending).reduce((sum, provider) => sum + provider.count, 0);
   const loadedProviders = providers.filter((provider) => !provider.pending).length;
@@ -310,7 +335,7 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
   const offlineFavorites = favoritesOnly ? result?.items.filter((cam) => cam.online === false) ?? [] : [];
   const camGrid = (items: LiveCam[]) => <div className="live-grid">{items.map((cam) => <LiveCamCard cam={cam} open={open} key={`${cam.providerId}:${cam.id}`}/>)}</div>;
   return <section className="live-page">
-    <div className="library-intro live-intro"><div><p>LIVE NOW</p><h2>Live Cam</h2><span>Public live rooms aggregated by your installed Open EasyX source plugins</span></div><button className="quiet" onClick={() => setRefresh((value) => value + 1)} disabled={loading}><RefreshCw className={loading ? "spin" : ""}/>Refresh</button></div>
+    <div className="library-intro live-intro"><div><p>LIVE NOW</p><h2>Live Cam</h2><span>Public live rooms aggregated by your installed Open EasyX source plugins</span></div><button className="quiet" onClick={() => setRefresh((value) => value + 1)}><RefreshCw className={loading || refreshing ? "spin" : ""}/>Refresh</button></div>
     {result?.available !== false && <div className="live-filters">
       <label><Search/><input ref={searchInput} defaultValue={search} onChange={(event) => { const value = event.currentTarget.value; window.clearTimeout(searchTimer.current); searchTimer.current = window.setTimeout(() => { setSearch(value); setPage(1); }, 300); }} placeholder="Search live cams or tags…"/></label>
       <label><Radio/><select aria-label="Filter live provider" value={providerId} onChange={(event) => reset(() => setProviderId(event.target.value))}><option value="">All live sources ({allCount.toLocaleString()}{loading ? "+" : ""})</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name} ({provider.pending ? "loading…" : provider.count.toLocaleString()})</option>)}</select></label>
@@ -320,9 +345,11 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
       : result?.available === false ? <LiveCamUnavailable reason={result.reason ?? "No live-cam provider is available in Open EasyX."}/>
       : result && !result.providers.length ? <div className="live-unavailable compact"><span><Radio/></span><h2>No live-cam plugin installed</h2><small>Install a live provider such as Chaturbate Live from Plugins. It will appear here automatically.</small></div>
       : result?.items.length ? <>
-        <div className="live-summary"><b>{result.total.toLocaleString()}{loading ? "+" : ""} {favoritesOnly ? (result.total === 1 ? "favorite creator" : "favorite creators") : (result.total === 1 ? "live cam" : "live cams")}</b><span>{loading ? `Loading sources ${loadedProviders}/${result.providers.length}` : favoritesOnly ? `${onlineFavorites.length} live on this page` : `${result.providers.filter((provider) => provider.ok && provider.count > 0).length} active sources`}</span></div>
+        <div className="live-summary"><b>{result.total.toLocaleString()}{loading || refreshing ? "+" : ""} {favoritesOnly ? (result.total === 1 ? "favorite creator" : "favorite creators") : (result.total === 1 ? "live cam" : "live cams")}</b><span>{loading || refreshing ? `Loading sources ${loadedProviders}/${result.providers.length}` : favoritesOnly ? `${onlineFavorites.length} live on this page` : `${result.providers.filter((provider) => provider.ok && provider.count > 0).length} active sources`}</span></div>
         {favoritesOnly ? <div className="favorite-live-sections">{onlineFavorites.length > 0 && <section><h3><i/>Live now</h3>{camGrid(onlineFavorites)}</section>}{offlineFavorites.length > 0 && <section className="offline"><h3><i/>Offline</h3>{camGrid(offlineFavorites)}</section>}</div> : camGrid(result.items)}
-        {result.pages > 1 && <div className="pagination"><button disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {result.pages}</span><button disabled={page >= result.pages || loading} onClick={() => setPage(page + 1)}>Next</button></div>}
+        {/* Pagination is driven by page bounds only. Tying it to `loading` used to grey out Next for the
+            whole time a slow provider kept the SSE stream open, so users saw the bar but could not click. */}
+        {(() => { const pages = Math.max(result.pages, pagesFloor.current); return pages > 1 ? <div className="pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {pages}</span><button disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div> : null; })()}
       </> : loading && result ? <div className="loading"><LoaderCircle className="spin"/>Loading sources {loadedProviders}/{result.providers.length}… {result.total.toLocaleString()} live cams found</div>
       : <div className="live-unavailable compact"><span>{favoritesOnly ? <Star/> : <Radio/>}</span><h2>{favoritesOnly ? (favorites.length ? "Your favorite creators are offline" : "No favorite creators yet") : "No public cams are live"}</h2><small>{favoritesOnly ? (favorites.length ? "They will appear here automatically when they go live again." : "Open a live stream and select Favorite creator to add it here.") : "Try another source or filter. Installed providers are refreshed every 30 seconds."}</small>{result?.providers.filter((provider) => !provider.ok).map((provider) => <p key={provider.id}>{provider.name}: {provider.error}</p>)}</div>}
   </section>;

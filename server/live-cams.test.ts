@@ -7,7 +7,7 @@ import { LiveCamService } from "./live-cams.js";
 import { PluginManager } from "./plugin-manager.js";
 
 const temporaryDirectories: string[] = [];
-afterEach(() => { for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
+afterEach(() => { for (const directory of temporaryDirectories.splice(0)) { try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* Windows occasionally holds the WAL/db handle; cleanup is best-effort. */ } } });
 
 async function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-live-cams-")); temporaryDirectories.push(root);
@@ -30,6 +30,46 @@ describe("Open EasyX live cams", () => {
     await expect(service.list({ page: 1, pageSize: 24 })).resolves.toMatchObject({
       total: 1, items: [{ username: "alice", providerId: "test.live", providerName: "Test Live", viewers: 25 }], providers: [{ id: "test.live", ok: true }],
     });
+  });
+
+  it("keeps pages disjoint when live viewer counts reshuffle between requests", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-live-pages-")); temporaryDirectories.push(root);
+    const pluginRoot = path.join(root, "plugins");
+    fs.mkdirSync(path.join(pluginRoot, "live"), { recursive: true });
+    fs.mkdirSync(path.join(pluginRoot, "live2"), { recursive: true });
+    fs.writeFileSync(path.join(pluginRoot, "live", "index.mjs"), `export default { manifest: { id: "test.live", name: "Test Live", version: "1", description: "Test", author: "Test", capabilities: ["live-cam"], sourceUrlPatterns: ["https://test.live/*"] }, listLiveCams: async () => ({ cams: [], total: 0, page: 1, pageSize: 24, pages: 1 }), resolveLiveStream: async () => ({ url: "https://cdn.test/master.m3u8", headers: {} }) };`);
+    fs.writeFileSync(path.join(pluginRoot, "live2", "index.mjs"), `export default { manifest: { id: "test.live2", name: "Test Live 2", version: "1", description: "Test", author: "Test", capabilities: ["live-cam"], sourceUrlPatterns: ["https://test.live2/*"] }, listLiveCams: async () => ({ cams: [], total: 0, page: 1, pageSize: 24, pages: 1 }), resolveLiveStream: async () => ({ url: "https://cdn.test/master.m3u8", headers: {} }) };`);
+    const database = new Database(path.join(root, "data"));
+    const plugins = new PluginManager(database, [pluginRoot]); await plugins.load();
+    plugins.install("test.live"); plugins.install("test.live2");
+    const service = new LiveCamService(database, plugins);
+
+    // When `p1Hot` is true provider 1 dominates the viewer leaderboard; when false the
+    // roles swap. The old global sort keyed pages on live `viewers`, so flipping it between
+    // requests pushed the same cams onto two pages. Pages must stay disjoint regardless.
+    let p1Hot = true;
+    const makeList = (prefix: string, host: string, hot: boolean) => async (_context: unknown, query: { page: number; pageSize: number }) => {
+      const cams = Array.from({ length: 12 }, (_, index) => {
+        const username = `${prefix}${String(index + 1).padStart(2, "0")}`;
+        const viewers = hot ? 100 - index : 12 - index;
+        return { id: username, username, pageUrl: `https://${host}/${username}`, viewers };
+      });
+      return { cams, total: cams.length, page: query.page, pageSize: query.pageSize, pages: 1 };
+    };
+    plugins.get("test.live").listLiveCams = makeList("u", "test.live", p1Hot);
+    plugins.get("test.live2").listLiveCams = makeList("v", "test.live2", !p1Hot);
+
+    const pageSize = 12;
+    p1Hot = true;
+    const page1 = (await service.list({ page: 1, pageSize })).items.map((cam) => cam.username);
+    p1Hot = false;
+    plugins.get("test.live").listLiveCams = makeList("u", "test.live", p1Hot);
+    plugins.get("test.live2").listLiveCams = makeList("v", "test.live2", !p1Hot);
+    const page2 = (await service.list({ page: 2, pageSize })).items.map((cam) => cam.username);
+
+    const overlap = (left: string[], right: string[]) => left.filter((value) => right.includes(value));
+    expect(overlap(page1, page2)).toEqual([]);
+    expect(new Set([...page1, ...page2]).size).toBe(24);
   });
 
   it("persists favorite creators and lists only favorites that are currently online", async () => {
@@ -291,7 +331,13 @@ describe("Open EasyX live cams", () => {
     const page = await service.list({ page: 3, pageSize: 24 });
     expect(page).toMatchObject({ total: 125, page: 3, pages: 6, providers: [{ id: "test.live", count: 125 }] });
     expect(page.items).toHaveLength(24);
-    expect(page.items[0]).toMatchObject({ username: "cam-49" });
+    // Pagination is by a stable identity order, so adjacent windows never overlap even
+    // though the live viewer leaderboard reshuffles between requests.
+    const page1 = await service.list({ page: 1, pageSize: 24 });
+    expect(page1.items).toHaveLength(24);
+    const overlap = page1.items.filter((cam) => page.items.some((other) => other.username === cam.username));
+    expect(overlap).toEqual([]);
+    expect(new Set(page.items.map((cam) => cam.username)).size).toBe(24);
     await expect(service.list({ page: 1, pageSize: 24, search: "cam-12" })).resolves.toMatchObject({
       total: 7, providers: [{ id: "test.live", count: 7 }],
     });

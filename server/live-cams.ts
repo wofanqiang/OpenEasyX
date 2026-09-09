@@ -1,6 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { Readable } from "node:stream";
 import type { FastifyReply } from "fastify";
 import type { LiveCam, LiveCamFavoriteSnapshot, LiveCamQuery, LiveStream } from "../packages/plugin-sdk/index.js";
 import type { Database, LiveCamFavorite, Performer, Source } from "./database.js";
@@ -20,8 +19,35 @@ type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>
 type ProviderResult = { items: PublicLiveCam[]; total: number; status: LiveCamProviderStatus };
 type LiveCamListQuery = LiveCamQuery & { providerId?: string; favoritesOnly?: boolean };
 
+// Every provider is aggregated into one globally-ordered list. We request the SAME generous
+// window from each provider on every page so the universe of cams does not change with the
+// page number. The old code grew the request with `query.page * query.pageSize`, so a later
+// page built its identity-sorted list from a larger, different set of cams and its window
+// overlapped an earlier page. A fixed cap keeps the windows disjoint; catalogs larger than
+// the cap simply stop paginating past it (rare for live-cam rooms and far better than dupes).
+const AGGREGATE_PREVIEW_LIMIT = 200;
+
 function text(value: unknown): string | undefined { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
 function whole(value: unknown): number { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0; }
+// Compare usernames so that embedded numbers sort numerically (cam-2 < cam-10) instead of
+// lexicographically. Used for the stable global pagination key so pages read in a natural order.
+function naturalCompare(left: string, right: string): number {
+  const chunks = (value: string): string[] => value.toLowerCase().match(/(\d+|\D+)/g) ?? [value.toLowerCase()];
+  const leftChunks = chunks(left);
+  const rightChunks = chunks(right);
+  for (let index = 0; index < Math.max(leftChunks.length, rightChunks.length); index++) {
+    const leftChunk = leftChunks[index] ?? "";
+    const rightChunk = rightChunks[index] ?? "";
+    const leftNumber = Number(leftChunk);
+    const rightNumber = Number(rightChunk);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+      if (leftNumber !== rightNumber) return leftNumber - rightNumber;
+    } else if (leftChunk !== rightChunk) {
+      return leftChunk < rightChunk ? -1 : 1;
+    }
+  }
+  return 0;
+}
 function usernameFromUrl(value: string): string {
   try { return new URL(value).pathname.split("/").filter(Boolean).at(-1)?.replace(/^@/, "") || "live"; }
   catch { return "live"; }
@@ -186,8 +212,13 @@ export class LiveCamService {
     const providerResults = query.providerId ? (selected ? [selected] : []) : [...results.values()];
     const unique = new Map<string, PublicLiveCam>();
     for (const cam of providerResults.flatMap((result) => result.items)) unique.set(`${cam.providerId}:${cam.username.toLowerCase()}`, cam);
-    let ranked = [...unique.values()].sort((left, right) => whole(right.viewers) - whole(left.viewers) || left.username.localeCompare(right.username));
-    if (!query.providerId) ranked = ranked.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
+    // Paginate by a STABLE identity order (provider + username). Viewer counts are live
+    // and reshuffle the list between requests and streaming snapshots, which used to push
+    // the same cam onto two pages. Within a returned page we still surface the most-watched
+    // cams first for display.
+    const ordered = [...unique.values()].sort((left, right) => left.providerId.localeCompare(right.providerId) || naturalCompare(left.username, right.username));
+    let ranked = query.providerId ? ordered : ordered.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
+    ranked = [...ranked].sort((left, right) => whole(right.viewers) - whole(left.viewers) || left.username.localeCompare(right.username));
     const total = providerResults.reduce((sum, result) => sum + result.total, 0);
     const providers = entries.map((entry) => results.get(entry.manifest.id)?.status ?? {
       id: entry.manifest.id, name: entry.manifest.name, ok: true, count: 0, pending: true,
@@ -200,7 +231,7 @@ export class LiveCamService {
 
   async *stream(query: LiveCamListQuery, signal?: AbortSignal): AsyncGenerator<LiveCamResult> {
     const entries = this.livePlugins();
-    const requestedItems = query.page * query.pageSize;
+    const requestedItems = AGGREGATE_PREVIEW_LIMIT;
     const results = new Map<string, ProviderResult>();
     const pending = new Map<string, Promise<{ id: string; result: ProviderResult }>>();
     for (const entry of entries) {
@@ -487,9 +518,6 @@ export class LiveCamService {
     for (const key of ["_HLS_msn", "_HLS_part", "_HLS_skip"]) {
       const value = text(query[key]); if (value) sourceUrl.searchParams.set(key, value);
     }
-    const cacheKey = this.proxyCacheKey(sourceUrl.toString(), range, entry.headers);
-    const cached = this.readProxyCache(cacheKey);
-    if (cached) return reply.status(200).type(cached.contentType).header("cache-control", "no-store").send(cached.buffer);
     let response: Response;
     try { response = await this.fetchUpstream(sourceUrl, entry.headers, range); }
     catch (error) {
@@ -497,45 +525,34 @@ export class LiveCamService {
     }
     if (!response.ok) return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
     const contentType = response.headers.get("content-type") ?? "application/octet-stream";
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const playlist = contentType.includes("mpegurl") || buffer.subarray(0, 7).toString() === "#EXTM3U";
-    if (!playlist) this.writeProxyCache(cacheKey, buffer, contentType);
-    reply.status(response.status).type(playlist ? "application/vnd.apple.mpegurl" : contentType).header("cache-control", "no-store");
-    const contentRange = response.headers.get("content-range"); const acceptRanges = response.headers.get("accept-ranges");
-    if (contentRange) reply.header("content-range", contentRange); if (acceptRanges) reply.header("accept-ranges", acceptRanges);
-    return reply.send(playlist ? this.rewritePlaylist(buffer.toString("utf8"), response.url, entry.headers) : buffer);
-  }
-
-  private proxyCacheKey(url: string, range: string | undefined, headers: Record<string, string>): string {
-    return createHash("sha256").update(`${url}|${range ?? ""}|${JSON.stringify(Object.entries(headers).sort())}`).digest("hex").slice(0, 32);
-  }
-
-  private readProxyCache(key: string): { buffer: Buffer; contentType: string } | undefined {
-    if (!this.cacheDir) return undefined;
-    try {
-      const dataPath = path.join(this.cacheDir, `${key}.bin`);
-      const metaPath = path.join(this.cacheDir, `${key}.ct`);
-      const stat = fs.statSync(dataPath);
-      if (Date.now() - stat.mtimeMs > 5 * 60_000) { fs.rmSync(dataPath, { force: true }); fs.rmSync(metaPath, { force: true }); return undefined; }
-      return { buffer: fs.readFileSync(dataPath), contentType: fs.readFileSync(metaPath, "utf8") || "application/octet-stream" };
-    } catch { return undefined; }
-  }
-
-  private writeProxyCache(key: string, buffer: Buffer, contentType: string): void {
-    if (!this.cacheDir) return;
-    try {
-      if (!fs.existsSync(this.cacheDir)) fs.mkdirSync(this.cacheDir, { recursive: true });
-      fs.writeFileSync(path.join(this.cacheDir, `${key}.bin`), buffer, { mode: 0o600 });
-      fs.writeFileSync(path.join(this.cacheDir, `${key}.ct`), contentType, { mode: 0o600 });
-      const entries = fs.readdirSync(this.cacheDir).filter((name) => name.endsWith(".bin")).map((name) => ({ name, mtime: fs.statSync(path.join(this.cacheDir!, name)).mtimeMs }));
-      const cap = 500;
-      if (entries.length > cap) {
-        for (const stale of entries.sort((a, b) => a.mtime - b.mtime).slice(0, entries.length - cap)) {
-          fs.rmSync(path.join(this.cacheDir!, stale.name), { force: true });
-          fs.rmSync(path.join(this.cacheDir!, `${stale.name.slice(0, -4)}.ct`), { force: true });
-        }
-      }
-    } catch { /* Disk cache is best-effort; never blocks the proxy. */ }
+    const contentRange = response.headers.get("content-range");
+    const acceptRanges = response.headers.get("accept-ranges");
+    const passthroughHeaders = () => {
+      reply.header("cache-control", "no-store");
+      if (contentRange) reply.header("content-range", contentRange);
+      if (acceptRanges) reply.header("accept-ranges", acceptRanges);
+    };
+    // Playlists are tiny and must be rewritten so every nested URL points back
+    // through this proxy. Buffering the whole body here is cheap and safe.
+    if (contentType.includes("mpegurl")) {
+      const playlist = Buffer.from(await response.arrayBuffer()).toString("utf8");
+      passthroughHeaders();
+      return reply.status(response.status)
+        .type("application/vnd.apple.mpegurl")
+        .send(this.rewritePlaylist(playlist, response.url, entry.headers));
+    }
+    // Media segments are opaque binary that do not need rewriting. Stream them
+    // straight to the client with zero buffering and zero disk writes so playback
+    // stays real-time instead of waiting for each segment to fully download on the
+    // server first (the old arrayBuffer() + writeProxyCache path caused stutter).
+    if (!response.body) {
+      const fallback = Buffer.from(await response.arrayBuffer());
+      passthroughHeaders();
+      return reply.status(response.status).type(contentType).send(fallback);
+    }
+    const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
+    passthroughHeaders();
+    return reply.status(response.status).type(contentType).send(nodeStream);
   }
 
   private async fetchUpstream(url: URL, headers: Record<string, string>, range: string | undefined): Promise<Response> {

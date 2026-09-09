@@ -1,0 +1,347 @@
+diff --git a/server/live-cams.test.ts b/server/live-cams.test.ts
+index 68dd3f2..c42ce43 100644
+--- a/server/live-cams.test.ts
++++ b/server/live-cams.test.ts
+@@ -7,7 +7,7 @@ import { LiveCamService } from "./live-cams.js";
+ import { PluginManager } from "./plugin-manager.js";
+ 
+ const temporaryDirectories: string[] = [];
+-afterEach(() => { for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
++afterEach(() => { for (const directory of temporaryDirectories.splice(0)) { try { fs.rmSync(directory, { recursive: true, force: true }); } catch { /* Windows occasionally holds the WAL/db handle; cleanup is best-effort. */ } } });
+ 
+ async function fixture() {
+   const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-live-cams-")); temporaryDirectories.push(root);
+@@ -32,6 +32,46 @@ describe("Open EasyX live cams", () => {
+     });
+   });
+ 
++  it("keeps pages disjoint when live viewer counts reshuffle between requests", async () => {
++    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-live-pages-")); temporaryDirectories.push(root);
++    const pluginRoot = path.join(root, "plugins");
++    fs.mkdirSync(path.join(pluginRoot, "live"), { recursive: true });
++    fs.mkdirSync(path.join(pluginRoot, "live2"), { recursive: true });
++    fs.writeFileSync(path.join(pluginRoot, "live", "index.mjs"), `export default { manifest: { id: "test.live", name: "Test Live", version: "1", description: "Test", author: "Test", capabilities: ["live-cam"], sourceUrlPatterns: ["https://test.live/*"] }, listLiveCams: async () => ({ cams: [], total: 0, page: 1, pageSize: 24, pages: 1 }), resolveLiveStream: async () => ({ url: "https://cdn.test/master.m3u8", headers: {} }) };`);
++    fs.writeFileSync(path.join(pluginRoot, "live2", "index.mjs"), `export default { manifest: { id: "test.live2", name: "Test Live 2", version: "1", description: "Test", author: "Test", capabilities: ["live-cam"], sourceUrlPatterns: ["https://test.live2/*"] }, listLiveCams: async () => ({ cams: [], total: 0, page: 1, pageSize: 24, pages: 1 }), resolveLiveStream: async () => ({ url: "https://cdn.test/master.m3u8", headers: {} }) };`);
++    const database = new Database(path.join(root, "data"));
++    const plugins = new PluginManager(database, [pluginRoot]); await plugins.load();
++    plugins.install("test.live"); plugins.install("test.live2");
++    const service = new LiveCamService(database, plugins);
++
++    // When `p1Hot` is true provider 1 dominates the viewer leaderboard; when false the
++    // roles swap. The old global sort keyed pages on live `viewers`, so flipping it between
++    // requests pushed the same cams onto two pages. Pages must stay disjoint regardless.
++    let p1Hot = true;
++    const makeList = (prefix: string, host: string, hot: boolean) => async (_context: unknown, query: { page: number; pageSize: number }) => {
++      const cams = Array.from({ length: 12 }, (_, index) => {
++        const username = `${prefix}${String(index + 1).padStart(2, "0")}`;
++        const viewers = hot ? 100 - index : 12 - index;
++        return { id: username, username, pageUrl: `https://${host}/${username}`, viewers };
++      });
++      return { cams, total: cams.length, page: query.page, pageSize: query.pageSize, pages: 1 };
++    };
++    plugins.get("test.live").listLiveCams = makeList("u", "test.live", p1Hot);
++    plugins.get("test.live2").listLiveCams = makeList("v", "test.live2", !p1Hot);
++
++    const pageSize = 12;
++    p1Hot = true;
++    const page1 = (await service.list({ page: 1, pageSize })).items.map((cam) => cam.username);
++    p1Hot = false;
++    plugins.get("test.live").listLiveCams = makeList("u", "test.live", p1Hot);
++    plugins.get("test.live2").listLiveCams = makeList("v", "test.live2", !p1Hot);
++    const page2 = (await service.list({ page: 2, pageSize })).items.map((cam) => cam.username);
++
++    const overlap = (left: string[], right: string[]) => left.filter((value) => right.includes(value));
++    expect(overlap(page1, page2)).toEqual([]);
++    expect(new Set([...page1, ...page2]).size).toBe(24);
++  });
++
+   it("persists favorite creators and lists only favorites that are currently online", async () => {
+     const { database, plugins, service } = await fixture(); plugins.install("test.live");
+     const plugin = plugins.get("test.live");
+@@ -291,7 +331,13 @@ describe("Open EasyX live cams", () => {
+     const page = await service.list({ page: 3, pageSize: 24 });
+     expect(page).toMatchObject({ total: 125, page: 3, pages: 6, providers: [{ id: "test.live", count: 125 }] });
+     expect(page.items).toHaveLength(24);
+-    expect(page.items[0]).toMatchObject({ username: "cam-49" });
++    // Pagination is by a stable identity order, so adjacent windows never overlap even
++    // though the live viewer leaderboard reshuffles between requests.
++    const page1 = await service.list({ page: 1, pageSize: 24 });
++    expect(page1.items).toHaveLength(24);
++    const overlap = page1.items.filter((cam) => page.items.some((other) => other.username === cam.username));
++    expect(overlap).toEqual([]);
++    expect(new Set(page.items.map((cam) => cam.username)).size).toBe(24);
+     await expect(service.list({ page: 1, pageSize: 24, search: "cam-12" })).resolves.toMatchObject({
+       total: 7, providers: [{ id: "test.live", count: 7 }],
+     });
+diff --git a/server/live-cams.ts b/server/live-cams.ts
+index 22a1d9b..dc15ab3 100644
+--- a/server/live-cams.ts
++++ b/server/live-cams.ts
+@@ -1,6 +1,5 @@
+-import { createHash, randomBytes } from "node:crypto";
+-import fs from "node:fs";
+-import path from "node:path";
++import { randomBytes } from "node:crypto";
++import { Readable } from "node:stream";
+ import type { FastifyReply } from "fastify";
+ import type { LiveCam, LiveCamFavoriteSnapshot, LiveCamQuery, LiveStream } from "../packages/plugin-sdk/index.js";
+ import type { Database, LiveCamFavorite, Performer, Source } from "./database.js";
+@@ -20,8 +19,35 @@ type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>
+ type ProviderResult = { items: PublicLiveCam[]; total: number; status: LiveCamProviderStatus };
+ type LiveCamListQuery = LiveCamQuery & { providerId?: string; favoritesOnly?: boolean };
+ 
++// Every provider is aggregated into one globally-ordered list. We request the SAME generous
++// window from each provider on every page so the universe of cams does not change with the
++// page number. The old code grew the request with `query.page * query.pageSize`, so a later
++// page built its identity-sorted list from a larger, different set of cams and its window
++// overlapped an earlier page. A fixed cap keeps the windows disjoint; catalogs larger than
++// the cap simply stop paginating past it (rare for live-cam rooms and far better than dupes).
++const AGGREGATE_PREVIEW_LIMIT = 200;
++
+ function text(value: unknown): string | undefined { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
+ function whole(value: unknown): number { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0; }
++// Compare usernames so that embedded numbers sort numerically (cam-2 < cam-10) instead of
++// lexicographically. Used for the stable global pagination key so pages read in a natural order.
++function naturalCompare(left: string, right: string): number {
++  const chunks = (value: string): string[] => value.toLowerCase().match(/(\d+|\D+)/g) ?? [value.toLowerCase()];
++  const leftChunks = chunks(left);
++  const rightChunks = chunks(right);
++  for (let index = 0; index < Math.max(leftChunks.length, rightChunks.length); index++) {
++    const leftChunk = leftChunks[index] ?? "";
++    const rightChunk = rightChunks[index] ?? "";
++    const leftNumber = Number(leftChunk);
++    const rightNumber = Number(rightChunk);
++    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
++      if (leftNumber !== rightNumber) return leftNumber - rightNumber;
++    } else if (leftChunk !== rightChunk) {
++      return leftChunk < rightChunk ? -1 : 1;
++    }
++  }
++  return 0;
++}
+ function usernameFromUrl(value: string): string {
+   try { return new URL(value).pathname.split("/").filter(Boolean).at(-1)?.replace(/^@/, "") || "live"; }
+   catch { return "live"; }
+@@ -186,8 +212,13 @@ export class LiveCamService {
+     const providerResults = query.providerId ? (selected ? [selected] : []) : [...results.values()];
+     const unique = new Map<string, PublicLiveCam>();
+     for (const cam of providerResults.flatMap((result) => result.items)) unique.set(`${cam.providerId}:${cam.username.toLowerCase()}`, cam);
+-    let ranked = [...unique.values()].sort((left, right) => whole(right.viewers) - whole(left.viewers) || left.username.localeCompare(right.username));
+-    if (!query.providerId) ranked = ranked.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
++    // Paginate by a STABLE identity order (provider + username). Viewer counts are live
++    // and reshuffle the list between requests and streaming snapshots, which used to push
++    // the same cam onto two pages. Within a returned page we still surface the most-watched
++    // cams first for display.
++    const ordered = [...unique.values()].sort((left, right) => left.providerId.localeCompare(right.providerId) || naturalCompare(left.username, right.username));
++    let ranked = query.providerId ? ordered : ordered.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
++    ranked = [...ranked].sort((left, right) => whole(right.viewers) - whole(left.viewers) || left.username.localeCompare(right.username));
+     const total = providerResults.reduce((sum, result) => sum + result.total, 0);
+     const providers = entries.map((entry) => results.get(entry.manifest.id)?.status ?? {
+       id: entry.manifest.id, name: entry.manifest.name, ok: true, count: 0, pending: true,
+@@ -200,7 +231,7 @@ export class LiveCamService {
+ 
+   async *stream(query: LiveCamListQuery, signal?: AbortSignal): AsyncGenerator<LiveCamResult> {
+     const entries = this.livePlugins();
+-    const requestedItems = query.page * query.pageSize;
++    const requestedItems = AGGREGATE_PREVIEW_LIMIT;
+     const results = new Map<string, ProviderResult>();
+     const pending = new Map<string, Promise<{ id: string; result: ProviderResult }>>();
+     for (const entry of entries) {
+@@ -487,9 +518,6 @@ export class LiveCamService {
+     for (const key of ["_HLS_msn", "_HLS_part", "_HLS_skip"]) {
+       const value = text(query[key]); if (value) sourceUrl.searchParams.set(key, value);
+     }
+-    const cacheKey = this.proxyCacheKey(sourceUrl.toString(), range, entry.headers);
+-    const cached = this.readProxyCache(cacheKey);
+-    if (cached) return reply.status(200).type(cached.contentType).header("cache-control", "no-store").send(cached.buffer);
+     let response: Response;
+     try { response = await this.fetchUpstream(sourceUrl, entry.headers, range); }
+     catch (error) {
+@@ -497,45 +525,34 @@ export class LiveCamService {
+     }
+     if (!response.ok) return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
+     const contentType = response.headers.get("content-type") ?? "application/octet-stream";
+-    const buffer = Buffer.from(await response.arrayBuffer());
+-    const playlist = contentType.includes("mpegurl") || buffer.subarray(0, 7).toString() === "#EXTM3U";
+-    if (!playlist) this.writeProxyCache(cacheKey, buffer, contentType);
+-    reply.status(response.status).type(playlist ? "application/vnd.apple.mpegurl" : contentType).header("cache-control", "no-store");
+-    const contentRange = response.headers.get("content-range"); const acceptRanges = response.headers.get("accept-ranges");
+-    if (contentRange) reply.header("content-range", contentRange); if (acceptRanges) reply.header("accept-ranges", acceptRanges);
+-    return reply.send(playlist ? this.rewritePlaylist(buffer.toString("utf8"), response.url, entry.headers) : buffer);
+-  }
+-
+-  private proxyCacheKey(url: string, range: string | undefined, headers: Record<string, string>): string {
+-    return createHash("sha256").update(`${url}|${range ?? ""}|${JSON.stringify(Object.entries(headers).sort())}`).digest("hex").slice(0, 32);
+-  }
+-
+-  private readProxyCache(key: string): { buffer: Buffer; contentType: string } | undefined {
+-    if (!this.cacheDir) return undefined;
+-    try {
+-      const dataPath = path.join(this.cacheDir, `${key}.bin`);
+-      const metaPath = path.join(this.cacheDir, `${key}.ct`);
+-      const stat = fs.statSync(dataPath);
+-      if (Date.now() - stat.mtimeMs > 5 * 60_000) { fs.rmSync(dataPath, { force: true }); fs.rmSync(metaPath, { force: true }); return undefined; }
+-      return { buffer: fs.readFileSync(dataPath), contentType: fs.readFileSync(metaPath, "utf8") || "application/octet-stream" };
+-    } catch { return undefined; }
+-  }
+-
+-  private writeProxyCache(key: string, buffer: Buffer, contentType: string): void {
+-    if (!this.cacheDir) return;
+-    try {
+-      if (!fs.existsSync(this.cacheDir)) fs.mkdirSync(this.cacheDir, { recursive: true });
+-      fs.writeFileSync(path.join(this.cacheDir, `${key}.bin`), buffer, { mode: 0o600 });
+-      fs.writeFileSync(path.join(this.cacheDir, `${key}.ct`), contentType, { mode: 0o600 });
+-      const entries = fs.readdirSync(this.cacheDir).filter((name) => name.endsWith(".bin")).map((name) => ({ name, mtime: fs.statSync(path.join(this.cacheDir!, name)).mtimeMs }));
+-      const cap = 500;
+-      if (entries.length > cap) {
+-        for (const stale of entries.sort((a, b) => a.mtime - b.mtime).slice(0, entries.length - cap)) {
+-          fs.rmSync(path.join(this.cacheDir!, stale.name), { force: true });
+-          fs.rmSync(path.join(this.cacheDir!, `${stale.name.slice(0, -4)}.ct`), { force: true });
+-        }
+-      }
+-    } catch { /* Disk cache is best-effort; never blocks the proxy. */ }
++    const contentRange = response.headers.get("content-range");
++    const acceptRanges = response.headers.get("accept-ranges");
++    const passthroughHeaders = () => {
++      reply.header("cache-control", "no-store");
++      if (contentRange) reply.header("content-range", contentRange);
++      if (acceptRanges) reply.header("accept-ranges", acceptRanges);
++    };
++    // Playlists are tiny and must be rewritten so every nested URL points back
++    // through this proxy. Buffering the whole body here is cheap and safe.
++    if (contentType.includes("mpegurl")) {
++      const playlist = Buffer.from(await response.arrayBuffer()).toString("utf8");
++      passthroughHeaders();
++      return reply.status(response.status)
++        .type("application/vnd.apple.mpegurl")
++        .send(this.rewritePlaylist(playlist, response.url, entry.headers));
++    }
++    // Media segments are opaque binary that do not need rewriting. Stream them
++    // straight to the client with zero buffering and zero disk writes so playback
++    // stays real-time instead of waiting for each segment to fully download on the
++    // server first (the old arrayBuffer() + writeProxyCache path caused stutter).
++    if (!response.body) {
++      const fallback = Buffer.from(await response.arrayBuffer());
++      passthroughHeaders();
++      return reply.status(response.status).type(contentType).send(fallback);
++    }
++    const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
++    passthroughHeaders();
++    return reply.status(response.status).type(contentType).send(nodeStream);
+   }
+ 
+   private async fetchUpstream(url: URL, headers: Record<string, string>, range: string | undefined): Promise<Response> {
+diff --git a/src/LiveCamPage.tsx b/src/LiveCamPage.tsx
+index 52c9273..293c186 100644
+--- a/src/LiveCamPage.tsx
++++ b/src/LiveCamPage.tsx
+@@ -263,7 +263,11 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
+   const [search, setSearch] = useState(preset.query ?? ""); const [providerId, setProviderId] = useState(preset.providerId ?? "");
+   const [gender, setGender] = useState<LiveCamPreset["gender"]>(preset.gender ?? ""); const [favoritesOnly, setFavoritesOnly] = useState(Boolean(preset.favoritesOnly)); const [page, setPage] = useState(preset.page ?? 1);
+   const [favorites, setFavorites] = useState<LiveCamFavorite[]>([]);
+-  const [loading, setLoading] = useState(true); const [refresh, setRefresh] = useState(0);
++  const [loading, setLoading] = useState(true); const [refreshing, setRefreshing] = useState(false); const [refresh, setRefresh] = useState(0);
++  const resultRef = useRef<LiveCamResult | null>(null);
++  const filtersKeyRef = useRef<string | null>(null);
++  const pagesFloor = useRef(1); // Keep the highest page count seen for the current filter set so pagination never shrinks mid-refresh.
++  const applyResult = (value: LiveCamResult | null) => { resultRef.current = value; setResult(value); };
+   const params = useMemo(() => new URLSearchParams({ page: String(page), pageSize: "24", search, providerId, gender: gender ?? "", favoritesOnly: favoritesOnly ? "1" : "" }), [page, search, providerId, gender, favoritesOnly]);
+   useEffect(() => {
+     const syncFromLocation = () => {
+@@ -281,28 +285,49 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
+     return () => window.removeEventListener("easyx:live-favorites", loadFavorites);
+   }, []);
+   useEffect(() => {
+-    const controller = new AbortController(); let events: EventSource | undefined; let complete = false; const timer = window.setTimeout(() => {
+-      setLoading(true); setResult(null);
+-      const fallback = () => void api<LiveCamResult>(`/api/live-cams?${params}`, { signal: controller.signal }).then(setResult).catch((reason) => {
+-        if (reason instanceof DOMException && reason.name === "AbortError") return;
+-        setResult({ available: false, reason: reason instanceof Error ? reason.message : String(reason), items: [], total: 0, page, pageSize: 24, pages: 1, providers: [] });
+-      }).finally(() => setLoading(false));
++    const filtersKey = `${search}\u0000${providerId}\u0000${gender ?? ""}\u0000${favoritesOnly ? "1" : "0"}`;
++    const filtersChanged = filtersKeyRef.current !== filtersKey;
++    filtersKeyRef.current = filtersKey;
++    if (filtersChanged) pagesFloor.current = 1;
++    // Soft path (auto-refresh or page change): keep the current grid visible and keep pagination usable.
++    // Hard path (filter change or first load): show the loading state.
++    const soft = !filtersChanged && resultRef.current !== null;
++    if (soft) setRefreshing(true); else { setLoading(true); applyResult(null); }
++    const controller = new AbortController(); let events: EventSource | undefined; let complete = false; let gotSnapshot = false; let guard = 0;
++    const finalize = () => { window.clearTimeout(guard); events?.close(); setLoading(false); setRefreshing(false); };
++    const fallback = () => {
++      const abort = new AbortController(); const timeout = window.setTimeout(() => abort.abort(), 20_000);
++      void api<LiveCamResult>(`/api/live-cams?${params}`, { signal: abort.signal }).then((value) => {
++        if (controller.signal.aborted) return;
++        pagesFloor.current = Math.max(pagesFloor.current, value.pages);
++        applyResult(value);
++      }).catch((reason) => {
++        if (controller.signal.aborted || (reason instanceof DOMException && reason.name === "AbortError")) return;
++        applyResult({ available: false, reason: reason instanceof Error ? reason.message : String(reason), items: [], total: 0, page, pageSize: 24, pages: 1, providers: [] });
++      }).finally(() => { window.clearTimeout(timeout); finalize(); });
++    };
++    const timer = window.setTimeout(() => {
+       if (!("EventSource" in window)) { fallback(); return; }
+       events = new EventSource(`/api/live-cams/events?${params}`);
+       events.onmessage = (event) => {
+         const next = JSON.parse(event.data) as Omit<LiveCamResult, "available">;
+-        setResult({ available: true, ...next });
+-        if (next.complete) { complete = true; setLoading(false); events?.close(); }
++        gotSnapshot = true; pagesFloor.current = Math.max(pagesFloor.current, next.pages);
++        applyResult({ available: true, ...next });
++        if (next.complete) { complete = true; finalize(); }
+       };
+-      events.onerror = () => { events?.close(); if (!complete) fallback(); };
++      // Deadlock guards: a hung provider means `complete` never arrives, which used to leave the
++      // pagination (and Refresh) disabled forever. If we already have data, use it; otherwise fall
++      // back to the one-shot REST endpoint (which itself has a 20s timeout).
++      events.onerror = () => { events?.close(); if (complete) return; if (gotSnapshot) finalize(); else fallback(); };
++      guard = window.setTimeout(() => { events?.close(); if (complete) return; if (gotSnapshot) finalize(); else fallback(); }, 30_000);
+     }, 180);
+-    return () => { window.clearTimeout(timer); controller.abort(); events?.close(); };
++    return () => { window.clearTimeout(timer); window.clearTimeout(guard); controller.abort(); events?.close(); };
+   }, [params, refresh]);
+   useEffect(() => {
+-    if (loading) return;
++    if (loading || refreshing) return;
+     const timer = window.setInterval(() => { if (!document.hidden) setRefresh((value) => value + 1); }, 30_000);
+     return () => window.clearInterval(timer);
+-  }, [loading]);
++  }, [loading, refreshing]);
+   const reset = (action: () => void) => { action(); setPage(1); };
+   const providers = result?.providers ?? []; const allCount = providers.filter((provider) => provider.ok && !provider.pending).reduce((sum, provider) => sum + provider.count, 0);
+   const loadedProviders = providers.filter((provider) => !provider.pending).length;
+@@ -310,7 +335,7 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
+   const offlineFavorites = favoritesOnly ? result?.items.filter((cam) => cam.online === false) ?? [] : [];
+   const camGrid = (items: LiveCam[]) => <div className="live-grid">{items.map((cam) => <LiveCamCard cam={cam} open={open} key={`${cam.providerId}:${cam.id}`}/>)}</div>;
+   return <section className="live-page">
+-    <div className="library-intro live-intro"><div><p>LIVE NOW</p><h2>Live Cam</h2><span>Public live rooms aggregated by your installed Open EasyX source plugins</span></div><button className="quiet" onClick={() => setRefresh((value) => value + 1)} disabled={loading}><RefreshCw className={loading ? "spin" : ""}/>Refresh</button></div>
++    <div className="library-intro live-intro"><div><p>LIVE NOW</p><h2>Live Cam</h2><span>Public live rooms aggregated by your installed Open EasyX source plugins</span></div><button className="quiet" onClick={() => setRefresh((value) => value + 1)}><RefreshCw className={loading || refreshing ? "spin" : ""}/>Refresh</button></div>
+     {result?.available !== false && <div className="live-filters">
+       <label><Search/><input ref={searchInput} defaultValue={search} onChange={(event) => { const value = event.currentTarget.value; window.clearTimeout(searchTimer.current); searchTimer.current = window.setTimeout(() => { setSearch(value); setPage(1); }, 300); }} placeholder="Search live cams or tags…"/></label>
+       <label><Radio/><select aria-label="Filter live provider" value={providerId} onChange={(event) => reset(() => setProviderId(event.target.value))}><option value="">All live sources ({allCount.toLocaleString()}{loading ? "+" : ""})</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name} ({provider.pending ? "loading…" : provider.count.toLocaleString()})</option>)}</select></label>
+@@ -320,9 +345,11 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
+       : result?.available === false ? <LiveCamUnavailable reason={result.reason ?? "No live-cam provider is available in Open EasyX."}/>
+       : result && !result.providers.length ? <div className="live-unavailable compact"><span><Radio/></span><h2>No live-cam plugin installed</h2><small>Install a live provider such as Chaturbate Live from Plugins. It will appear here automatically.</small></div>
+       : result?.items.length ? <>
+-        <div className="live-summary"><b>{result.total.toLocaleString()}{loading ? "+" : ""} {favoritesOnly ? (result.total === 1 ? "favorite creator" : "favorite creators") : (result.total === 1 ? "live cam" : "live cams")}</b><span>{loading ? `Loading sources ${loadedProviders}/${result.providers.length}` : favoritesOnly ? `${onlineFavorites.length} live on this page` : `${result.providers.filter((provider) => provider.ok && provider.count > 0).length} active sources`}</span></div>
++        <div className="live-summary"><b>{result.total.toLocaleString()}{loading || refreshing ? "+" : ""} {favoritesOnly ? (result.total === 1 ? "favorite creator" : "favorite creators") : (result.total === 1 ? "live cam" : "live cams")}</b><span>{loading || refreshing ? `Loading sources ${loadedProviders}/${result.providers.length}` : favoritesOnly ? `${onlineFavorites.length} live on this page` : `${result.providers.filter((provider) => provider.ok && provider.count > 0).length} active sources`}</span></div>
+         {favoritesOnly ? <div className="favorite-live-sections">{onlineFavorites.length > 0 && <section><h3><i/>Live now</h3>{camGrid(onlineFavorites)}</section>}{offlineFavorites.length > 0 && <section className="offline"><h3><i/>Offline</h3>{camGrid(offlineFavorites)}</section>}</div> : camGrid(result.items)}
+-        {result.pages > 1 && <div className="pagination"><button disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {result.pages}</span><button disabled={page >= result.pages || loading} onClick={() => setPage(page + 1)}>Next</button></div>}
++        {/* Pagination is driven by page bounds only. Tying it to `loading` used to grey out Next for the
++            whole time a slow provider kept the SSE stream open, so users saw the bar but could not click. */}
++        {(() => { const pages = Math.max(result.pages, pagesFloor.current); return pages > 1 ? <div className="pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {pages}</span><button disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div> : null; })()}
+       </> : loading && result ? <div className="loading"><LoaderCircle className="spin"/>Loading sources {loadedProviders}/{result.providers.length}… {result.total.toLocaleString()} live cams found</div>
+       : <div className="live-unavailable compact"><span>{favoritesOnly ? <Star/> : <Radio/>}</span><h2>{favoritesOnly ? (favorites.length ? "Your favorite creators are offline" : "No favorite creators yet") : "No public cams are live"}</h2><small>{favoritesOnly ? (favorites.length ? "They will appear here automatically when they go live again." : "Open a live stream and select Favorite creator to add it here.") : "Try another source or filter. Installed providers are refreshed every 30 seconds."}</small>{result?.providers.filter((provider) => !provider.ok).map((provider) => <p key={provider.id}>{provider.name}: {provider.error}</p>)}</div>}
+   </section>;
+diff --git a/src/library.css b/src/library.css
+index f622210..b3fb215 100644
+--- a/src/library.css
++++ b/src/library.css
+@@ -1,6 +1,6 @@
+ .library-mode{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f4f5;background:#09090b;min-height:100vh;--bg:#09090b;--panel:#121216;--panel2:#18181d;--line:#29292f;--muted:#92929d;--red:#fa4058;--green:#42d392}
+ @scope (.library-mode){
+-:root{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f4f5;background:#09090b;font-synthesis:none;--bg:#09090b;--panel:#121216;--panel2:#18181d;--line:#29292f;--muted:#92929d;--red:#fa4058;--green:#42d392}*{box-sizing:border-box}body{margin:0;min-width:320px;min-height:100vh;background:radial-gradient(circle at 80% -10%,rgba(250,64,88,.07),transparent 28%),var(--bg)}button,input,select{font:inherit}button{color:inherit;cursor:pointer}.app-shell{display:grid;grid-template-columns:236px 1fr;min-height:100vh}.sidebar{position:fixed;inset:0 auto 0 0;width:236px;padding:24px 15px 20px;background:#0c0c0f;border-right:1px solid #202024;display:flex;flex-direction:column;z-index:30}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 30px;border:0;background:none;text-align:left}.logo{width:39px;height:39px;border-radius:12px;background:linear-gradient(145deg,#ff5268,#d91e3b);box-shadow:0 8px 28px rgba(250,64,88,.2);display:grid;place-items:center;font-weight:900;font-size:13px;letter-spacing:-.05em}.brand>span:last-child{display:flex;flex-direction:column}.brand b{font-size:18px;line-height:1}.brand small{font-size:9px;letter-spacing:.2em;color:#777783;margin-top:5px}.sidebar nav{display:flex;flex-direction:column;gap:4px}.sidebar nav button{height:43px;border:0;border-radius:10px;background:none;color:#7e7e89;display:flex;align-items:center;gap:12px;padding:0 12px;text-align:left;font-weight:650}.sidebar nav button svg{width:18px}.sidebar nav button:hover{color:#ddd;background:#151519}.sidebar nav button.active{color:white;background:#1a1a1f}.sidebar nav button.active svg{color:var(--red)}.sidebar nav i{margin-left:auto;background:rgba(250,64,88,.16);color:#ff6f82;border-radius:10px;padding:2px 7px;font-size:9px;font-style:normal}.storage{margin-top:auto;display:flex;align-items:center;gap:10px;padding:14px 11px;border-top:1px solid #202025;border-bottom:1px solid #202025}.storage>svg{width:18px;color:#676771}.storage b,.storage small{display:block}.storage b{font-size:11px}.storage small{font-size:9px;color:#666670;margin-top:3px}.sidebar-foot{display:flex;gap:10px;align-items:center;padding:18px 11px 0}.sidebar-foot b,.sidebar-foot small{display:block}.sidebar-foot b{font-size:10px;color:#b3b3ba}.sidebar-foot small{font-size:8px;color:#5f5f69;margin-top:4px}.status{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 0 4px rgba(66,211,146,.08)}.status.scanning{background:#ffc55d;box-shadow:0 0 0 4px rgba(255,197,93,.08)}main{grid-column:2;min-width:0}main>header{height:90px;padding:0 40px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #202024;background:rgba(9,9,11,.84);backdrop-filter:blur(18px);position:sticky;top:0;z-index:20}main>header p,.library-intro p{font-size:8px;font-weight:800;letter-spacing:.2em;color:#64646f;margin:0 0 7px}main>header h1{font-size:21px;margin:0}.header-actions{display:flex;gap:9px}.primary,.quiet,.glass{border:0;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:700;padding:11px 16px}.primary{background:var(--red);box-shadow:0 9px 28px rgba(250,64,88,.17)}.primary:hover{background:#ff5369}.primary svg,.quiet svg,.glass svg{width:17px}.quiet{background:#17171b;border:1px solid #2a2a30;color:#b2b2ba}.quiet:disabled{opacity:.55}.menu-button{display:none;background:none;border:0}.content{padding:30px 40px 70px;max-width:1600px;margin:auto}.hero{height:410px;border-radius:20px;overflow:hidden;position:relative;border:1px solid #29292f;background:#151519}.hero>img{width:100%;height:100%;object-fit:cover;object-position:center 25%}.hero-shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(7,7,9,.97) 0%,rgba(7,7,9,.76) 34%,rgba(7,7,9,.08) 76%),linear-gradient(0deg,rgba(7,7,9,.78),transparent 48%)}.hero-copy{position:absolute;left:50px;bottom:48px;width:min(590px,55%)}.hero-copy>span{display:flex;gap:7px;align-items:center;color:#ff7788;font-size:9px;font-weight:800;letter-spacing:.14em}.hero-copy>span svg{width:14px}.hero h2{font-size:43px;line-height:1.08;letter-spacing:-.045em;margin:17px 0 10px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.hero-copy p{color:#a4a4ad;margin:0 0 24px}.hero-copy>div{display:flex;gap:9px}.primary.big{padding:13px 20px}.glass{background:rgba(26,26,31,.76);border:1px solid rgba(255,255,255,.13);backdrop-filter:blur(12px)}.filled{fill:currentColor;color:var(--red)}.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:18px 0 38px}.stat-card{height:82px;background:var(--panel);border:1px solid #24242a;border-radius:14px;padding:17px;display:flex;align-items:center;gap:13px}.stat-card>span{width:42px;height:42px;display:grid;place-items:center;background:#1c1c22;border-radius:11px;color:#74747f}.stat-card svg{width:18px}.stat-card b,.stat-card small{display:block}.stat-card b{font-size:20px}.stat-card small{font-size:9px;color:#777782;margin-top:3px}.shelf{margin-top:34px}.section-head{display:flex;align-items:end;justify-content:space-between;margin-bottom:15px}.section-head h2{font-size:19px;margin:0 0 5px}.section-head p{font-size:10px;color:#777782;margin:0}.section-head button{background:none;border:0;color:#aaaab3;font-size:10px}.media-row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(210px,1fr);grid-template-rows:1fr;gap:13px;overflow:auto;padding-bottom:10px;scrollbar-width:thin}.media-row .media-card{width:230px}.media-card{min-width:0;position:relative}.poster{position:relative;width:100%;aspect-ratio:16/10;padding:0;border:1px solid #25252b;border-radius:12px;overflow:hidden;background:#151519;display:block}.poster img{width:100%;height:100%;display:block;object-fit:cover;transition:transform .25s,opacity .25s}.poster:hover img{transform:scale(1.025);opacity:.72}.poster .play{position:absolute;inset:0;margin:auto;width:43px;height:43px;border-radius:50%;background:rgba(250,64,88,.92);display:grid;place-items:center;opacity:0;transform:scale(.8);transition:.2s}.poster:hover .play{opacity:1;transform:scale(1)}.play svg{width:17px;fill:white}.poster .type{position:absolute;left:9px;top:9px;width:26px;height:26px;display:grid;place-items:center;background:rgba(0,0,0,.72);border-radius:7px}.type svg{width:12px}.poster time{position:absolute;right:8px;bottom:8px;background:rgba(0,0,0,.78);border-radius:5px;padding:4px 6px;font-size:8px}.poster>i{position:absolute;height:3px;background:var(--red);left:0;bottom:0}.media-copy{padding:11px 34px 0 2px;min-width:0}.media-title{display:block;width:100%;padding:0;border:0;background:none;text-align:left;font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-copy p{font-size:9px;color:#74747e;margin:5px 0}.heart-button{position:absolute;right:2px;bottom:11px;width:28px;height:28px;background:none;border:0;color:#62626d}.heart-button svg{width:15px}.library-intro{display:flex;align-items:end;justify-content:space-between;margin:3px 0 24px}.library-intro h2{font-size:30px;letter-spacing:-.035em;margin:0 0 5px}.library-intro span{font-size:10px;color:#73737d}.filters{display:grid;grid-template-columns:minmax(260px,1fr) auto auto;gap:10px;background:var(--panel);border:1px solid #24242a;border-radius:14px;padding:10px;margin-bottom:22px}.filters>label,.performer-search{display:flex;align-items:center;background:#0e0e11;border:1px solid #29292f;border-radius:9px}.filters label>svg,.performer-search svg{width:16px;color:#656570;margin-left:12px}.filters input,.performer-search input{width:100%;background:none;border:0;outline:0;color:white;padding:10px 12px}.filter-buttons{display:flex;gap:3px;background:#0e0e11;border:1px solid #29292f;border-radius:9px;padding:3px}.filter-buttons button{border:0;background:none;color:#777781;border-radius:6px;padding:6px 10px;display:flex;align-items:center;gap:6px;font-size:10px}.filter-buttons button svg{width:13px}.filter-buttons button.active{background:#24242a;color:white}.filters .sort{width:180px}.filters select{width:100%;background:none;border:0;outline:0;color:#b4b4bc;padding:9px;font-size:10px}.media-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:22px 14px}.loading,.empty-state{min-height:300px;display:flex;align-items:center;justify-content:center;gap:10px;color:#777781;font-size:11px}.empty-state{flex-direction:column}.empty-state>svg{width:44px;height:44px;color:#4e4e57}.empty-state h3{font-size:15px;margin:5px 0 0;color:#c5c5ca}.empty-state p{margin:0}.pagination{display:flex;align-items:center;justify-content:center;gap:18px;margin-top:38px}.pagination button{border:1px solid #2b2b31;background:#17171c;border-radius:8px;padding:9px 13px}.pagination button:disabled{opacity:.35}.pagination span{font-size:10px;color:#777}.performer-search{width:300px}.performer-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px}.performer-card{border:1px solid #27272d;background:var(--panel);border-radius:14px;padding:17px;text-align:left;display:flex;align-items:center;gap:13px}.performer-card:hover{background:#17171c;border-color:#383840}.performer-avatar{width:50px;height:50px;flex:none;border-radius:13px;background:linear-gradient(145deg,#29292f,#17171c);display:grid;place-items:center;color:#656570}.performer-avatar svg{width:22px}.performer-card h3{font-size:13px;margin:0 0 4px}.performer-card p{font-size:9px;color:#70707a;margin:0 0 8px}.performer-card small{display:flex;align-items:center;gap:5px;color:#888;font-size:8px}.performer-card small svg{width:11px}.empty-library{height:330px;border:1px dashed #303038;border-radius:18px;display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center;background:linear-gradient(145deg,#121216,#0d0d10)}.empty-library>span{width:60px;height:60px;border-radius:18px;background:#1a1a1f;display:grid;place-items:center;color:#60606a}.empty-library p{font-size:8px;font-weight:800;letter-spacing:.17em;color:#ff6d80;margin:18px 0 7px}.empty-library h2{font-size:25px;margin:0 0 8px}.empty-library small{color:#70707a}.empty-library code{color:#aaa}.viewer-backdrop{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.86);backdrop-filter:blur(8px);padding:22px;display:grid;place-items:center}.viewer{width:min(1380px,100%);max-height:calc(100vh - 44px);overflow:auto;background:#111115;border:1px solid #323239;border-radius:18px;box-shadow:0 40px 120px #000}.viewer>header{min-height:76px;padding:15px 19px 15px 24px;display:flex;align-items:center;justify-content:space-between}.viewer>header span{font-size:7px;color:#ff6c7f;letter-spacing:.16em;font-weight:800}.viewer h2{font-size:16px;margin:4px 0}.viewer header p{font-size:9px;color:#777;margin:0}.viewer header>div:last-child{display:flex;gap:7px}.viewer header button{width:38px;height:38px;background:#1d1d22;border:1px solid #2c2c33;border-radius:9px}.viewer header button svg{width:16px}.stage{height:min(68vh,760px);min-height:320px;background:#050506;display:grid;place-items:center}.stage video,.stage img{width:100%;height:100%;object-fit:contain}.viewer footer{padding:17px 23px;display:flex;gap:22px;align-items:center;color:#777781;font-size:9px}.viewer footer>div{display:flex;align-items:center;gap:7px}.viewer footer svg{width:13px}.viewer footer code{margin-left:auto;max-width:45%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#55555f}.toast{position:fixed;right:22px;bottom:22px;z-index:200;display:flex;align-items:center;gap:13px;background:#202026;border:1px solid #393941;box-shadow:0 20px 60px #000;border-radius:11px;padding:13px 15px;font-size:10px}.toast button{background:none;border:0;padding:0;color:#777}.toast svg{width:14px}.boot{min-height:100vh;display:flex;align-items:center;justify-content:center;gap:13px;color:#777;font-size:11px}.boot p{margin:0}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
++:root{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f4f5;background:#09090b;font-synthesis:none;--bg:#09090b;--panel:#121216;--panel2:#18181d;--line:#29292f;--muted:#92929d;--red:#fa4058;--green:#42d392}*{box-sizing:border-box}body{margin:0;min-width:320px;min-height:100vh;background:radial-gradient(circle at 80% -10%,rgba(250,64,88,.07),transparent 28%),var(--bg)}button,input,select{font:inherit}button{color:inherit;cursor:pointer}.app-shell{display:grid;grid-template-columns:236px 1fr;min-height:100vh}.sidebar{position:fixed;inset:0 auto 0 0;width:236px;padding:24px 15px 20px;background:#0c0c0f;border-right:1px solid #202024;display:flex;flex-direction:column;z-index:30}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 30px;border:0;background:none;text-align:left}.logo{width:39px;height:39px;border-radius:12px;background:linear-gradient(145deg,#ff5268,#d91e3b);box-shadow:0 8px 28px rgba(250,64,88,.2);display:grid;place-items:center;font-weight:900;font-size:13px;letter-spacing:-.05em}.brand>span:last-child{display:flex;flex-direction:column}.brand b{font-size:18px;line-height:1}.brand small{font-size:9px;letter-spacing:.2em;color:#777783;margin-top:5px}.sidebar nav{display:flex;flex-direction:column;gap:4px}.sidebar nav button{height:43px;border:0;border-radius:10px;background:none;color:#7e7e89;display:flex;align-items:center;gap:12px;padding:0 12px;text-align:left;font-weight:650}.sidebar nav button svg{width:18px}.sidebar nav button:hover{color:#ddd;background:#151519}.sidebar nav button.active{color:white;background:#1a1a1f}.sidebar nav button.active svg{color:var(--red)}.sidebar nav i{margin-left:auto;background:rgba(250,64,88,.16);color:#ff6f82;border-radius:10px;padding:2px 7px;font-size:9px;font-style:normal}.storage{margin-top:auto;display:flex;align-items:center;gap:10px;padding:14px 11px;border-top:1px solid #202025;border-bottom:1px solid #202025}.storage>svg{width:18px;color:#676771}.storage b,.storage small{display:block}.storage b{font-size:11px}.storage small{font-size:9px;color:#666670;margin-top:3px}.sidebar-foot{display:flex;gap:10px;align-items:center;padding:18px 11px 0}.sidebar-foot b,.sidebar-foot small{display:block}.sidebar-foot b{font-size:10px;color:#b3b3ba}.sidebar-foot small{font-size:8px;color:#5f5f69;margin-top:4px}.status{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 0 4px rgba(66,211,146,.08)}.status.scanning{background:#ffc55d;box-shadow:0 0 0 4px rgba(255,197,93,.08)}main{grid-column:2;min-width:0}main>header{height:90px;padding:0 40px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #202024;background:rgba(9,9,11,.84);backdrop-filter:blur(18px);position:sticky;top:0;z-index:20}main>header p,.library-intro p{font-size:8px;font-weight:800;letter-spacing:.2em;color:#64646f;margin:0 0 7px}main>header h1{font-size:21px;margin:0}.header-actions{display:flex;gap:9px}.primary,.quiet,.glass{border:0;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;gap:8px;font-weight:700;padding:11px 16px}.primary{background:var(--red);box-shadow:0 9px 28px rgba(250,64,88,.17)}.primary:hover{background:#ff5369}.primary svg,.quiet svg,.glass svg{width:17px}.quiet{background:#17171b;border:1px solid #2a2a30;color:#b2b2ba}.quiet:disabled{opacity:.55}.menu-button{display:none;background:none;border:0}.content{padding:30px 40px 70px;max-width:1600px;margin:auto}.hero{height:410px;border-radius:20px;overflow:hidden;position:relative;border:1px solid #29292f;background:#151519}.hero>img{width:100%;height:100%;object-fit:cover;object-position:center 25%}.hero-shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(7,7,9,.97) 0%,rgba(7,7,9,.76) 34%,rgba(7,7,9,.08) 76%),linear-gradient(0deg,rgba(7,7,9,.78),transparent 48%)}.hero-copy{position:absolute;left:50px;bottom:48px;width:min(590px,55%)}.hero-copy>span{display:flex;gap:7px;align-items:center;color:#ff7788;font-size:9px;font-weight:800;letter-spacing:.14em}.hero-copy>span svg{width:14px}.hero h2{font-size:43px;line-height:1.08;letter-spacing:-.045em;margin:17px 0 10px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.hero-copy p{color:#a4a4ad;margin:0 0 24px}.hero-copy>div{display:flex;gap:9px}.primary.big{padding:13px 20px}.glass{background:rgba(26,26,31,.76);border:1px solid rgba(255,255,255,.13);backdrop-filter:blur(12px)}.filled{fill:currentColor;color:var(--red)}.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:18px 0 38px}.stat-card{height:82px;background:var(--panel);border:1px solid #24242a;border-radius:14px;padding:17px;display:flex;align-items:center;gap:13px}.stat-card>span{width:42px;height:42px;display:grid;place-items:center;background:#1c1c22;border-radius:11px;color:#74747f}.stat-card svg{width:18px}.stat-card b,.stat-card small{display:block}.stat-card b{font-size:20px}.stat-card small{font-size:9px;color:#777782;margin-top:3px}.shelf{margin-top:34px}.section-head{display:flex;align-items:end;justify-content:space-between;margin-bottom:15px}.section-head h2{font-size:19px;margin:0 0 5px}.section-head p{font-size:10px;color:#777782;margin:0}.section-head button{background:none;border:0;color:#aaaab3;font-size:10px}.media-row{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(210px,1fr);grid-template-rows:1fr;gap:13px;overflow:auto;padding-bottom:10px;scrollbar-width:thin}.media-row .media-card{width:230px}.media-card{min-width:0;position:relative}.poster{position:relative;width:100%;aspect-ratio:16/10;padding:0;border:1px solid #25252b;border-radius:12px;overflow:hidden;background:#151519;display:block}.poster img{width:100%;height:100%;display:block;object-fit:cover;transition:transform .25s,opacity .25s}.poster:hover img{transform:scale(1.025);opacity:.72}.poster .play{position:absolute;inset:0;margin:auto;width:43px;height:43px;border-radius:50%;background:rgba(250,64,88,.92);display:grid;place-items:center;opacity:0;transform:scale(.8);transition:.2s}.poster:hover .play{opacity:1;transform:scale(1)}.play svg{width:17px;fill:white}.poster .type{position:absolute;left:9px;top:9px;width:26px;height:26px;display:grid;place-items:center;background:rgba(0,0,0,.72);border-radius:7px}.type svg{width:12px}.poster time{position:absolute;right:8px;bottom:8px;background:rgba(0,0,0,.78);border-radius:5px;padding:4px 6px;font-size:8px}.poster>i{position:absolute;height:3px;background:var(--red);left:0;bottom:0}.media-copy{padding:11px 34px 0 2px;min-width:0}.media-title{display:block;width:100%;padding:0;border:0;background:none;text-align:left;font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-copy p{font-size:9px;color:#74747e;margin:5px 0}.heart-button{position:absolute;right:2px;bottom:11px;width:28px;height:28px;background:none;border:0;color:#62626d}.heart-button svg{width:15px}.library-intro{display:flex;align-items:end;justify-content:space-between;margin:3px 0 24px}.library-intro h2{font-size:30px;letter-spacing:-.035em;margin:0 0 5px}.library-intro span{font-size:10px;color:#73737d}.filters{display:grid;grid-template-columns:minmax(260px,1fr) auto auto;gap:10px;background:var(--panel);border:1px solid #24242a;border-radius:14px;padding:10px;margin-bottom:22px}.filters>label,.performer-search{display:flex;align-items:center;background:#0e0e11;border:1px solid #29292f;border-radius:9px}.filters label>svg,.performer-search svg{width:16px;color:#656570;margin-left:12px}.filters input,.performer-search input{width:100%;background:none;border:0;outline:0;color:white;padding:10px 12px}.filter-buttons{display:flex;gap:3px;background:#0e0e11;border:1px solid #29292f;border-radius:9px;padding:3px}.filter-buttons button{border:0;background:none;color:#777781;border-radius:6px;padding:6px 10px;display:flex;align-items:center;gap:6px;font-size:10px}.filter-buttons button svg{width:13px}.filter-buttons button.active{background:#24242a;color:white}.filters .sort{width:180px}.filters select{width:100%;background:none;border:0;outline:0;color:#b4b4bc;padding:9px;font-size:10px}.media-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:22px 14px}.loading,.empty-state{min-height:300px;display:flex;align-items:center;justify-content:center;gap:10px;color:#777781;font-size:11px}.empty-state{flex-direction:column}.empty-state>svg{width:44px;height:44px;color:#4e4e57}.empty-state h3{font-size:15px;margin:5px 0 0;color:#c5c5ca}.empty-state p{margin:0}.pagination{display:flex;align-items:center;justify-content:center;gap:18px;margin-top:38px}.pagination button{border:1px solid #2b2b31;background:#17171c;border-radius:8px;padding:9px 13px}.pagination button:disabled{opacity:.35;cursor:not-allowed}.pagination span{font-size:10px;color:#777}.performer-search{width:300px}.performer-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px}.performer-card{border:1px solid #27272d;background:var(--panel);border-radius:14px;padding:17px;text-align:left;display:flex;align-items:center;gap:13px}.performer-card:hover{background:#17171c;border-color:#383840}.performer-avatar{width:50px;height:50px;flex:none;border-radius:13px;background:linear-gradient(145deg,#29292f,#17171c);display:grid;place-items:center;color:#656570}.performer-avatar svg{width:22px}.performer-card h3{font-size:13px;margin:0 0 4px}.performer-card p{font-size:9px;color:#70707a;margin:0 0 8px}.performer-card small{display:flex;align-items:center;gap:5px;color:#888;font-size:8px}.performer-card small svg{width:11px}.empty-library{height:330px;border:1px dashed #303038;border-radius:18px;display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center;background:linear-gradient(145deg,#121216,#0d0d10)}.empty-library>span{width:60px;height:60px;border-radius:18px;background:#1a1a1f;display:grid;place-items:center;color:#60606a}.empty-library p{font-size:8px;font-weight:800;letter-spacing:.17em;color:#ff6d80;margin:18px 0 7px}.empty-library h2{font-size:25px;margin:0 0 8px}.empty-library small{color:#70707a}.empty-library code{color:#aaa}.viewer-backdrop{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.86);backdrop-filter:blur(8px);padding:22px;display:grid;place-items:center}.viewer{width:min(1380px,100%);max-height:calc(100vh - 44px);overflow:auto;background:#111115;border:1px solid #323239;border-radius:18px;box-shadow:0 40px 120px #000}.viewer>header{min-height:76px;padding:15px 19px 15px 24px;display:flex;align-items:center;justify-content:space-between}.viewer>header span{font-size:7px;color:#ff6c7f;letter-spacing:.16em;font-weight:800}.viewer h2{font-size:16px;margin:4px 0}.viewer header p{font-size:9px;color:#777;margin:0}.viewer header>div:last-child{display:flex;gap:7px}.viewer header button{width:38px;height:38px;background:#1d1d22;border:1px solid #2c2c33;border-radius:9px}.viewer header button svg{width:16px}.stage{height:min(68vh,760px);min-height:320px;background:#050506;display:grid;place-items:center}.stage video,.stage img{width:100%;height:100%;object-fit:contain}.viewer footer{padding:17px 23px;display:flex;gap:22px;align-items:center;color:#777781;font-size:9px}.viewer footer>div{display:flex;align-items:center;gap:7px}.viewer footer svg{width:13px}.viewer footer code{margin-left:auto;max-width:45%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#55555f}.toast{position:fixed;right:22px;bottom:22px;z-index:200;display:flex;align-items:center;gap:13px;background:#202026;border:1px solid #393941;box-shadow:0 20px 60px #000;border-radius:11px;padding:13px 15px;font-size:10px}.toast button{background:none;border:0;padding:0;color:#777}.toast svg{width:14px}.boot{min-height:100vh;display:flex;align-items:center;justify-content:center;gap:13px;color:#777;font-size:11px}.boot p{margin:0}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+ @media(max-width:1150px){.media-grid,.performer-grid{grid-template-columns:repeat(3,1fr)}.hero-copy{width:64%}.hero h2{font-size:37px}.filters{grid-template-columns:1fr auto}.filters .sort{grid-column:1/-1;width:100%}}
+ @media(max-width:800px){.app-shell{display:block}.sidebar{transform:translateX(-100%);transition:.2s;box-shadow:20px 0 60px #000}.sidebar.open{transform:none}main{display:block}main>header{height:72px;padding:0 16px;justify-content:flex-start;gap:12px}.menu-button{display:block}.menu-button svg{width:20px}.header-actions{margin-left:auto}.header-actions span{display:none}.header-actions button{width:40px;height:40px;padding:0}.content{padding:16px 14px 55px}.hero{height:360px}.hero-shade{background:linear-gradient(0deg,rgba(7,7,9,.97) 0%,rgba(7,7,9,.55) 62%,rgba(7,7,9,.06))}.hero-copy{left:24px;right:24px;bottom:28px;width:auto}.hero h2{font-size:30px}.stat-row{grid-template-columns:1fr 1fr}.media-grid,.performer-grid{grid-template-columns:repeat(2,1fr)}.filters{grid-template-columns:1fr}.filter-buttons{overflow:auto}.filters .sort{grid-column:auto}.library-intro{align-items:start;gap:14px;flex-direction:column}.performer-search{width:100%}.viewer-backdrop{padding:0}.viewer{max-height:100vh;height:100vh;border:0;border-radius:0}.stage{height:60vh}.viewer footer{align-items:flex-start;flex-wrap:wrap}.viewer footer code{max-width:100%;width:100%;margin:0}.media-row{grid-auto-columns:190px}.media-row .media-card{width:200px}}
+ @media(max-width:480px){.hero{height:410px}.hero-copy>div{align-items:stretch;flex-direction:column}.hero-copy>div button{width:100%}.stat-row{gap:8px}.stat-card{padding:12px;height:70px}.stat-card>span{display:none}.media-grid{grid-template-columns:1fr 1fr;gap:18px 8px}.poster{aspect-ratio:4/3}.media-copy{padding-right:25px}.performer-grid{grid-template-columns:1fr}.viewer>header{padding:12px}.viewer h2{max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stage{height:55vh;min-height:260px}}
