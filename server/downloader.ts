@@ -10,6 +10,8 @@ import type { LogWriter } from "./log-store.js";
 import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
+import { liveRecordingRequest } from "../packages/live-capture.js";
+import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
 
 type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean };
 
@@ -136,15 +138,22 @@ export class DownloadQueue {
     stallTimer?.unref();
     try {
       const plugin = this.plugins.get(item.pluginId);
-      if (!plugin.resolveDownload) throw new Error("This plugin cannot resolve downloads");
       const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
       if (!performer || !source) throw new Error("The performer or source no longer exists");
       const settings = outputSettings(this.db.getSettings());
-      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId), {
+      const context = this.plugins.context(item.pluginId);
+      const candidate: MediaCandidate = {
         externalId: item.externalId, identityKey: item.identityKey, title: item.title, pageUrl: item.pageUrl,
-        mediaType: item.mediaType as any, filename: item.filename, qualityScore: item.qualityScore,
+        mediaType: item.mediaType as MediaCandidate["mediaType"], filename: item.filename, qualityScore: item.qualityScore,
         expectedBytes: item.expectedBytes, publishedAt: item.publishedAt, metadata: item.metadata,
-      });
+      };
+      // TS-first live capture wins over the plugin's own download path: any live item
+      // records as ffmpeg MPEG-TS (then the remux below turns it into MP4) no matter
+      // which plugin resolved it. Non-live items and plugins without a live resolver
+      // keep using resolveDownload unchanged.
+      const request = (await liveRecordingRequest(plugin, context, candidate))
+        ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
+      if (!request) throw new Error("This plugin cannot resolve downloads");
       const fallback = `${item.externalId}.${item.mediaType === "image" ? "jpg" : item.mediaType === "video" ? "mp4" : "bin"}`;
       const requestUrl = request.kind === "command" ? item.pageUrl ?? item.externalId : request.url;
       const filename = safeSegment(request.filename ?? item.filename ?? filenameFromUrl(requestUrl, fallback), fallback);
