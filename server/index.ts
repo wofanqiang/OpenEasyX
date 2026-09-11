@@ -15,6 +15,7 @@ import { domainFromUrl } from "./utils.js";
 import { BrowserLoginManager } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
 import { LiveCamService } from "./live-cams.js";
+import { SystemStatsService } from "./system-stats.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
 import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
@@ -46,7 +47,9 @@ const queue = new DownloadQueue(
 );
 const browserLogin = new BrowserLoginManager(dataDir);
 const liveCams = new LiveCamService(db, plugins, undefined, path.join(dataDir, ".proxy-cache"));
+const systemStats = new SystemStatsService({ mediaDir });
 queue.start();
+systemStats.start();
 
 const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });
 const discoveryStatus = { running: false, completed: 0, total: 0, progress: 0, query: "", error: "" };
@@ -116,6 +119,9 @@ const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir);
 
 app.get("/api/health", async () => ({ ok: true, product: "Open EasyX", version: appVersion, plugins: plugins.list().length, library: libraryDb.stats().total, scan: catalog.status }));
 app.get("/api/version", async () => ({ version: appVersion }));
+// Host and container resource snapshot. Sampling happens on a background timer
+// inside SystemStatsService; this handler only reads the cached snapshot.
+app.get("/api/system/stats", async () => systemStats.snapshotNow());
 
 app.post("/api/auth/login", async (request, reply) => {
   const limit = auth.checkRateLimit(request.ip);
@@ -693,7 +699,7 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; queue.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  shuttingDown = true; queue.stop(); systemStats.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);

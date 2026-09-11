@@ -11,6 +11,7 @@ import { playbackAutoStart, playbackLocationState, type EasyXLocationState } fro
 import { SettingsPage } from "./SettingsPage";
 import { LiveCamPage, LiveCamViewer, liveCamListUrl, liveCamPresetFromSearch, liveCamUrl, type LiveCam } from "./LiveCamPage";
 import { AppChrome } from "./AppChrome";
+import { SystemStats } from "./SystemStats";
 import "./library.css";
 
 type Media = {
@@ -282,6 +283,7 @@ function Statistics({ stats }: { stats: Stats }) {
   const storageTotal = Math.max(1, stats.bytes); const watchedPercent = stats.total ? Math.round(stats.viewed / stats.total * 100) : 0;
   return <section className="statistics-page">
     <div className="library-intro"><div><p>LIBRARY INSIGHTS</p><h2>Statistics</h2><span>A complete snapshot of your local collection and viewing activity</span></div></div>
+    <SystemStats/>
     <div className="statistics-highlights">
       <article><span><LibraryIcon/></span><div><small>Total content</small><b>{stats.total.toLocaleString()}</b><p>{stats.videos.toLocaleString()} {stats.videos === 1 ? "video" : "videos"} · {stats.images.toLocaleString()} {stats.images === 1 ? "photo" : "photos"}</p></div></article>
       <article><span><Eye/></span><div><small>Content viewed</small><b>{stats.viewed.toLocaleString()}</b><p>{watchedPercent}% of your collection</p></div></article>
