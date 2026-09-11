@@ -120,6 +120,7 @@ export class DownloadQueue {
     let temporary = "";
     let temporaryDirectory = "";
     let preserveTemporary = false;
+    let recordingFinalize = false;
     let lastProgress = 0; let lastBytes = 0; let lastProgressUpdate = 0; let lastActivity = Date.now();
     const reportProgress = (progress?: number, downloadedBytes?: number, force = false) => {
       const nextProgress = progress === undefined ? lastProgress : Math.max(lastProgress, Math.min(0.99, Math.max(0, progress)));
@@ -181,7 +182,18 @@ export class DownloadQueue {
           const tsPath = path.join(temporaryDirectory, "capture.ts");
           if (fs.existsSync(tsPath) && fs.statSync(tsPath).size > 0) {
             const mp4Staging = path.join(temporaryDirectory, "encoded.mp4");
+            // A live capture ends either because the user pressed stop or because the
+            // stream went offline, and in both cases the capture is already finished:
+            // the remux below concludes the recording, it is not a fresh download.
+            // Clear any pending action *before* spawning ffmpeg, because
+            // runCommandDownload immediately signals a child spawned while
+            // control.action is still set. Left as "stop", it would SIGINT the remux the
+            // instant it starts, produce no MP4, and let the catch branch discard the
+            // whole capture. `encoding` then keeps a later stop/cancel from cutting the
+            // remux short (see interrupt()).
+            control.action = undefined;
             control.encoding = true;
+            recordingFinalize = true;
             this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
             this.writeLog?.("info", "download", "Remuxing live TS capture to MP4", { itemId: item.id });
             await this.runCommandDownload("ffmpeg", [
@@ -268,19 +280,27 @@ export class DownloadQueue {
       });
     } catch (error) {
       let message = error instanceof Error ? error.message : String(error);
-      if (!control.action && !control.paused && temporary && fs.existsSync(temporary)) {
-        const partialBytes = fs.statSync(temporary).size;
+      // A failed post-processing step (remux / re-encode) must never throw the capture
+      // away: prefer the finished MP4, but fall back to the TS capture. Before this
+      // fallback existed a failed remux deleted the entire recording, because the
+      // staging file is capture.ts while `temporary` points at the not-yet-written MP4.
+      const capturePath = temporaryDirectory ? path.join(temporaryDirectory, "capture.ts") : "";
+      const recoverySource = temporary && fs.existsSync(temporary)
+        ? temporary
+        : (capturePath && fs.existsSync(capturePath) && fs.statSync(capturePath).size > 0 ? capturePath : "");
+      if (!control.action && !control.paused && recoverySource) {
+        const partialBytes = fs.statSync(recoverySource).size;
         const isLiveRecording = (item.metadata as Record<string, unknown> | undefined)?.live === true;
         if (control.encoding || (isLiveRecording && partialBytes > 0)) {
           try {
             const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
             this.prepareOutputDirectory(recoveryDirectory);
-            const recovery = this.availableDestination(path.join(recoveryDirectory, path.basename(temporary)), item.id);
-            fs.renameSync(temporary, recovery); temporary = "";
+            const recovery = this.availableDestination(path.join(recoveryDirectory, path.basename(recoverySource)), item.id);
+            fs.renameSync(recoverySource, recovery); temporary = "";
             message += ` Recording preserved for recovery at ${path.relative(this.mediaRoot, recovery)}.`;
           } catch {
             preserveTemporary = true;
-            message += ` Recording preserved in staging at ${path.relative(this.mediaRoot, temporary)}; recover it before retrying.`;
+            message += ` Recording preserved in staging at ${path.relative(this.mediaRoot, recoverySource)}; recover it before retrying.`;
           }
         }
       }
@@ -289,6 +309,12 @@ export class DownloadQueue {
         this.writeLog?.("info", "download", control.action === "stop" ? "Recording stopped" : "Download cancelled", { itemId: item.id, title: item.title });
       } else if (control.paused) {
         this.db.setItemStatus(item.id, "paused", { error: null });
+      } else if (recordingFinalize) {
+        // The capture already ended (user stop, or the stream going offline) and only
+        // the post-processing failed. Retrying would silently restart a recording the
+        // user asked to stop, so report the failure once instead.
+        this.db.setItemStatus(item.id, "failed", { error: message });
+        this.writeLog?.("error", "download", "Live recording could not be finalized after the capture ended", { itemId: item.id, title: item.title, error: message });
       } else {
         // Keep the underlying command output: without it a stall is undiagnosable
         // (the real ffmpeg/yt-dlp error is the only clue to what went wrong).
@@ -360,7 +386,10 @@ export class DownloadQueue {
     if (process.platform !== "win32") {
       try { process.kill(-child.pid, signal); return; } catch { /* Fall back to the direct child. */ }
     }
-    child.kill(signal);
+    // Windows only maps SIGTERM/SIGKILL/SIGINT to a process kill and throws
+    // ERR_UNKNOWN_SIGNAL for the rest, so an unsupported signal must not abort the
+    // caller mid-stop (SIGCONT/SIGSTOP simply have no equivalent on Windows).
+    try { child.kill(signal); } catch { /* Signal unsupported on this platform. */ }
   }
 
   private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload): Promise<void> {

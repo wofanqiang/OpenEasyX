@@ -95,4 +95,40 @@ describe("custom download output", () => {
     expect(db.getItem(item.id)?.error).toContain("Recording preserved for recovery");
     expect(fs.readFileSync(path.join(media, ".recording-recovery", item.id, "original.mp4"), "utf8")).toBe("test bytes");
   });
+  it("remuxes a stopped TS capture into a playable MP4 and consumes the TS", async () => {
+    const { db, plugins, media, queue, add } = await fixture({ outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-ts-live" });
+    // Emulate the TS-first live capture: the command writes MPEG-TS to
+    // {outputDir}/capture.ts, exactly like the real live recording path does.
+    plugins.get("test.output").resolveDownload = async () => ({ kind: "command", command: "ffmpeg", filename: "ts-live.mp4", args: ["-y", "-v", "error", "-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-re", "-f", "lavfi", "-i", "sine=frequency=440", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-f", "mpegts", "{outputDir}/capture.ts"] });
+    const item = add("ts-stopped", true);
+    queue.start();
+    // Wait until ffmpeg actually flushed bytes into capture.ts before stopping.
+    // The MPEG-TS muxer buffers writes (~32KB), so a stop issued too early sees
+    // an empty staging directory and the capture is discarded as if nothing
+    // was ever recorded -- in production the stream bitrate flushes it instantly.
+    const stagingRoot = path.join(media, ".downloads");
+    const captureFile = () => {
+      for (const dir of fs.readdirSync(stagingRoot)) {
+        const candidate = path.join(stagingRoot, dir, "capture.ts");
+        if (fs.existsSync(candidate)) return candidate;
+      }
+      return undefined;
+    };
+    const flushed = Date.now() + 20_000;
+    while ((!captureFile() || fs.statSync(captureFile()!).size < 65_536) && Date.now() < flushed) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(captureFile()).toBeDefined();
+    queue.stopRecording(item.id);
+    const done = await complete(db, item.id);
+    queue.stop();
+    const filename = path.join(media, done.storagePath!);
+    expect(done.storagePath).toMatch(/\.mp4$/);
+    const probe = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-show_streams", "-of", "json", filename], { encoding: "utf8" }));
+    expect(probe.streams.some((stream: any) => stream.codec_type === "video")).toBe(true);
+    // Stopping must remux the capture, not lose it: no TS left in staging, no
+    // recovery copy, and no leftover item directory.
+    expect(fs.existsSync(path.join(media, ".recording-recovery", item.id))).toBe(false);
+    expect(fs.readdirSync(path.join(media, ".downloads"))).toEqual([]);
+  }, 30_000);
 });
