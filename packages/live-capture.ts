@@ -9,6 +9,13 @@ const FFMPEG_CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
  * downloader remuxes the TS to MP4 afterwards and deletes the TS. `-reconnect`
  * lets a transient network error or a segment 403 self-heal inside the same
  * ffmpeg process instead of tearing the whole recording down.
+ *
+ * `-reconnect_at_eof` is deliberately NOT set: for HLS, every short segment and
+ * playlist request ends at EOF, so that flag makes ffmpeg reconnect to the same
+ * byte offset forever — it never finishes opening the init section and writes
+ * zero bytes, until the downloader's stall timeout kills it (verified against
+ * chaturbate LL-HLS on ffmpeg 5.1: without the flag the capture starts
+ * immediately, with it the process hangs until killed).
  */
 export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?: string; output: string; filename: string }): CommandDownloadRequest {
   const headerLines = new Map<string, string>();
@@ -20,14 +27,16 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
   const headerArg = [...headerLines].map(([key, value]) => `${key}: ${value}`).join("\r\n") + "\r\n";
   const args = [
     "-nostdin", "-hide_banner", "-loglevel", "warning", "-y",
-    "-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_on_network_error", "1",
+    "-reconnect", "1", "-reconnect_on_network_error", "1",
     "-reconnect_on_http_error", "5xx", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "10",
     "-user_agent", FFMPEG_CHROME_USER_AGENT,
   ];
   if (headerArg.trim()) args.push("-headers", headerArg);
-  args.push("-i", stream.url);
-  if (stream.audioUrl) args.push("-i", stream.audioUrl, "-map", "0", "-map", "1:a:0?");
+  // -thread_queue_size must precede the input it applies to; giving both HLS
+  // demuxers room stops them blocking each other on a shared video+audio capture.
+  args.push("-thread_queue_size", "512", "-i", stream.url);
+  if (stream.audioUrl) args.push("-thread_queue_size", "512", "-i", stream.audioUrl, "-map", "0", "-map", "1:a:0?");
   args.push("-c", "copy", "-f", "mpegts", options.output);
   return { kind: "command", command: "ffmpeg", args, filename: options.filename };
 }

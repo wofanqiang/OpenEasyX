@@ -290,7 +290,9 @@ export class DownloadQueue {
       } else if (control.paused) {
         this.db.setItemStatus(item.id, "paused", { error: null });
       } else {
-        if (control.stalled) message = "Download timed out (no progress received within the configured stall timeout)";
+        // Keep the underlying command output: without it a stall is undiagnosable
+        // (the real ffmpeg/yt-dlp error is the only clue to what went wrong).
+        if (control.stalled) message = `Download timed out (no progress received within the configured stall timeout). Underlying output: ${message.slice(0, 800)}`;
         this.handleFailure(item.id, message, control);
       }
     } finally {

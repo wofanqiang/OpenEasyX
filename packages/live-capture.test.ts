@@ -28,6 +28,8 @@ describe("live capture request", () => {
     expect(request.filename).toBe("a.mp4");
     expect(request.args).toEqual(expect.arrayContaining(["-reconnect_delay_max", "10", "-c", "copy", "-f", "mpegts", "{outputDir}/capture.ts"]));
     expect(request.args).not.toContain("-reconnect_delay_total_max");
+    // For HLS, -reconnect_at_eof loops forever instead of progressing; never emit it.
+    expect(request.args).not.toContain("-reconnect_at_eof");
     const headers = request.args[request.args.indexOf("-headers") + 1];
     expect(headers).toContain("Cookie: sid=1");
     expect(headers).toContain("Referer: https://site.test/");
@@ -39,6 +41,8 @@ describe("live capture request", () => {
       { output: "{outputDir}/capture.ts", filename: "a.mp4" },
     );
     expect(request.args).toEqual(expect.arrayContaining(["-i", "https://cdn.test/v.m3u8", "-i", "https://cdn.test/a.m3u8", "-map", "0", "-map", "1:a:0?"]));
+    // Each input gets its own queue so the two demuxers cannot block each other.
+    expect(request.args.filter((argument) => argument === "-thread_queue_size")).toHaveLength(2);
   });
 
   it("derives the referer from the recorded page origin", () => {
