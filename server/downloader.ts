@@ -102,7 +102,7 @@ export class DownloadQueue {
   }
 
   private async tick() {
-    const max = Math.max(1, Math.min(8, Number(this.db.getSettings().maxConcurrentDownloads ?? 2)));
+    const max = Math.max(1, Math.min(2, Number(this.db.getSettings().maxConcurrentDownloads ?? 1)));
     while (this.active.size < max) {
       const item = this.db.nextQueued();
       if (!item || this.active.has(item.id)) return;
@@ -333,7 +333,12 @@ export class DownloadQueue {
 
   private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload): Promise<void> {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+      // Memory guard for live recordings on small VPS: cap yt-dlp fragment concurrency
+      // and buffer so a single download cannot balloon the cgroup and trip OOM.
+      const effectiveArgs = command === "yt-dlp"
+        ? [...args, "--concurrent-fragments", "1", "--buffer-size", "4M"]
+        : args;
+      const child = spawn(command, effectiveArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
       if (control.paused) this.signal(control, "SIGSTOP");
       if (control.action) this.signal(control, control.action === "stop" ? "SIGINT" : "SIGTERM");

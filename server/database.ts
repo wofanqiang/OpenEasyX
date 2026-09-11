@@ -122,7 +122,7 @@ export class Database {
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_storage_path_idx ON items(storage_path)");
     this.migrateNitterToPublicX();
     this.setDefault("retentionDays", 0);
-    this.setDefault("maxConcurrentDownloads", 2);
+    this.setDefault("maxConcurrentDownloads", 1);
     this.setDefault("downloadRetryAttempts", 5);
     this.setDefault("downloadRetryBaseSeconds", 30);
     this.setDefault("downloadStallTimeoutSeconds", 120);
