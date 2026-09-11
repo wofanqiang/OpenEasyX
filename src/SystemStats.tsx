@@ -149,7 +149,7 @@ export function SystemStats() {
         caption={`${formatBytes(host.memory.usedBytes)} used · ${formatBytes(host.memory.availableBytes)} free`}/>
       <Metric icon={Server} label="Container memory" value={container.detected ? formatBytes(container.memoryBytes) : "n/a"}
         caption={container.detected
-          ? (container.memoryLimitBytes > 0 ? `Limit ${formatBytes(container.memoryLimitBytes)} · cgroup ${container.cgroupVersion}` : `No memory limit · cgroup ${container.cgroupVersion}`)
+          ? `${container.memoryLimitBytes > 0 ? `Limit ${formatBytes(container.memoryLimitBytes)}` : "No memory limit"} · cgroup ${container.cgroupVersion} · excl. reclaimable cache`
           : "Running outside a container"}/>
       <Metric icon={HardDrive} label="Recording buffer" value={`${recordings.activeDirectories} active`}
         caption={`${formatBytes(recordings.bytesOnDisk)} on disk · ${formatRate(recordings.writeBytesPerSecond)}`}/>

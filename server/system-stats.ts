@@ -161,6 +161,17 @@ export function parseCgroupUsageNanoseconds(text: string): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * Reclaimable page cache held by the cgroup. `docker stats` reports
+ * `usage - inactive_file` rather than the raw usage, because that cache is
+ * evictable under pressure; without this subtraction the panel would report a
+ * noticeably larger figure than `docker stats` for the same container.
+ */
+export function parseInactiveFile(text: string): number {
+  const match = /^inactive_file\s+(\d+)\s*$/m.exec(text);
+  return match ? Number(match[1]) : 0;
+}
+
 export function normalizeMemoryLimit(value: number | undefined): number {
   if (value === undefined) return 0;
   if (!Number.isFinite(value) || value <= 0 || value >= CGROUP_V1_UNLIMITED) return 0;
@@ -270,7 +281,7 @@ export class SystemStatsService {
     const v2Memory = readNumber(path.join(CGROUP_ROOT, "memory.current"));
     if (v2Memory !== undefined) {
       cgroupVersion = "v2";
-      containerMemoryBytes = v2Memory;
+      containerMemoryBytes = Math.max(0, v2Memory - parseInactiveFile(readText(path.join(CGROUP_ROOT, "memory.stat")) ?? ""));
       const max = readText(path.join(CGROUP_ROOT, "memory.max"));
       containerMemoryLimitBytes = normalizeMemoryLimit(max === undefined || max.trim() === "max" ? Number.POSITIVE_INFINITY : Number(max));
       const microseconds = parseCgroupUsageMicroseconds(readText(path.join(CGROUP_ROOT, "cpu.stat")) ?? "");
@@ -279,7 +290,7 @@ export class SystemStatsService {
       const v1Memory = readNumber(path.join(CGROUP_ROOT, "memory", "memory.usage_in_bytes"));
       if (v1Memory !== undefined) {
         cgroupVersion = "v1";
-        containerMemoryBytes = v1Memory;
+        containerMemoryBytes = Math.max(0, v1Memory - parseInactiveFile(readText(path.join(CGROUP_ROOT, "memory", "memory.stat")) ?? ""));
         containerMemoryLimitBytes = normalizeMemoryLimit(readNumber(path.join(CGROUP_ROOT, "memory", "memory.limit_in_bytes")));
         const nanoseconds = parseCgroupUsageNanoseconds(readText(path.join(CGROUP_ROOT, "cpuacct", "cpuacct.usage")) ?? "");
         if (nanoseconds !== undefined) cgroupUsageSeconds = nanoseconds / 1e9;

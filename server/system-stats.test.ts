@@ -6,6 +6,7 @@ import {
   parseCgroupUsageMicroseconds,
   parseCgroupUsageNanoseconds,
   parseDiskstats,
+  parseInactiveFile,
   parseLoadavg,
   parseMeminfo,
   parseNetDev,
@@ -92,6 +93,12 @@ describe("system stats parsers", () => {
     expect(normalizeMemoryLimit(undefined)).toBe(0);
     expect(normalizeMemoryLimit(9_223_372_036_854_771_000)).toBe(0);
     expect(normalizeMemoryLimit(Number.POSITIVE_INFINITY)).toBe(0);
+  });
+
+  it("reads reclaimable page cache so container memory can match docker stats", () => {
+    const stat = ["cache 900000", "rss 400000", "inactive_file 250000", "active_file 100000"].join("\n");
+    expect(parseInactiveFile(stat)).toBe(250000);
+    expect(parseInactiveFile("rss 1\ncache 2")).toBe(0);
   });
 
   it("clamps percentages to a sane range", () => {
