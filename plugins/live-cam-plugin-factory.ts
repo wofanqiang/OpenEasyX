@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { definePlugin, type EasyXPlugin, type MediaCandidate, type PluginManifest } from "../packages/plugin-sdk/index.js";
+import { definePlugin, type EasyXPlugin, type LiveCam, type LiveStream, type MediaCandidate, type PluginManifest } from "../packages/plugin-sdk/index.js";
 import { browserCapturedLiveStream } from "./browser-html-utils.js";
 import { listDiscoveredLiveCams, type LiveCamDiscoveryProvider } from "./live-cam-discovery.js";
-import { configuredArgs, runYtDlpJson, testYtDlp, ytDlpDownload, ytDlpLiveStream } from "./yt-dlp-utils.js";
+import { configuredArgs, ffmpegLiveCaptureCommand, runYtDlpJson, testYtDlp, ytDlpDownload, ytDlpLiveStream } from "./yt-dlp-utils.js";
 
 const OFFLINE_MARKERS = [
   "channel is not currently live", "model is offline", "model is in private show", "no active streams",
@@ -126,6 +126,26 @@ export function createLiveCamPlugin(options: LiveCamPluginOptions): EasyXPlugin 
       }
     },
     ...(options.discovery ? { async listLiveCams(context, query) { return listDiscoveredLiveCams(context, options.discovery!, query); } } : {}),
-    async resolveDownload(context, item) { return ytDlpDownload(item, context.config, { referer, live: true }); },
+    async resolveDownload(context, item) {
+      if ((item.metadata as Record<string, unknown> | undefined)?.live === true) {
+        // Capture the live HLS to MPEG-TS with ffmpeg (lightweight, crash-safe,
+        // self-reconnecting). The downloader remuxes TS -> MP4 and deletes the TS.
+        // Re-resolving here (instead of at queue time) keeps the HLS token fresh
+        // across retries when a long session expires mid-recording.
+        const meta = item.metadata as Record<string, unknown> | undefined;
+        const pageUrl = item.pageUrl ?? (typeof meta?.extractorUrl === "string" ? meta.extractorUrl : undefined);
+        if (!pageUrl) throw new Error("Live recording item is missing the source page URL");
+        const cam: LiveCam = { id: item.externalId, username: item.identityKey ?? item.title ?? "live", title: item.title, pageUrl };
+        let stream: LiveStream;
+        try {
+          stream = await ytDlpLiveStream(context, cam, { referer, impersonate: "chrome" });
+        } catch (error) {
+          context.log("debug", `${options.name} live resolution failed for capture; falling back to browser capture`, error instanceof Error ? error.message : String(error));
+          stream = await browserCapturedLiveStream(context, pageUrl);
+        }
+        return ffmpegLiveCaptureCommand(stream, { referer, output: "{outputDir}/capture.ts", filename: item.filename ?? `${item.externalId}.mp4` });
+      }
+      return ytDlpDownload(item, context.config, { referer });
+    },
   });
 }

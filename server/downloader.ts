@@ -102,7 +102,7 @@ export class DownloadQueue {
   }
 
   private async tick() {
-    const max = Math.max(1, Math.min(2, Number(this.db.getSettings().maxConcurrentDownloads ?? 1)));
+    const max = Math.max(1, Math.min(8, Number(this.db.getSettings().maxConcurrentDownloads ?? 2)));
     while (this.active.size < max) {
       const item = this.db.nextQueued();
       if (!item || this.active.has(item.id)) return;
@@ -165,6 +165,27 @@ export class DownloadQueue {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
         }), temporaryDirectory, item.expectedBytes, reportProgress, control);
+        // Live captures land as MPEG-TS (capture.ts); remux to MP4 in place and
+        // delete the TS so every downstream step only ever sees a .mp4 file.
+        // Gated on the TS file actually existing so non-TS captures are untouched.
+        if ((item.metadata as Record<string, unknown> | undefined)?.live === true) {
+          const tsPath = path.join(temporaryDirectory, "capture.ts");
+          if (fs.existsSync(tsPath) && fs.statSync(tsPath).size > 0) {
+            const mp4Staging = path.join(temporaryDirectory, "encoded.mp4");
+            control.encoding = true;
+            this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
+            this.writeLog?.("info", "download", "Remuxing live TS capture to MP4", { itemId: item.id });
+            await this.runCommandDownload("ffmpeg", [
+              "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
+              "-map", "0", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+              "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
+            ], temporaryDirectory, undefined, () => {}, control);
+            if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
+            if (!fs.existsSync(mp4Staging) || !fs.statSync(mp4Staging).size) throw new Error("Remux to MP4 produced no output");
+            fs.unlinkSync(tsPath);
+            fs.renameSync(mp4Staging, temporary);
+          }
+        }
         if (!fs.existsSync(temporary) || fs.statSync(temporary).size === 0) throw new Error("Extractor completed without producing a media file");
         reportProgress(0.99, fs.statSync(temporary).size, true);
         checksum = await this.hashFile(temporary);

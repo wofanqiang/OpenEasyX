@@ -146,3 +146,35 @@ export function ytDlpDownload(item: MediaCandidate, config: Record<string, unkno
 export function positiveInteger(value: unknown, fallback: number, maximum = 500): number {
   return Math.max(1, Math.min(maximum, Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : fallback));
 }
+
+const FFMPEG_CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/**
+ * Build an ffmpeg command that captures a live HLS stream straight to MPEG-TS.
+ * Capturing to TS (instead of letting yt-dlp record the whole session) keeps
+ * memory in the tens of MB per stream and tolerates an abrupt stop: the
+ * downloader remuxes the TS to MP4 afterwards and deletes the TS. `-reconnect`
+ * lets a transient network error or a segment 403 self-heal inside the same
+ * ffmpeg process instead of tearing the whole recording down.
+ */
+export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?: string; output: string; filename: string }): CommandDownloadRequest {
+  const headerLines = new Map<string, string>();
+  if (options.referer) headerLines.set("Referer", options.referer);
+  for (const [key, value] of Object.entries(stream.headers ?? {})) {
+    if (/^user-agent$/i.test(key)) continue; // emitted via -user_agent below
+    headerLines.set(key, value);
+  }
+  const headerArg = [...headerLines].map(([key, value]) => `${key}: ${value}`).join("\r\n") + "\r\n";
+  const args = [
+    "-nostdin", "-hide_banner", "-loglevel", "warning", "-y",
+    "-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_on_network_error", "1",
+    "-reconnect_on_http_error", "5xx", "-reconnect_streamed", "1",
+    "-reconnect_delay_max", "10", "-reconnect_delay_total_max", "120",
+    "-user_agent", FFMPEG_CHROME_USER_AGENT,
+  ];
+  if (headerArg.trim()) args.push("-headers", headerArg);
+  args.push("-i", stream.url);
+  if (stream.audioUrl) args.push("-i", stream.audioUrl, "-map", "0", "-map", "1:a:0?");
+  args.push("-c", "copy", "-f", "mpegts", options.output);
+  return { kind: "command", command: "ffmpeg", args, filename: options.filename };
+}

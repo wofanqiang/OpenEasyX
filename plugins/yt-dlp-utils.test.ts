@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { liveStreamFromInfo, ytDlpDownload } from "./yt-dlp-utils.js";
+import { ffmpegLiveCaptureCommand, liveStreamFromInfo, ytDlpDownload } from "./yt-dlp-utils.js";
 
 describe("live stream selection", () => {
   it("keeps separate live video and audio tracks when yt-dlp selected both formats", () => {
@@ -31,5 +31,24 @@ describe("live recording output", () => {
     expect(request.args).toContain("--no-hls-use-mpegts");
     expect(request.args).not.toContain("--hls-use-mpegts");
     expect(request.args).toEqual(expect.arrayContaining(["--merge-output-format", "mp4", "--remux-video", "mp4"]));
+  });
+
+  it("captures a live stream to MPEG-TS with ffmpeg and self-reconnect flags", () => {
+    const stream = { url: "https://cdn.test/live.m3u8?token=fresh", audioUrl: "https://cdn.test/audio.m3u8", headers: { Referer: "https://live.test/", "User-Agent": "yt-dlp" } };
+    const request = ffmpegLiveCaptureCommand(stream, { referer: "https://live.test/", output: "{outputDir}/capture.ts", filename: "alice.mp4" });
+    expect(request.command).toBe("ffmpeg");
+    expect(request.filename).toBe("alice.mp4");
+    // reconnect lets a transient 403 / network blip self-heal inside one ffmpeg process
+    expect(request.args).toContain("-reconnect");
+    expect(request.args).toContain("-reconnect_on_http_error");
+    expect(request.args).toContain("5xx");
+    // straight to MPEG-TS so the downloader can remux + delete afterwards
+    expect(request.args).toEqual(expect.arrayContaining(["-f", "mpegts", "{outputDir}/capture.ts"]));
+    // per-stream headers are forwarded (minus User-Agent, which ffmpeg emits itself)
+    const headerArg = request.args[request.args.indexOf("-headers") + 1];
+    expect(headerArg).toContain("Referer: https://live.test/");
+    expect(headerArg).not.toContain("User-Agent:");
+    // audio is mapped in when a separate audio track exists
+    expect(request.args).toEqual(expect.arrayContaining(["-i", "https://cdn.test/audio.m3u8", "-map", "0", "-map", "1:a:0?"]));
   });
 });
