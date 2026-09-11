@@ -169,7 +169,7 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
     "-nostdin", "-hide_banner", "-loglevel", "warning", "-y",
     "-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_on_network_error", "1",
     "-reconnect_on_http_error", "5xx", "-reconnect_streamed", "1",
-    "-reconnect_delay_max", "10", "-reconnect_delay_total_max", "120",
+    "-reconnect_delay_max", "10",
     "-user_agent", FFMPEG_CHROME_USER_AGENT,
   ];
   if (headerArg.trim()) args.push("-headers", headerArg);
