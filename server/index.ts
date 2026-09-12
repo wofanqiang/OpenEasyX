@@ -22,6 +22,7 @@ import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
 import { registerLibraryRoutes } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
+import { startAutoRecorder } from "./auto-recorder.js";
 import { AuthService } from "./auth.js";
 import type { FastifyRequest, FastifyReply } from "fastify";
 
@@ -60,6 +61,7 @@ systemStats.start();
 const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });
 const discoveryStatus = { running: false, completed: 0, total: 0, progress: 0, query: "", error: "" };
 const performerRefreshStatus = { running: false, completed: 0, total: 0, progress: 0, error: "" };
+const autoRecorder = startAutoRecorder({ db, liveCams, log: (message) => app.log.info({ scope: "auto-record" }, message) });
 
 function ensureBrowserLoginEnabled() {
   if (process.env.EASYX_ENABLE_BROWSER_LOGIN !== "true") {
@@ -324,6 +326,16 @@ app.put<{ Body: unknown }>("/api/live-cams/favorites", async (request) => {
 app.post<{ Params: { providerId: string } }>("/api/live-cams/favorites/sync/:providerId", async (request) => {
   const providerId = z.string().trim().min(1).max(200).parse(request.params.providerId);
   return liveCams.syncFavorites(providerId);
+});
+app.patch<{ Body: unknown }>("/api/live-cams/favorites/auto-record", async (request) => {
+  const body = z.object({
+    providerId: z.string().trim().min(1).max(200),
+    username: z.string().trim().min(1).max(300),
+    autoRecord: z.boolean(),
+  }).parse(request.body);
+  const item = liveCams.setFavoriteAutoRecord(body.providerId, body.username, body.autoRecord);
+  if (!item) throw Object.assign(new Error("Favorite not found"), { statusCode: 404 });
+  return item;
 });
 app.post<{ Body: unknown }>("/api/live-cams/performer", async (request) => {
   const body = liveCamBodySchema.parse(request.body);
@@ -708,7 +720,7 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; queue.stop(); systemStats.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  shuttingDown = true; queue.stop(); systemStats.stop(); autoRecorder.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);

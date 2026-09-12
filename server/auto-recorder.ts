@@ -1,0 +1,121 @@
+import type { Database } from "./database.js";
+import type { LiveCamService } from "./live-cams.js";
+
+// Download statuses that mean "a recording for this cam is still in flight".
+// Mirrors the buckets used by Database.listItems(); kept local to avoid coupling.
+const ACTIVE_STATUSES = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
+// After a recording ends, wait before auto-starting another one for the same cam so a
+// flapping online/offline edge (or a stale cached snapshot) cannot trigger a loop.
+const COOLDOWN_MS = 10 * 60_000;
+// Settings bounds for the status-check interval (seconds).
+const INTERVAL = { min: 30, max: 3600, fallback: 60 };
+const LIVE_ITEM = /^(?:auto|manual)-live:([^:]+):/;
+
+export type AutoRecorder = { stop: () => void; tick: () => Promise<void> };
+
+export function startAutoRecorder({ db, liveCams, log }: {
+  db: Database;
+  liveCams: LiveCamService;
+  log?: (message: string) => void;
+}): AutoRecorder {
+  // providerId:usernameLower -> itemId of the recording we are tracking.
+  const active = new Map<string, { itemId: string }>();
+  const cooldowns = new Map<string, number>();
+  let running = false;
+  let timer: NodeJS.Timeout | undefined;
+
+  const keyOf = (providerId: string, username: string) => `${providerId}:${username.trim().toLowerCase()}`;
+
+  const intervalSeconds = (): number => {
+    const raw = Number(db.getSettings().autoRecordCheckSeconds);
+    if (!Number.isFinite(raw)) return INTERVAL.fallback;
+    return Math.min(INTERVAL.max, Math.max(INTERVAL.min, raw));
+  };
+
+  // Reconcile the in-memory active set with the DB on every tick: recordings that were
+  // in flight when the process (re)started keep blocking new auto-starts for the same cam,
+  // and recordings that finished (or vanished) move their cam onto the cooldown list.
+  const syncActive = () => {
+    const liveKeys = new Map<string, string>();
+    for (const item of db.listItems(300)) {
+      const match = LIVE_ITEM.exec(item.externalId);
+      if (match && ACTIVE_STATUSES.has(item.status)) liveKeys.set(`${item.pluginId}:${match[1]}`, item.id);
+    }
+    for (const [key, itemId] of liveKeys) if (!active.has(key)) active.set(key, { itemId });
+    for (const [key, entry] of [...active]) {
+      if (liveKeys.has(key)) continue;
+      active.delete(key);
+      cooldowns.set(key, Date.now() + COOLDOWN_MS);
+      log?.(`auto-record: recording ${entry.itemId} finished; ${key} enters cooldown`);
+    }
+    for (const [key, until] of cooldowns) if (until < Date.now() - COOLDOWN_MS) cooldowns.delete(key);
+  };
+
+  const tick = async () => {
+    if (running) return; // a previous cycle is still in flight; skip this round
+    running = true;
+    try {
+      syncActive();
+
+      // Only providers that actually have an auto-record favorite are polled.
+      const byProvider = new Map<string, string[]>();
+      for (const favorite of db.listLiveCamFavorites()) {
+        if (!favorite.autoRecord) continue;
+        const usernames = byProvider.get(favorite.providerId) ?? [];
+        usernames.push(favorite.username.toLowerCase());
+        byProvider.set(favorite.providerId, usernames);
+      }
+
+      for (const [providerId, usernames] of byProvider) {
+        let items;
+        try {
+          // Reuses the favorites status path and its caches (getLiveCam TTL 60s), so the
+          // watcher adds no extra provider traffic beyond refreshing stale snapshots.
+          const result = await liveCams.list({ providerId, favoritesOnly: true, page: 1, pageSize: 48 });
+          const providerStatus = result.providers.find((provider) => provider.id === providerId);
+          if (providerStatus && !providerStatus.ok) {
+            log?.(`auto-record: ${providerId} status check failed: ${providerStatus.error ?? "unknown error"}`);
+            continue;
+          }
+          items = result.items;
+        } catch (error) {
+          log?.(`auto-record: ${providerId} status check threw: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+        for (const cam of items) {
+          const usernameKey = cam.username.trim().toLowerCase();
+          if (!usernames.includes(usernameKey)) continue;
+          const key = keyOf(providerId, cam.username);
+          if (active.has(key)) continue;
+          if ((cooldowns.get(key) ?? 0) > Date.now()) continue;
+          // Never auto-start from an uncertain status; missing a few minutes is better
+          // than recording a room that is actually offline.
+          if (cam.online === false || cam.statusUnavailable) continue;
+          try {
+            const { itemId } = await liveCams.record(providerId, cam, { origin: "auto" });
+            active.set(key, { itemId });
+            log?.(`auto-record: ${cam.username} is live; recording started (${itemId})`);
+          } catch (error) {
+            log?.(`auto-record: could not start recording for ${cam.username}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+    } finally {
+      running = false;
+    }
+  };
+
+  const schedule = () => {
+    timer = setTimeout(async () => {
+      await tick();
+      schedule();
+    }, intervalSeconds() * 1000);
+    timer.unref();
+  };
+
+  schedule();
+  return {
+    stop: () => { if (timer) clearTimeout(timer); },
+    tick,
+  };
+}

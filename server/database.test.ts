@@ -20,6 +20,17 @@ describe("Database", () => {
     expect(db.listLiveCamFavorites()).toEqual([]);
   });
 
+  it("defaults favorites to auto-record off and persists the toggle", () => {
+    const db = createDb();
+    db.setLiveCamFavorite("test.live", { camId: "alice-id", username: "Alice", pageUrl: "https://live.test/Alice" }, true);
+    // New favorites start with auto-record disabled.
+    expect(db.listLiveCamFavorites()[0]).toMatchObject({ username: "Alice", autoRecord: false });
+    expect(db.setLiveCamFavoriteAutoRecord("test.live", "ALICE", true)).toMatchObject({ username: "Alice", autoRecord: true });
+    expect(db.setLiveCamFavoriteAutoRecord("test.live", "alice", true)).toMatchObject({ autoRecord: true });
+    expect(db.setLiveCamFavoriteAutoRecord("test.live", "alice", false)).toMatchObject({ autoRecord: false });
+    expect(db.getSettings().autoRecordCheckSeconds).toBe(60);
+  });
+
   it("queues discovered media by default without overriding a saved preference", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
     const initial = new Database(dir);

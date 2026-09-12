@@ -41,6 +41,7 @@ export type ItemPage = {
 
 export type LiveCamFavorite = {
   providerId: string; camId: string; username: string; title?: string; pageUrl: string; thumbnailUrl?: string;
+  autoRecord: boolean;
   createdAt: string; updatedAt: string;
 };
 export type LiveCamFavoriteInput = Pick<LiveCamFavorite, "camId" | "username" | "pageUrl"> & Partial<Pick<LiveCamFavorite, "title" | "thumbnailUrl">>;
@@ -104,6 +105,8 @@ export class Database {
         PRIMARY KEY(provider_id, username_key)
       );
     `);
+    const favoriteColumns = new Set((this.sqlite.prepare("PRAGMA table_info(live_cam_favorites)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!favoriteColumns.has("auto_record")) this.sqlite.exec("ALTER TABLE live_cam_favorites ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0");
     const sourceColumns = new Set((this.sqlite.prepare("PRAGMA table_info(sources)").all() as Array<{ name: string }>).map((column) => column.name));
     if (!sourceColumns.has("scraper_plugin_id")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scraper_plugin_id TEXT");
     if (!sourceColumns.has("scrape_enabled")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scrape_enabled INTEGER NOT NULL DEFAULT 0");
@@ -129,6 +132,7 @@ export class Database {
     this.setDefault("autoQueueDiscovered", true);
     this.setDefault("defaultScrapeIntervalMinutes", 360);
     this.setDefault("defaultLiveIntervalSeconds", 10);
+    this.setDefault("autoRecordCheckSeconds", 60);
     this.setDefault("admin_password_hash", "");
     for (const [key, value] of Object.entries(outputDefaults)) this.setDefault(key, value);
   }
@@ -181,6 +185,15 @@ export class Database {
       ? this.sqlite.prepare("SELECT * FROM live_cam_favorites WHERE provider_id=? ORDER BY username COLLATE NOCASE").all(providerId)
       : this.sqlite.prepare("SELECT * FROM live_cam_favorites ORDER BY username COLLATE NOCASE").all();
     return (rows as any[]).map(this.mapLiveCamFavorite);
+  }
+
+  setLiveCamFavoriteAutoRecord(providerId: string, username: string, autoRecord: boolean): LiveCamFavorite | undefined {
+    const usernameKey = username.trim().toLowerCase();
+    const updated = this.sqlite.prepare("UPDATE live_cam_favorites SET auto_record=?,updated_at=? WHERE provider_id=? AND username_key=?")
+      .run(autoRecord ? 1 : 0, now(), providerId, usernameKey);
+    if (!updated.changes) return undefined;
+    const row = this.sqlite.prepare("SELECT * FROM live_cam_favorites WHERE provider_id=? AND username_key=?").get(providerId, usernameKey) as any;
+    return row ? this.mapLiveCamFavorite(row) : undefined;
   }
 
   isLiveCamFavorite(providerId: string, username: string): boolean {
@@ -550,7 +563,8 @@ export class Database {
   private mapLiveCamFavorite(row: any): LiveCamFavorite {
     return {
       providerId: row.provider_id, camId: row.cam_id, username: row.username, title: row.title ?? undefined,
-      pageUrl: row.page_url, thumbnailUrl: row.thumbnail_url ?? undefined, createdAt: row.created_at, updatedAt: row.updated_at,
+      pageUrl: row.page_url, thumbnailUrl: row.thumbnail_url ?? undefined, autoRecord: !!row.auto_record,
+      createdAt: row.created_at, updatedAt: row.updated_at,
     };
   }
 }

@@ -5,7 +5,7 @@ import type { LiveCam, LiveCamFavoriteSnapshot, LiveCamQuery, LiveStream } from 
 import type { Database, LiveCamFavorite, Performer, Source } from "./database.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 
-export type PublicLiveCam = LiveCam & { providerId: string; providerName: string; favorite: boolean; performerId?: string };
+export type PublicLiveCam = LiveCam & { providerId: string; providerName: string; favorite: boolean; autoRecord: boolean; performerId?: string };
 export type LiveCamProviderStatus = { id: string; name: string; ok: boolean; count: number; pending?: boolean; error?: string; warning?: string };
 export type LiveCamResult = {
   items: PublicLiveCam[]; total: number; page: number; pageSize: number; pages: number;
@@ -255,8 +255,11 @@ export class LiveCamService {
         cams = cams.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
       }
       const performers = this.db.listPerformers();
+      // Attach the per-favorite auto-record flag so favorite cards can render their toggle
+      // without a second round-trip; non-favorites always report false.
+      const autoRecordMap = new Map(this.db.listLiveCamFavorites(entry.manifest.id).map((favorite) => [favorite.username.toLowerCase(), favorite.autoRecord]));
       const normalized = cams.filter((cam) => pluginMatchesSource(entry.manifest, cam.pageUrl))
-        .map((cam) => this.linkPerformer({ ...cam, providerId: entry.manifest.id, providerName: entry.manifest.name, favorite: this.db.isLiveCamFavorite(entry.manifest.id, cam.username) }, performers));
+        .map((cam) => this.linkPerformer({ ...cam, providerId: entry.manifest.id, providerName: entry.manifest.name, favorite: this.db.isLiveCamFavorite(entry.manifest.id, cam.username), autoRecord: autoRecordMap.get(cam.username.toLowerCase()) ?? false }, performers));
       // A rendered favorite may itself come from a cache or an offline placeholder.
       if (!favoritesOnly && epoch === this.favoriteEpoch.get(entry.manifest.id)) for (const cam of normalized) this.recentCams.set(`${entry.manifest.id}:${cam.id.toLowerCase()}`, { cam, expiresAt: Date.now() + 120_000 });
       return {
@@ -337,7 +340,7 @@ export class LiveCamService {
     if (plugin.getLiveCam && saved) {
       const cam = await plugin.getLiveCam(this.plugins.context(providerId), { ...saved, id: saved.camId });
       if (cam.online === false) throw Object.assign(new Error("This cam is no longer live"), { statusCode: 404 });
-      return this.linkPerformer({ ...cam, providerId, providerName: entry.manifest.name, favorite: true });
+      return this.linkPerformer({ ...cam, providerId, providerName: entry.manifest.name, favorite: true, autoRecord: saved.autoRecord });
     }
     const result = await this.listProvider(entry, { page: 1, pageSize: 48, search: camId });
     if (!result.status.ok) throw Object.assign(new Error(result.status.error ?? "The live provider could not be reached"), { statusCode: 502 });
@@ -349,6 +352,10 @@ export class LiveCamService {
 
   listFavorites(): LiveCamFavorite[] {
     return this.db.listLiveCamFavorites();
+  }
+
+  setFavoriteAutoRecord(providerId: string, username: string, autoRecord: boolean): LiveCamFavorite | undefined {
+    return this.db.setLiveCamFavoriteAutoRecord(providerId, username, autoRecord);
   }
 
   favoriteChanges() {
@@ -505,7 +512,7 @@ export class LiveCamService {
     return { performer, source, created: !existing, sourceCreated: !existingSource };
   }
 
-  async record(providerId: string, cam: LiveCam): Promise<{ itemId: string; status: string }> {
+  async record(providerId: string, cam: LiveCam, options: { origin?: "manual" | "auto" } = {}): Promise<{ itemId: string; status: string }> {
     const entry = this.livePlugins(providerId)[0];
     if (!entry) throw Object.assign(new Error("The selected live-cam plugin is not installed"), { statusCode: 404 });
     const plugin = this.plugins.get(providerId);
@@ -516,7 +523,7 @@ export class LiveCamService {
     const username = cam.username.trim();
     const startedAt = new Date();
     const session = startedAt.toISOString().replace(/[:.]/g, "-");
-    const externalId = `manual-live:${username.toLowerCase()}:${session}`;
+    const externalId = `${options.origin === "auto" ? "auto-live" : "manual-live"}:${username.toLowerCase()}:${session}`;
     const safeName = username.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "live";
     const { performer, source } = this.createPerformer(providerId, cam);
     let recordingAudioUrl: string | undefined;

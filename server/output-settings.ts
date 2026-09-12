@@ -10,6 +10,7 @@ export const settingsSchema = z.object({
   retentionDays: z.number().int().min(0).max(36500).optional(), maxConcurrentDownloads: z.number().int().min(1).max(8).optional(),
   autoQueueDiscovered: z.boolean().optional(), legalAccepted: z.boolean().optional(),
   defaultScrapeIntervalMinutes: z.number().int().min(5).max(525600).optional(), defaultLiveIntervalSeconds: z.number().int().min(5).max(3600).optional(),
+  autoRecordCheckSeconds: z.number().int().min(30).max(3600).optional(),
   outputPathTemplate: template("path").optional(), outputFilenameTemplate: template("filename").optional(),
   recordingPreset: z.enum(["source", "h264-high", "h264-small", "h265"]).optional(),
 });
