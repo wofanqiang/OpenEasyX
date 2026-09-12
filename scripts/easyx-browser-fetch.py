@@ -37,6 +37,9 @@ def rendered_html(url: str) -> str:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-breakpad",
+                "--disable-crash-reporter",
+                "--disable-crashpad",
                 "--disable-background-networking",
                 "--hide-scrollbars",
                 "--window-size=1440,1200",
@@ -48,7 +51,7 @@ def rendered_html(url: str) -> str:
             capture_output=True,
             text=True,
             timeout=75,
-            env={**os.environ, "LANG": "en_US.UTF-8"},
+            env={**os.environ, "LANG": "en_US.UTF-8", "XDG_CONFIG_HOME": os.path.join(profile, "config"), "XDG_CACHE_HOME": os.path.join(profile, "cache")},
             check=False,
         )
     if result.returncode != 0 or not result.stdout.strip():
@@ -260,6 +263,9 @@ def captured_media(url: str, cookies_file: str | None = None) -> str:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-breakpad",
+                "--disable-crash-reporter",
+                "--disable-crashpad",
                 "--autoplay-policy=no-user-gesture-required",
                 "--remote-allow-origins=*",
                 f"--remote-debugging-port={port}",
@@ -268,7 +274,7 @@ def captured_media(url: str, cookies_file: str | None = None) -> str:
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env={**os.environ, "LANG": "en_US.UTF-8"},
+            env={**os.environ, "LANG": "en_US.UTF-8", "XDG_CONFIG_HOME": os.path.join(profile, "config"), "XDG_CACHE_HOME": os.path.join(profile, "cache")},
         )
         try:
             page = None
@@ -428,10 +434,13 @@ def stripchat_favorite(url: str, cookies_file: str, model_id: int, follow: bool)
         raise RuntimeError("Chromium is not installed")
     port = _free_port()
     with tempfile.TemporaryDirectory(prefix="easyx-stripchat-favorite-", ignore_cleanup_errors=True) as profile:
+        os.makedirs(os.path.join(profile, "config"), exist_ok=True)
+        os.makedirs(os.path.join(profile, "cache"), exist_ok=True)
         process = subprocess.Popen([
             executable, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-breakpad", "--disable-crash-reporter", "--disable-crashpad",
             "--remote-allow-origins=*", f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "about:blank",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "LANG": "en_US.UTF-8"})
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "LANG": "en_US.UTF-8", "XDG_CONFIG_HOME": os.path.join(profile, "config"), "XDG_CACHE_HOME": os.path.join(profile, "cache")})
         try:
             page = None
             deadline = time.monotonic() + 10

@@ -27,6 +27,8 @@ describe("live capture request", () => {
     expect(request.command).toBe("ffmpeg");
     expect(request.filename).toBe("a.mp4");
     expect(request.args).toEqual(expect.arrayContaining(["-reconnect_delay_max", "10", "-c", "copy", "-f", "mpegts", "{outputDir}/capture.ts"]));
+    // Wall-clock timestamps keep a split video/audio HLS aligned (no constant A/V skew).
+    expect(request.args).toEqual(expect.arrayContaining(["-use_wallclock_as_timestamps", "1"]));
     expect(request.args).not.toContain("-reconnect_delay_total_max");
     // For HLS, -reconnect_at_eof loops forever instead of progressing; never emit it.
     expect(request.args).not.toContain("-reconnect_at_eof");
