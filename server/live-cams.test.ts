@@ -457,6 +457,23 @@ describe("Open EasyX live cams", () => {
     await expect(service.get("test.live", "alice")).resolves.toMatchObject({ performerId: database.listPerformers()[0].id });
   });
 
+  it("toggles auto-record at the performer level across its live-cam favorites", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    await service.setFavorite("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+    const performer = database.listPerformers().find((entry) => entry.externalRefs["test.live"] === "alice")!;
+    expect(service.performerAutoRecord(performer)).toBe(false);
+    // Without a saved favorite there is nothing to attach the flag to; the watcher only
+    // polls favorites, so a toggle without one must fail loudly instead of silently no-op.
+    const lone = database.createPerformer({ name: "lone", aliases: [] });
+    expect(() => service.setPerformerAutoRecord(lone.id, true)).toThrowError(/favorite/i);
+    expect(service.setPerformerAutoRecord(performer.id, true).matched).toBe(1);
+    expect(database.listLiveCamFavorites("test.live")).toEqual([expect.objectContaining({ username: "alice", autoRecord: true })]);
+    // The read path mirrors findPerformer: external refs first, performer name fallback.
+    expect(service.performerAutoRecord(database.getPerformerByName("ALICE")!)).toBe(true);
+    expect(service.setPerformerAutoRecord(performer.id, false).matched).toBe(1);
+    expect(service.performerAutoRecord(database.getPerformer(performer.id)!)).toBe(false);
+  });
+
   it("resolves provider streams behind a short-lived Downloader proxy URL", async () => {
     const { plugins, service } = await fixture(); plugins.install("org.easyx.viewer"); plugins.install("test.live");
     await expect(service.resolve("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }))

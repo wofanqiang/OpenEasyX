@@ -358,6 +358,35 @@ export class LiveCamService {
     return this.db.setLiveCamFavoriteAutoRecord(providerId, username, autoRecord);
   }
 
+  // Auto-record is stored per live-cam favorite, but the Performers UI toggles it per
+  // performer. Mirror findPerformer's identity rules: a favorite belongs to a performer
+  // when its username matches one of the performer's external refs or the performer name.
+  private performerFavoriteMatches(performer: Performer): LiveCamFavorite[] {
+    const refs = new Set(Object.values(performer.externalRefs).map((value) => value.trim().toLowerCase()));
+    const name = performer.name.trim().toLowerCase();
+    return this.db.listLiveCamFavorites().filter((favorite) => {
+      const username = favorite.username.trim().toLowerCase();
+      return refs.has(username) || username === name;
+    });
+  }
+
+  performerAutoRecord(performer: Performer): boolean {
+    return this.performerFavoriteMatches(performer).some((favorite) => favorite.autoRecord);
+  }
+
+  setPerformerAutoRecord(performerId: string, autoRecord: boolean): { performer: Performer; matched: number } {
+    const performer = this.db.getPerformer(performerId);
+    if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+    const matches = this.performerFavoriteMatches(performer);
+    // The watcher only polls saved favorites, so a toggle without one would be a no-op.
+    if (!matches.length) throw Object.assign(new Error("Save this creator as a live-cam favorite first — auto-record follows the favorite list"), { statusCode: 409 });
+    let matched = 0;
+    for (const favorite of matches) {
+      if (this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, autoRecord)) matched += 1;
+    }
+    return { performer, matched };
+  }
+
   favoriteChanges() {
     return this.db.listLiveCamFavoriteChanges().map(({ providerId, cam, state, error }) => ({ providerId, username: cam.username, state, error }));
   }

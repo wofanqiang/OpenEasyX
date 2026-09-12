@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type HlsInstance from "hls.js";
-import { AlertTriangle, ArrowLeft, Check, Download, Eye, LoaderCircle, Maximize, Minimize, Pause, Play, Radio, RefreshCw, Search, Server, Star, UserPlus, Users, Volume2, VolumeX } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Download, Eye, LoaderCircle, Maximize, Minimize, Pause, Play, Radio, RefreshCw, Search, Server, Star, UserPlus, Users, Volume2, VolumeX } from "lucide-react";
 import { api } from "./api";
 import { loadPlayerAudio, savePlayerAudio } from "./player-audio";
 import { monitorVideoStalls } from "./video-stall-recovery";
@@ -11,7 +11,7 @@ import "./live-player.css";
 
 export type LiveCam = {
   id: string; username: string; title?: string; pageUrl: string; thumbnailUrl?: string; viewers?: number; age?: number; gender?: string; tags?: string[];
-  providerId: string; providerName: string; favorite?: boolean; autoRecord?: boolean; online?: boolean; performerId?: string; statusUnavailable?: boolean;
+  providerId: string; providerName: string; favorite?: boolean; online?: boolean; performerId?: string; statusUnavailable?: boolean;
 };
 type LiveCamFavorite = Pick<LiveCam, "providerId" | "id" | "username" | "title" | "pageUrl" | "thumbnailUrl">;
 type Provider = { id: string; name: string; ok: boolean; count: number; pending?: boolean; error?: string; warning?: string };
@@ -197,24 +197,6 @@ export function LiveCamFavoriteButton({ cam }: { cam: LiveCam }) {
   return <>{<button className={`quiet live-favorite-button${favorite ? " active" : ""}`} onClick={() => void toggle()} disabled={saving} aria-pressed={favorite}><Star fill={favorite ? "currentColor" : "none"}/>{saving ? "Saving…" : favorite ? "Favorited" : "Favorite creator"}</button>}{favoriteError && <p className="row-error" role="alert">{favoriteError}</p>}</>;
 }
 
-export function LiveCamAutoRecordButton({ cam }: { cam: LiveCam }) {
-  // Toggle for the per-favorite auto-record switch. Lives inside a clickable card, so it
-  // must swallow the click to avoid navigating to the watch page.
-  const [autoRecord, setAutoRecord] = useState(Boolean(cam.autoRecord)); const [saving, setSaving] = useState(false); const [failed, setFailed] = useState(false);
-  useEffect(() => setAutoRecord(Boolean(cam.autoRecord)), [cam.autoRecord]);
-  const toggle = async (event: React.MouseEvent) => {
-    event.preventDefault(); event.stopPropagation();
-    if (saving) return;
-    const next = !autoRecord; setSaving(true); setFailed(false);
-    try {
-      await api("/api/live-cams/favorites/auto-record", { method: "PATCH", signal: AbortSignal.timeout(15_000), body: JSON.stringify({ providerId: cam.providerId, username: cam.username, autoRecord: next }) });
-      setAutoRecord(next);
-    } catch { setAutoRecord(!next); setFailed(true); }
-    finally { setSaving(false); }
-  };
-  return <button className={`auto-record-toggle${autoRecord ? " active" : ""}${failed ? " failed" : ""}`} title={autoRecord ? "Auto record is on — new live sessions are recorded automatically" : failed ? "Could not update; click to retry" : "Automatically record this creator when they go live"} aria-pressed={autoRecord} disabled={saving} onClick={(event) => void toggle(event)}><Check size={12}/>{saving ? "Saving…" : autoRecord ? "Auto record" : "Auto record"}</button>;
-}
-
 export function LiveCamPerformerButton({ cam }: { cam: LiveCam }) {
   const [saving, setSaving] = useState(false); const [performerId, setPerformerId] = useState(cam.performerId ?? ""); const [performerError, setPerformerError] = useState("");
   useEffect(() => setPerformerId(cam.performerId ?? ""), [cam.performerId]);
@@ -233,7 +215,7 @@ export function LiveCamPerformerButton({ cam }: { cam: LiveCam }) {
     {performerError && <p className="row-error">{performerError}</p>}</>;
 }
 
-export function LiveCamCard({ cam, open, autoRecordToggle = false }: { cam: LiveCam; open: (cam: LiveCam) => void; autoRecordToggle?: boolean }) {
+export function LiveCamCard({ cam, open }: { cam: LiveCam; open: (cam: LiveCam) => void }) {
   const unavailable = Boolean(cam.statusUnavailable);
   const offline = cam.online === false && !unavailable;
   return <a className={`live-card${offline ? " offline" : ""}`} href={offline ? undefined : liveCamUrl(cam)} aria-disabled={offline || undefined} onClick={(event) => {
@@ -242,7 +224,7 @@ export function LiveCamCard({ cam, open, autoRecordToggle = false }: { cam: Live
     event.preventDefault(); open(cam);
   }}>
     <span className="live-thumb">{cam.thumbnailUrl ? <img src={cam.thumbnailUrl} alt="" loading="lazy" onError={(event) => { event.currentTarget.hidden = true; }}/> : <Users/>}{!offline && !unavailable && <em><Eye/>{Number(cam.viewers ?? 0).toLocaleString()}</em>}<strong>{cam.providerName}</strong>{!offline && <span><Play/></span>}</span>
-    <span className="live-copy"><b>{cam.username}</b>{cam.age ? <i>{cam.age}</i> : null}<small>{cam.title && cam.title !== cam.username ? cam.title : (cam.tags?.slice(0, 3).map((tag) => `#${tag}`).join(" ") || "Public live broadcast")}</small>{autoRecordToggle && Boolean(cam.favorite) && <LiveCamAutoRecordButton cam={cam}/>}</span>
+    <span className="live-copy"><b>{cam.username}</b>{cam.age ? <i>{cam.age}</i> : null}<small>{cam.title && cam.title !== cam.username ? cam.title : (cam.tags?.slice(0, 3).map((tag) => `#${tag}`).join(" ") || "Public live broadcast")}</small></span>
   </a>;
 }
 
@@ -343,7 +325,7 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
   const loadedProviders = providers.filter((provider) => !provider.pending).length;
   const onlineFavorites = favoritesOnly ? result?.items.filter((cam) => cam.online !== false && !cam.statusUnavailable) ?? [] : [];
   const offlineFavorites = favoritesOnly ? result?.items.filter((cam) => cam.online === false) ?? [] : [];
-  const camGrid = (items: LiveCam[], autoRecordToggle = false) => <div className="live-grid">{items.map((cam) => <LiveCamCard cam={cam} open={open} autoRecordToggle={autoRecordToggle} key={`${cam.providerId}:${cam.id}`}/>)}</div>;
+  const camGrid = (items: LiveCam[]) => <div className="live-grid">{items.map((cam) => <LiveCamCard cam={cam} open={open} key={`${cam.providerId}:${cam.id}`}/>)}</div>;
   return <section className="live-page">
     <div className="library-intro live-intro"><div><p>LIVE NOW</p><h2>Live Cam</h2><span>Public live rooms aggregated by your installed Open EasyX source plugins</span></div><button className="quiet" onClick={() => setRefresh((value) => value + 1)}><RefreshCw className={loading || refreshing ? "spin" : ""}/>Refresh</button></div>
     {result?.available !== false && <div className="live-filters">
@@ -357,7 +339,7 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
       : result && !result.providers.length ? <div className="live-unavailable compact"><span><Radio/></span><h2>No live-cam plugin installed</h2><small>Install a live provider such as Chaturbate Live from Plugins. It will appear here automatically.</small></div>
       : result?.items.length ? <>
         <div className="live-summary"><b>{result.total.toLocaleString()}{loading || refreshing ? "+" : ""} {favoritesOnly ? (result.total === 1 ? "favorite creator" : "favorite creators") : (result.total === 1 ? "live cam" : "live cams")}</b><span>{loading || refreshing ? `Loading sources ${loadedProviders}/${result.providers.length}` : favoritesOnly ? `${onlineFavorites.length} live on this page` : `${result.providers.filter((provider) => provider.ok && provider.count > 0).length} active sources`}</span></div>
-        {favoritesOnly ? <div className="favorite-live-sections">{onlineFavorites.length > 0 && <section><h3><i/>Live now</h3>{camGrid(onlineFavorites, true)}</section>}{offlineFavorites.length > 0 && <section className="offline"><h3><i/>Offline</h3>{camGrid(offlineFavorites, true)}</section>}</div> : camGrid(result.items)}
+        {favoritesOnly ? <div className="favorite-live-sections">{onlineFavorites.length > 0 && <section><h3><i/>Live now</h3>{camGrid(onlineFavorites)}</section>}{offlineFavorites.length > 0 && <section className="offline"><h3><i/>Offline</h3>{camGrid(offlineFavorites)}</section>}</div> : camGrid(result.items)}
         {/* Pagination is driven by page bounds only. Tying it to `loading` used to grey out Next for the
             whole time a slow provider kept the SSE stream open, so users saw the bar but could not click. */}
         {(() => { const pages = Math.max(result.pages, pagesFloor.current); return pages > 1 ? <div className="pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {pages}</span><button disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button></div> : null; })()}

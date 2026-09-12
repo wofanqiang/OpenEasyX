@@ -7,6 +7,7 @@ import fastifyStatic from "@fastify/static";
 import pino from "pino";
 import { z } from "zod";
 import { Database } from "./database.js";
+import type { Performer } from "./database.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 import { DownloadQueue } from "./downloader.js";
 import { discoverPeople } from "./discovery.js";
@@ -157,7 +158,12 @@ app.get("/api/auth/me", async (request, reply) => {
   if (auth.verifySession(sessionCookie(request))) return { authenticated: true, user: "admin" };
   return reply.status(401).send({ error: "unauthorized" });
 });
-app.get("/api/dashboard", async () => ({ stats: db.stats(), performers: db.listPerformers(), sources: db.listSources(), items: db.listItems(30) }));
+// Performer responses carry the derived auto-record flag (any matching live-cam favorite
+// with auto_record=1) so the Performers UI can render its toggle without extra requests.
+function publicPerformer(performer: Performer) {
+  return { ...performer, autoRecord: liveCams.performerAutoRecord(performer) };
+}
+app.get("/api/dashboard", async () => ({ stats: db.stats(), performers: db.listPerformers().map(publicPerformer), sources: db.listSources(), items: db.listItems(30) }));
 app.get<{ Querystring: Record<string, string | undefined> }>("/api/logs", async (request) => {
   const query = z.object({ limit: z.coerce.number().int().min(1).max(1_000).default(500), level: z.enum(["debug", "info", "warn", "error"]).optional(), search: z.string().trim().max(200).optional() }).parse(request.query);
   return { entries: logStore.list(query) };
@@ -466,7 +472,7 @@ app.post<{ Body: unknown }>("/api/performers/import", async (request) => {
   if (performer) ensurePerformerDirectory(mediaDir, performer.name);
   return { performer, sources, providers };
 });
-app.get("/api/performers", async () => db.listPerformers());
+app.get("/api/performers", async () => db.listPerformers().map(publicPerformer));
 app.post<{ Body: unknown }>("/api/performers", async (request) => {
   const body = performerEditorSchema.parse(request.body);
   if (typeof body.imageUrl === "string" && body.imageUrl.startsWith("/api/")) throw Object.assign(new Error("Choose a local image after creating the performer"), { statusCode: 400 });
@@ -485,7 +491,13 @@ app.get<{ Params: { id: string } }>("/api/performers/:id/image", async (request,
 app.get<{ Params: { id: string } }>("/api/performers/:id", async (request) => {
   const performer = db.getPerformer(request.params.id);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
-  return { performer, sources: db.listSources(performer.id), items: db.listItems(10000).filter((item) => item.performerId === performer.id) };
+  return { performer: publicPerformer(performer), sources: db.listSources(performer.id), items: db.listItems(10000).filter((item) => item.performerId === performer.id) };
+});
+app.patch<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/auto-record", async (request) => {
+  const body = z.object({ autoRecord: z.boolean() }).parse(request.body);
+  const result = liveCams.setPerformerAutoRecord(request.params.id, body.autoRecord);
+  app.log.info({ scope: "auto-record", performerId: request.params.id, matched: result.matched }, body.autoRecord ? `Performer auto-record enabled (${result.matched} favorite${result.matched === 1 ? "" : "s"})` : "Performer auto-record disabled");
+  return { performer: publicPerformer(result.performer), matched: result.matched };
 });
 app.patch<{ Params: { id: string }; Body: unknown }>("/api/performers/:id", async (request) => {
   const current = db.getPerformer(request.params.id);

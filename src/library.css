@@ -95,10 +95,3 @@
 .system-stats-foot{margin:14px 0 0;color:#5c5c66;font-size:8px}
 @media(max-width:1150px){.system-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.system-details{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:800px){.system-gauges{grid-template-columns:1fr}.system-metrics{grid-template-columns:1fr}.system-details{grid-template-columns:1fr}}
-
-/* Per-favorite auto-record toggle on live cards (visual twin of .scrape-toggle). */
-.auto-record-toggle{align-self:flex-start;display:inline-flex;align-items:center;gap:4px;border:1px solid #34343c;background:#202026;color:#8d8d97;border-radius:8px;padding:4px 8px;font-size:9px;font-weight:700;letter-spacing:.02em;cursor:pointer;transition:.2s}
-.auto-record-toggle:hover{border-color:#45454e;color:#c9c9d4}
-.auto-record-toggle.active{border-color:rgba(66,211,146,.28);background:rgba(66,211,146,.1);color:#64dea8}
-.auto-record-toggle.failed{border-color:rgba(255,120,120,.35);color:#ff8f8f}
-.auto-record-toggle:disabled{opacity:.6;cursor:default}
