@@ -198,7 +198,13 @@ export class DownloadQueue {
             this.writeLog?.("info", "download", "Remuxing live TS capture to MP4", { itemId: item.id });
             await this.runCommandDownload("ffmpeg", [
               "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
-              "-map", "0", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+              // Re-encode audio and resync it to the video timeline. A live source that
+              // splits video and audio into two independent HLS inputs leaves a constant
+              // 1-2s A/V skew (the two demuxers each start their PTS at 0); `-async 1`
+              // stretches/slides the audio track to match the video PTS, removing that
+              // fixed drift deterministically. Video is copied (no transcode); only audio
+              // is re-encoded to AAC, which is a one-time finalize cost.
+              "-map", "0", "-c:v", "copy", "-c:a", "aac", "-async", "1",
               "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
             ], temporaryDirectory, undefined, () => {}, control);
             if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");

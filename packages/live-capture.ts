@@ -31,13 +31,6 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
     "-reconnect_on_http_error", "5xx", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "10",
     "-user_agent", FFMPEG_CHROME_USER_AGENT,
-    // Stamp every packet with its wall-clock arrival time instead of each
-    // demuxer's zero-based PTS. When a live source splits video and audio into
-    // two independent HLS inputs, the two demuxers would otherwise both start
-    // at 0 and discard the real inter-stream offset, producing a constant
-    // 1-2s audio-ahead sync error. A shared clock keeps them aligned (no
-    // re-encode, no extra CPU); the remux step shifts both streams equally.
-    "-use_wallclock_as_timestamps", "1",
   ];
   if (headerArg.trim()) args.push("-headers", headerArg);
   // -thread_queue_size must precede the input it applies to; giving both HLS
