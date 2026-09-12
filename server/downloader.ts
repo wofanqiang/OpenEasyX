@@ -11,6 +11,7 @@ import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
 import { liveRecordingRequest } from "../packages/live-capture.js";
+import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
 import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
 
 type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean };
@@ -121,6 +122,7 @@ export class DownloadQueue {
     let temporaryDirectory = "";
     let preserveTemporary = false;
     let recordingFinalize = false;
+    let avWatcher: AvSyncWatcher | undefined;
     let lastProgress = 0; let lastBytes = 0; let lastProgressUpdate = 0; let lastActivity = Date.now();
     const reportProgress = (progress?: number, downloadedBytes?: number, force = false) => {
       const nextProgress = progress === undefined ? lastProgress : Math.max(lastProgress, Math.min(0.99, Math.max(0, progress)));
@@ -166,6 +168,14 @@ export class DownloadQueue {
       temporary = path.join(temporaryDirectory, filename);
       let checksum: string;
       if (request.kind === "command") {
+        // For a live dual-HLS capture, measure the constant A/V offset while
+        // ffmpeg records: watch the first segment opened per input on stderr
+        // and map it to the playlist's PROGRAM-DATE-TIME. The result lands in
+        // a sidecar JSON next to capture.ts, consumed by the remux below.
+        if ((item.metadata as Record<string, unknown> | undefined)?.live === true && temporaryDirectory) {
+          const plan = avSyncPlan(request.args, temporaryDirectory);
+          if (plan) avWatcher = await startAvSyncMeasurement(plan, (message) => this.writeLog?.("info", "download", message, { itemId: item.id }));
+        }
         const placeholders: Record<string, string> = {
           "{output}": temporary,
           "{outputDir}": path.dirname(temporary),
@@ -174,7 +184,7 @@ export class DownloadQueue {
         await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
-        }), temporaryDirectory, item.expectedBytes, reportProgress, control);
+        }), temporaryDirectory, item.expectedBytes, reportProgress, control, avWatcher?.onStderr);
         // Live captures land as MPEG-TS (capture.ts); remux to MP4 in place and
         // delete the TS so every downstream step only ever sees a .mp4 file.
         // Gated on the TS file actually existing so non-TS captures are untouched.
@@ -198,31 +208,37 @@ export class DownloadQueue {
             this.writeLog?.("info", "download", "Remuxing live TS capture to MP4", { itemId: item.id });
             // Measure the constant A/V skew baked into the capture by the dual-HLS
             // recording command: video and audio come from two independent HLS
-            // playlists whose first PTS do not correspond to the same real moment,
-            // so capture.ts carries a fixed 1-2s offset (audio typically ahead).
-            // `-async 1` cannot remove a constant offset (it only corrects drift
-            // within the audio stream's own timeline), so we probe each stream's
-            // start_time with ffprobe and shift the audio PTS by the measured
-            // delta via `asetpts` while re-encoding to AAC. Video is copied.
-            let audioShift = 0;
-            try {
-              const probe = await this.capture("ffprobe", [
-                "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", tsPath,
-              ]);
-              const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; start_time?: string }> };
-              let videoStart: number | undefined;
-              let audioStart: number | undefined;
-              for (const stream of parsed.streams ?? []) {
-                if (stream.codec_type === "video" && videoStart === undefined) videoStart = Number(stream.start_time ?? 0) || 0;
-                if (stream.codec_type === "audio" && audioStart === undefined) audioStart = Number(stream.start_time ?? 0) || 0;
-              }
-              // Only correct a clear, sane skew: tiny deltas are measurement noise,
-              // and huge deltas would indicate something other than a sync issue.
-              if (videoStart !== undefined && audioStart !== undefined) {
-                const delta = videoStart - audioStart;
-                if (Math.abs(delta) > 0.15 && Math.abs(delta) <= 30) audioShift = delta;
-              }
-            } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
+            // playlists opened by ffmpeg at slightly different moments, so each
+            // input starts at its own live edge and capture.ts carries a fixed
+            // content offset (audio typically ahead 1-3s). The offset is invisible
+            // in capture.ts itself (the TS muxer rebases both start_times equal),
+            // so the primary source is the sidecar written during capture from the
+            // playlists' PROGRAM-DATE-TIME (see packages/av-sync-measure.ts).
+            // `-async 1` cannot remove a constant offset, so the audio PTS are
+            // shifted by the measured delta via `asetpts` while re-encoding to
+            // AAC. Video is copied. Without a sidecar, fall back to probing
+            // start_time (works for sources whose raw PTS differ visibly).
+            let audioShift = readAvSyncSidecar(tsPath + ".avsync.json") ?? 0;
+            if (audioShift === 0) {
+              try {
+                const probe = await this.capture("ffprobe", [
+                  "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", tsPath,
+                ]);
+                const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; start_time?: string }> };
+                let videoStart: number | undefined;
+                let audioStart: number | undefined;
+                for (const stream of parsed.streams ?? []) {
+                  if (stream.codec_type === "video" && videoStart === undefined) videoStart = Number(stream.start_time ?? 0) || 0;
+                  if (stream.codec_type === "audio" && audioStart === undefined) audioStart = Number(stream.start_time ?? 0) || 0;
+                }
+                // Only correct a clear, sane skew: tiny deltas are measurement noise,
+                // and huge deltas would indicate something other than a sync issue.
+                if (videoStart !== undefined && audioStart !== undefined) {
+                  const delta = videoStart - audioStart;
+                  if (Math.abs(delta) > 0.15 && Math.abs(delta) <= 30) audioShift = delta;
+                }
+              } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
+            }
             const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
             await this.runCommandDownload("ffmpeg", [
               "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
@@ -354,6 +370,7 @@ export class DownloadQueue {
       }
     } finally {
       if (stallTimer) clearInterval(stallTimer);
+      avWatcher?.dispose();
       if (temporaryDirectory && !preserveTemporary) fs.rmSync(temporaryDirectory, { recursive: true, force: true });
       if (control.action === "delete") this.db.deleteItem(item.id);
     }
@@ -423,7 +440,7 @@ export class DownloadQueue {
     try { child.kill(signal); } catch { /* Signal unsupported on this platform. */ }
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload): Promise<void> {
+  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void): Promise<void> {
     return new Promise((resolve, reject) => {
       // Memory guard for live recordings on small VPS: cap yt-dlp fragment concurrency
       // and buffer so a single download cannot balloon the cgroup and trip OOM.
@@ -437,6 +454,7 @@ export class DownloadQueue {
       let output = ""; let progressOutput = ""; let settled = false;
       const remember = (chunk: Buffer) => {
         const text = chunk.toString("utf8"); output = `${output}${text}`.slice(-8_000); progressOutput = `${progressOutput}${text}`.replaceAll("\r", "\n").slice(-2_000);
+        onStderr?.(text);
         const matches = [...progressOutput.matchAll(/(?:easyx-progress:\s*)?(\d{1,3}(?:\.\d+)?)%/gi)];
         const percentage = Number(matches.at(-1)?.[1]);
         if (Number.isFinite(percentage)) reportProgress(percentage / 100);

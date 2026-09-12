@@ -26,7 +26,11 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
   }
   const headerArg = [...headerLines].map(([key, value]) => `${key}: ${value}`).join("\r\n") + "\r\n";
   const args = [
-    "-nostdin", "-hide_banner", "-loglevel", "warning", "-y",
+    "-nostdin", "-hide_banner",
+    // loglevel info (not warning) so the hls demuxer logs "Opening '<segment>'
+    // for reading" on stderr; the av-sync measurement maps those first opened
+    // segments to their playlist PDT to measure the constant A/V offset.
+    "-loglevel", "info", "-y",
     "-reconnect", "1", "-reconnect_on_network_error", "1",
     "-reconnect_on_http_error", "5xx", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "10",
