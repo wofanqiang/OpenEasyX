@@ -196,15 +196,40 @@ export class DownloadQueue {
             recordingFinalize = true;
             this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
             this.writeLog?.("info", "download", "Remuxing live TS capture to MP4", { itemId: item.id });
+            // Measure the constant A/V skew baked into the capture by the dual-HLS
+            // recording command: video and audio come from two independent HLS
+            // playlists whose first PTS do not correspond to the same real moment,
+            // so capture.ts carries a fixed 1-2s offset (audio typically ahead).
+            // `-async 1` cannot remove a constant offset (it only corrects drift
+            // within the audio stream's own timeline), so we probe each stream's
+            // start_time with ffprobe and shift the audio PTS by the measured
+            // delta via `asetpts` while re-encoding to AAC. Video is copied.
+            let audioShift = 0;
+            try {
+              const probe = await this.capture("ffprobe", [
+                "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", tsPath,
+              ]);
+              const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; start_time?: string }> };
+              let videoStart: number | undefined;
+              let audioStart: number | undefined;
+              for (const stream of parsed.streams ?? []) {
+                if (stream.codec_type === "video" && videoStart === undefined) videoStart = Number(stream.start_time ?? 0) || 0;
+                if (stream.codec_type === "audio" && audioStart === undefined) audioStart = Number(stream.start_time ?? 0) || 0;
+              }
+              // Only correct a clear, sane skew: tiny deltas are measurement noise,
+              // and huge deltas would indicate something other than a sync issue.
+              if (videoStart !== undefined && audioStart !== undefined) {
+                const delta = videoStart - audioStart;
+                if (Math.abs(delta) > 0.15 && Math.abs(delta) <= 30) audioShift = delta;
+              }
+            } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
+            const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
             await this.runCommandDownload("ffmpeg", [
               "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
-              // Re-encode audio and resync it to the video timeline. A live source that
-              // splits video and audio into two independent HLS inputs leaves a constant
-              // 1-2s A/V skew (the two demuxers each start their PTS at 0); `-async 1`
-              // stretches/slides the audio track to match the video PTS, removing that
-              // fixed drift deterministically. Video is copied (no transcode); only audio
-              // is re-encoded to AAC, which is a one-time finalize cost.
-              "-map", "0", "-c:v", "copy", "-c:a", "aac", "-async", "1",
+              "-map", "0", "-c:v", "copy", "-c:a", "aac",
+              ...(audioFilter ? ["-af", audioFilter] : []),
+              // Still corrects any drift inside the audio timeline itself.
+              "-async", "1",
               "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
             ], temporaryDirectory, undefined, () => {}, control);
             if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
