@@ -142,7 +142,7 @@ export async function startAvSyncMeasurement(plan: AvSyncPlan, log?: (message: s
     log?.("av-sync probe skipped: playlists without PROGRAM-DATE-TIME");
     return undefined;
   }
-  return createAvSyncWatcher(videoSegments, audioSegments, plan, log);
+  return createAvSyncWatcher(videoSegments, audioSegments, plan, log, headers);
 }
 
 /**
@@ -150,7 +150,7 @@ export async function startAvSyncMeasurement(plan: AvSyncPlan, log?: (message: s
  * sidecar with the measured audio shift. Exported for testing; production
  * callers use `startAvSyncMeasurement`.
  */
-export function createAvSyncWatcher(videoSegments: Map<string, number>, audioSegments: Map<string, number>, plan: AvSyncPlan, log?: (message: string) => void): AvSyncWatcher {
+export function createAvSyncWatcher(videoSegments: Map<string, number>, audioSegments: Map<string, number>, plan: AvSyncPlan, log?: (message: string) => void, headers?: Record<string, string>): AvSyncWatcher {
 
   let videoPdt: number | undefined;
   let audioPdt: number | undefined;
@@ -197,13 +197,14 @@ export function createAvSyncWatcher(videoSegments: Map<string, number>, audioSeg
   const refreshTimer = setTimeout(() => {
     // The live window slides forward; ffmpeg's first segments may postdate the
     // pre-spawn snapshot. Merge one fresh snapshot (never removes entries).
+    if (!headers) return;
     void Promise.allSettled([
       snapshotSegmentTimeline(plan.videoPlaylist, headers),
       snapshotSegmentTimeline(plan.audioPlaylist, headers),
     ]).then(([video, audio]) => {
       if (finished) return;
-      for (const [uri, pdt] of video.value?.segments ?? []) if (!videoSegments.has(uri)) videoSegments.set(uri, pdt);
-      for (const [uri, pdt] of audio.value?.segments ?? []) if (!audioSegments.has(uri)) audioSegments.set(uri, pdt);
+      if (video.status === "fulfilled") for (const [uri, pdt] of video.value.segments) if (!videoSegments.has(uri)) videoSegments.set(uri, pdt);
+      if (audio.status === "fulfilled") for (const [uri, pdt] of audio.value.segments) if (!audioSegments.has(uri)) audioSegments.set(uri, pdt);
     }).catch(() => undefined);
   }, REFRESH_AFTER_MS);
   refreshTimer.unref();
