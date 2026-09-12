@@ -374,17 +374,17 @@ export class LiveCamService {
     return this.performerFavoriteMatches(performer).some((favorite) => favorite.autoRecord);
   }
 
-  setPerformerAutoRecord(performerId: string, autoRecord: boolean): { performer: Performer; matched: number } {
+  setPerformerAutoRecord(performerId: string, autoRecord: boolean): { performer: Performer; matched: number; favorites: LiveCamFavorite[] } {
     const performer = this.db.getPerformer(performerId);
     if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
     const matches = this.performerFavoriteMatches(performer);
     // The watcher only polls saved favorites, so a toggle without one would be a no-op.
     if (!matches.length) throw Object.assign(new Error("Save this creator as a live-cam favorite first — auto-record follows the favorite list"), { statusCode: 409 });
-    let matched = 0;
+    const favorites: LiveCamFavorite[] = [];
     for (const favorite of matches) {
-      if (this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, autoRecord)) matched += 1;
+      if (this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, autoRecord)) favorites.push(favorite);
     }
-    return { performer, matched };
+    return { performer, matched: favorites.length, favorites };
   }
 
   favoriteChanges() {

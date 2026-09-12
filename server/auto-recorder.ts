@@ -11,7 +11,14 @@ const COOLDOWN_MS = 10 * 60_000;
 const INTERVAL = { min: 30, max: 3600, fallback: 60 };
 const LIVE_ITEM = /^(?:auto|manual)-live:([^:]+):/;
 
-export type AutoRecorder = { stop: () => void; tick: () => Promise<void> };
+export type AutoRecorder = {
+  stop: () => void;
+  tick: () => Promise<void>;
+  // A manual stop means "not this session": the cam stays paused until the room goes
+  // offline, so the watcher never fights the user by restarting the same broadcast.
+  suppress: (providerId: string, username: string) => void;
+  clearSuppression: (providerId: string, username: string) => boolean;
+};
 
 export function startAutoRecorder({ db, liveCams, log }: {
   db: Database;
@@ -21,6 +28,9 @@ export function startAutoRecorder({ db, liveCams, log }: {
   // providerId:usernameLower -> itemId of the recording we are tracking.
   const active = new Map<string, { itemId: string }>();
   const cooldowns = new Map<string, number>();
+  // providerId:usernameLower -> cams the user stopped by hand. Cleared once the room
+  // goes offline so the next session is recorded again.
+  const suppressed = new Set<string>();
   let running = false;
   let timer: NodeJS.Timeout | undefined;
 
@@ -45,6 +55,12 @@ export function startAutoRecorder({ db, liveCams, log }: {
     for (const [key, entry] of [...active]) {
       if (liveKeys.has(key)) continue;
       active.delete(key);
+      // A manually stopped recording is guarded by the suppression flag, which is cleared
+      // by an offline transition. Adding a cooldown too would delay the next session.
+      if (suppressed.has(key)) {
+        log?.(`auto-record: recording ${entry.itemId} stopped by hand; ${key} stays paused until the room goes offline`);
+        continue;
+      }
       cooldowns.set(key, Date.now() + COOLDOWN_MS);
       log?.(`auto-record: recording ${entry.itemId} finished; ${key} enters cooldown`);
     }
@@ -87,6 +103,15 @@ export function startAutoRecorder({ db, liveCams, log }: {
           if (!usernames.includes(usernameKey)) continue;
           const key = keyOf(providerId, cam.username);
           if (active.has(key)) continue;
+          if (suppressed.has(key)) {
+            // Only a real offline transition ends the current session; an uncertain
+            // status must not silently lift the pause the user asked for.
+            if (cam.online === false) {
+              suppressed.delete(key);
+              log?.(`auto-record: ${cam.username} went offline; auto-record resumes with the next session`);
+            }
+            continue;
+          }
           if ((cooldowns.get(key) ?? 0) > Date.now()) continue;
           // Never auto-start from an uncertain status; missing a few minutes is better
           // than recording a room that is actually offline.
@@ -113,9 +138,24 @@ export function startAutoRecorder({ db, liveCams, log }: {
     timer.unref();
   };
 
+  const suppress = (providerId: string, username: string) => {
+    const key = keyOf(providerId, username);
+    suppressed.add(key);
+    log?.(`auto-record: manual stop for ${key}; skipped until the room goes offline`);
+  };
+
+  const clearSuppression = (providerId: string, username: string) => {
+    const key = keyOf(providerId, username);
+    if (!suppressed.delete(key)) return false;
+    log?.(`auto-record: ${key} pause lifted; auto-record can start again`);
+    return true;
+  };
+
   schedule();
   return {
     stop: () => { if (timer) clearTimeout(timer); },
     tick,
+    suppress,
+    clearSuppression,
   };
 }

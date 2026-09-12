@@ -163,6 +163,13 @@ app.get("/api/auth/me", async (request, reply) => {
 function publicPerformer(performer: Performer) {
   return { ...performer, autoRecord: liveCams.performerAutoRecord(performer) };
 }
+// Stopping a live recording by hand means "not this session": the watcher keeps the cam
+// paused until the room goes offline instead of restarting the same broadcast.
+function pauseAutoRecordForItem(itemId: string) {
+  const item = db.getItem(itemId);
+  const username = item ? /^(?:auto|manual)-live:([^:]+):/.exec(item.externalId)?.[1] : undefined;
+  if (item && username) autoRecorder.suppress(item.pluginId, username);
+}
 app.get("/api/dashboard", async () => ({ stats: db.stats(), performers: db.listPerformers().map(publicPerformer), sources: db.listSources(), items: db.listItems(30) }));
 app.get<{ Querystring: Record<string, string | undefined> }>("/api/logs", async (request) => {
   const query = z.object({ limit: z.coerce.number().int().min(1).max(1_000).default(500), level: z.enum(["debug", "info", "warn", "error"]).optional(), search: z.string().trim().max(200).optional() }).parse(request.query);
@@ -341,6 +348,7 @@ app.patch<{ Body: unknown }>("/api/live-cams/favorites/auto-record", async (requ
   }).parse(request.body);
   const item = liveCams.setFavoriteAutoRecord(body.providerId, body.username, body.autoRecord);
   if (!item) throw Object.assign(new Error("Favorite not found"), { statusCode: 404 });
+  if (body.autoRecord) autoRecorder.clearSuppression(body.providerId, body.username);
   return item;
 });
 app.post<{ Body: unknown }>("/api/live-cams/performer", async (request) => {
@@ -496,6 +504,9 @@ app.get<{ Params: { id: string } }>("/api/performers/:id", async (request) => {
 app.patch<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/auto-record", async (request) => {
   const body = z.object({ autoRecord: z.boolean() }).parse(request.body);
   const result = liveCams.setPerformerAutoRecord(request.params.id, body.autoRecord);
+  // Re-enabling the switch is an explicit request to record again, so lift any pause
+  // left behind by a manual stop.
+  if (body.autoRecord) for (const favorite of result.favorites) autoRecorder.clearSuppression(favorite.providerId, favorite.username);
   app.log.info({ scope: "auto-record", performerId: request.params.id, matched: result.matched }, body.autoRecord ? `Performer auto-record enabled (${result.matched} favorite${result.matched === 1 ? "" : "s"})` : "Performer auto-record disabled");
   return { performer: publicPerformer(result.performer), matched: result.matched };
 });
@@ -682,8 +693,14 @@ app.post<{ Params: { id: string } }>("/api/items/:id/queue", async (request) => 
 });
 app.post<{ Params: { id: string } }>("/api/items/:id/pause", async (request) => queue.pause(request.params.id));
 app.post<{ Params: { id: string } }>("/api/items/:id/resume", async (request) => queue.resume(request.params.id));
-app.post<{ Params: { id: string } }>("/api/items/:id/stop", async (request) => queue.stopRecording(request.params.id));
-app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) => queue.cancel(request.params.id));
+app.post<{ Params: { id: string } }>("/api/items/:id/stop", async (request) => {
+  pauseAutoRecordForItem(request.params.id);
+  return queue.stopRecording(request.params.id);
+});
+app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) => {
+  pauseAutoRecordForItem(request.params.id);
+  return queue.cancel(request.params.id);
+});
 app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queue.delete(request.params.id));
 
 app.get("/api/settings", async () => {

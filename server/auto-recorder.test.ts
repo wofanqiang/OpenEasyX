@@ -126,6 +126,52 @@ describe("auto recorder", () => {
     } finally { env.cleanup(); }
   });
 
+  it("keeps a manually stopped cam paused until the room goes offline", async () => {
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      const cam = makeCam();
+      env.cams.push(cam);
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+
+      // The user stops the recording by hand while the room is still live.
+      env.recorder.suppress("test.live", "alice");
+      for (let attempt = 0; attempt < 3; attempt++) await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      expect(env.logs.some((line) => line.includes("stays paused until the room goes offline"))).toBe(true);
+
+      // Going offline ends this session and lifts the pause.
+      cam.online = false;
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      expect(env.logs.some((line) => line.includes("went offline"))).toBe(true);
+
+      // The next session records again immediately (no leftover cooldown).
+      cam.online = true;
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(2);
+    } finally { env.cleanup(); }
+  });
+
+  it("lifts the pause when the auto-record switch is enabled again", async () => {
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      env.recorder.suppress("test.live", "alice");
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      expect(env.recorder.clearSuppression("test.live", "alice")).toBe(true);
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(2);
+      expect(env.recorder.clearSuppression("test.live", "alice")).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
   it("clamps the configured check interval into the allowed range", async () => {
     const env: Harness = await fixture();
     try {
