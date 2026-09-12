@@ -67,6 +67,8 @@ IDs must be stable lowercase reverse-domain identifiers. Supported capabilities 
 
 Only declare capabilities the plugin actually implements. `live-cam` exposes direct browser playback inside Open EasyX: implement `resolveLiveStream`, and implement `listLiveCams` when the provider offers a public room directory. Live plugins without a public directory can still contribute configured performer sources.
 
+Providers with an exact room-status endpoint can also implement `getLiveCam(context, cam)`. Return `online: true` for a public broadcast and `online: false` for a confirmed unavailable broadcast; throw on network errors or invalid responses. Open EasyX uses this lookup for local favorites missing from the account snapshot, so creators outside a limited search catalogue are still checked correctly. Failed checks are displayed as status unavailable, separately from confirmed offline rooms.
+
 Library hooks can implement `afterDownload` for outbound notifications, `acceptLibraryDeletion` for inbound deletion notifications, or both. The core owns item state: an accepted relative path is matched to a completed download and recorded as `deleted` without exposing database access to plugin code.
 
 Set `fallback: true` only for a deliberately generic parser such as Web Media. The interface suppresses a fallback when a source-specific plugin exists for that URL, so a generic HTML parser is not presented as equivalent to a working platform extractor.

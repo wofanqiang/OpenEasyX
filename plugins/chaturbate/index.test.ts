@@ -88,6 +88,16 @@ describe("Chaturbate plugin", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("checks a previously verified session again when the user tests the connection", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockResolvedValueOnce(new Response("", { status: 302, headers: { location: "/auth/login/" } }));
+    const context = accountContext(fetchMock, ".chaturbate.com\tTRUE\t/\tTRUE\t0\tsessionid\tpreviously-valid-session");
+    context.runCommand = vi.fn(async () => ({ exitCode: 0, stdout: "2026.08.19\n", stderr: "" }));
+    expect(await chaturbate.testConnection!(context)).toMatchObject({ ok: true });
+    expect(await chaturbate.testConnection!(context)).toMatchObject({ ok: false, message: expect.stringContaining("redirected to login") });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("refuses to replace favorites when Chaturbate ignores the followed-only filter", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ rooms: [{ username: "public_model", is_following: false }], total_count: 1 }), { status: 200 }));
     await expect(chaturbate.listFollowedLiveCams!(accountContext(fetchMock as typeof fetch))).resolves.toMatchObject({
@@ -127,5 +137,32 @@ describe("Chaturbate plugin", () => {
       "https://chaturbate.com/api/chatvideocontext/alice/",
     ]);
     expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "POST", headers: expect.objectContaining({ "x-csrftoken": "csrf-token" }) });
+  });
+
+  it.each(["public", "offline", "private"])("checks the exact room status for a %s creator without catalogue search", async (status) => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request) => new Response(JSON.stringify({ room_status: status, broadcaster_username: "Alice", room_title: "Alice's room", num_viewers: 42, broadcaster_gender: "f" })));
+    const context = accountContext(fetchMock as typeof fetch);
+    const cam = await chaturbate.getLiveCam!(context, { id: "alice", username: "alice", pageUrl: "https://chaturbate.com/alice/" });
+    expect(cam).toMatchObject({ online: status === "public", viewers: status === "public" ? 42 : 0, statusUnavailable: false, title: "Alice's room" });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://chaturbate.com/api/chatvideocontext/alice/");
+  });
+
+  it("does not mistake an invalid room response for an offline creator", async () => {
+    const context = accountContext(async () => new Response(JSON.stringify({ error: "temporarily unavailable" })));
+    await expect(chaturbate.getLiveCam!(context, { id: "alice", username: "alice", pageUrl: "https://chaturbate.com/alice/" })).rejects.toThrow("valid room status");
+  });
+
+  it("backs off exact status requests after provider rate limiting", async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const request = vi.fn().mockResolvedValueOnce(new Response("", { status: 429 })).mockResolvedValue(new Response(JSON.stringify({ room_status: "public" })));
+      const context = accountContext(request);
+      const cam = { id: "alice", username: "alice", pageUrl: "https://chaturbate.com/alice/" };
+      await expect(chaturbate.getLiveCam!(context, cam)).rejects.toThrow("HTTP 429");
+      await expect(chaturbate.getLiveCam!(context, cam)).rejects.toThrow("limiting requests");
+      expect(request).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(120_001);
+      await expect(chaturbate.getLiveCam!(context, cam)).resolves.toMatchObject({ online: true });
+    } finally { vi.useRealTimers(); }
   });
 });

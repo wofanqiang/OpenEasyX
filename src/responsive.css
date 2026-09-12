@@ -2,8 +2,14 @@
 .easyx-shell { min-height: 100dvh; }
 .easyx-main, .content, .watch-heading > div { min-width: 0; }
 .watch-heading h1 { overflow-wrap: anywhere; }
-.watch-actions { flex-wrap: wrap; }
-.favorite-sync-notice { flex-basis: 100%; max-width: 480px; color: #92929d; font-size: 11px; overflow-wrap: anywhere; }
+.watch-heading { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(0, 2fr); }
+.watch-actions { flex-wrap: wrap; justify-content: flex-end; }
+.watch-actions > .quiet { flex: 0 0 auto; white-space: nowrap; }
+.favorite-sync-notice { order: 1; flex-basis: 100%; color: #92929d; font-size: 11px; overflow-wrap: anywhere; text-align: right; }
+.watch-actions > .row-error { order: 1; flex-basis: 100%; }
+.live-provider-notices { margin-bottom: 18px; padding: 12px 16px; border: 1px solid #5d4930; border-radius: 10px; background: #211b13; color: #d7b98e; font-size: 12px; overflow-wrap: anywhere; }
+.live-provider-notices p { margin: 0 0 6px; }
+.live-provider-notices a { color: inherit; }
 .output-settings select { width: 100%; padding: 12px; border: 1px solid #303037; border-radius: 8px; color: #eee; background: #0d0d10; }
 .output-variables { display: flex; flex-wrap: wrap; gap: 7px; color: #92929d; font-size: 12px; }
 .output-variables code { color: #d2d2d9; }

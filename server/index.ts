@@ -14,6 +14,7 @@ import { deletePerformerFiles, ensurePerformerDirectory, renamePerformerDirector
 import { domainFromUrl } from "./utils.js";
 import { BrowserLoginManager } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
+import { LiveCamImages } from "./live-cam-images.js";
 import { LiveCamService } from "./live-cams.js";
 import { SystemStatsService } from "./system-stats.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
@@ -46,7 +47,12 @@ const queue = new DownloadQueue(
   (item) => catalog.deleteStoredMedia(item.storagePath!),
 );
 const browserLogin = new BrowserLoginManager(dataDir);
-const liveCams = new LiveCamService(db, plugins, undefined, path.join(dataDir, ".proxy-cache"));
+const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
+const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); });
+for (const favorite of db.listLiveCamFavorites()) {
+  const entry = plugins.list().find((entry) => entry.manifest.id === favorite.providerId && entry.installed && entry.enabled);
+  if (entry) liveCams.createPerformer(favorite.providerId, { ...favorite, id: favorite.camId, online: false });
+}
 const systemStats = new SystemStatsService({ mediaDir });
 queue.start();
 systemStats.start();
@@ -187,6 +193,7 @@ app.delete<{ Params: { id: string } }>("/api/plugin-repositories/:id", async (re
 });
 app.post<{ Params: { id: string }; Body: Record<string, unknown> | undefined }>("/api/plugins/:id/install", async (request) => {
   plugins.install(request.params.id, request.body ?? {});
+  liveCams.resetProviderSession(request.params.id);
   refreshLiveCamFavorites(request.params.id);
   return plugins.list().find((plugin) => plugin.manifest.id === request.params.id);
 });
@@ -203,6 +210,7 @@ app.post<{ Params: { id: string }; Body: { enabled?: boolean } }>("/api/plugins/
 });
 app.put<{ Params: { id: string }; Body: Record<string, unknown> }>("/api/plugins/:id/config", async (request) => {
   plugins.configure(request.params.id, request.body ?? {});
+  liveCams.resetProviderSession(request.params.id);
   refreshLiveCamFavorites(request.params.id);
   return plugins.list().find((plugin) => plugin.manifest.id === request.params.id);
 });
@@ -242,6 +250,7 @@ app.post<{ Params: { id: string }; Body: Record<string, unknown> | undefined }>(
   }
   const installed = db.getPluginState(request.params.id).installed;
   if (installed) plugins.configure(request.params.id, incoming); else plugins.install(request.params.id, incoming);
+  liveCams.resetProviderSession(request.params.id);
   await browserLogin.removeProfile(request.params.id);
   refreshLiveCamFavorites(request.params.id);
   return { plugin: plugins.list().find((entry) => entry.manifest.id === request.params.id), test };
@@ -280,7 +289,7 @@ const liveCamBodySchema = z.object({
   providerId: z.string().trim().min(1),
   cam: z.object({
     id: z.string().trim().min(1).max(300), username: z.string().trim().min(1).max(160), title: z.string().max(300).optional(),
-    pageUrl: z.string().url().max(4096), thumbnailUrl: z.string().url().max(4096).optional(), viewers: z.number().int().min(0).optional(),
+    pageUrl: z.string().url().max(4096), thumbnailUrl: z.string().url().max(4096).optional(), profileImageUrl: z.string().url().max(4096).optional(), viewers: z.number().int().min(0).optional(),
     age: z.number().int().min(18).max(120).optional(), gender: z.string().max(40).optional(), tags: z.array(z.string().max(80)).max(50).optional(),
   }),
 });

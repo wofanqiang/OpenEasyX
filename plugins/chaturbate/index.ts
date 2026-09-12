@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { chaturbateRequest } from "./request.js";
 import { createHash } from "node:crypto";
 import { definePlugin, type LiveCam, type LiveCamFavoriteSnapshot, type LiveCamPage, type MediaCandidate, type PluginContext } from "../../packages/plugin-sdk/index.js";
 import { configuredArgs, runYtDlpJson, testYtDlp, ytDlpDownload, ytDlpLiveStream } from "../yt-dlp-utils.js";
@@ -84,10 +85,11 @@ function strictTotal(value: unknown): number | undefined {
   return undefined;
 }
 
-async function validateAccountSession(context: PluginContext, cookies: Map<string, string>): Promise<void> {
+async function validateAccountSession(context: PluginContext, cookies: Map<string, string>, force = false): Promise<void> {
   const fingerprint = createHash("sha256").update(cookies.get("sessionid") ?? "").digest("hex");
+  if (force) verifiedAccountSessions.delete(fingerprint);
   if (verifiedAccountSessions.has(fingerprint)) return;
-  const validation = await context.fetch("https://chaturbate.com/api/ts/chatmessages/pm_users/?offset=0", {
+  const validation = await chaturbateRequest(context, "https://chaturbate.com/api/ts/chatmessages/pm_users/?offset=0", {
     headers: accountHeaders(cookies), redirect: "manual", signal: requestSignal(context),
   });
   if (validation.status >= 300 && validation.status < 400) throw new Error("The Chaturbate session redirected to login. Reconnect the account.");
@@ -119,7 +121,7 @@ async function followedSnapshot(context: PluginContext): Promise<LiveCamFavorite
       while (true) {
         const params = new URLSearchParams({ limit: String(FOLLOW_PAGE_SIZE), offset: String(offset), follow: "true" });
         if (offline) params.set("offline", "true");
-        const response = await context.fetch(`https://chaturbate.com/api/ts/roomlist/room-list/?${params}`, {
+        const response = await chaturbateRequest(context, `https://chaturbate.com/api/ts/roomlist/room-list/?${params}`, {
           headers: accountHeaders(cookies), redirect: "manual", signal: requestSignal(context),
         });
         if (response.status >= 300 && response.status < 400) throw new Error("The Chaturbate followed list redirected to login. Reconnect the account.");
@@ -162,7 +164,7 @@ async function followedSnapshot(context: PluginContext): Promise<LiveCamFavorite
   } catch (error) {
     const skippedReason = error instanceof Error ? error.message : String(error);
     context.log("warn", "Chaturbate favorite synchronization skipped", { reason: skippedReason });
-    return { cams: [], authoritative: false, skippedReason };
+    return { cams: [...cams.values()], authoritative: false, skippedReason };
   }
 }
 
@@ -173,14 +175,14 @@ async function setRemoteFavorite(context: PluginContext, cam: LiveCam, favorite:
   const username = cam.username;
   const roomUrl = `https://chaturbate.com/${username}/`;
   const headers = accountHeaders(cookies, roomUrl);
-  const primed = await context.fetch(roomUrl, { headers, redirect: "manual", signal: requestSignal(context) });
+  const primed = await chaturbateRequest(context, roomUrl, { headers, redirect: "manual", signal: requestSignal(context) });
   if (!primed.ok) throw new Error(`Chaturbate could not open the room (HTTP ${primed.status})`);
   const csrf = cookies.get("csrftoken");
-  const response = await context.fetch(`https://chaturbate.com/follow/${favorite ? "follow" : "unfollow"}/${username}/`, {
+  const response = await chaturbateRequest(context, `https://chaturbate.com/follow/${favorite ? "follow" : "unfollow"}/${username}/`, {
     method: "POST", headers: { ...headers, ...(csrf ? { "x-csrftoken": csrf } : {}) }, redirect: "manual", signal: requestSignal(context),
   });
   if (!response.ok) throw new Error(`Chaturbate could not ${favorite ? "follow" : "unfollow"} ${username} (HTTP ${response.status})`);
-  const verification = await context.fetch(`https://chaturbate.com/api/chatvideocontext/${username}/`, {
+  const verification = await chaturbateRequest(context, `https://chaturbate.com/api/chatvideocontext/${username}/`, {
     headers, redirect: "manual", signal: requestSignal(context),
   });
   let payload: unknown;
@@ -264,7 +266,7 @@ export default definePlugin({
     try {
       const cookies = accountCookies(context.config);
       if (!cookies) return { ok: false, message: "Connect a Chaturbate account in the integrated browser." };
-      await validateAccountSession(context, cookies);
+      await validateAccountSession(context, cookies, true);
       return { ok: true, message: `${extractor.message} Chaturbate account session verified.` };
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : String(error) };
@@ -287,7 +289,7 @@ export default definePlugin({
       const params = new URLSearchParams({ limit: String(Math.min(100, limit)), offset: String(offset) });
       if (query.gender) params.set("genders", { female: "f", male: "m", couple: "c", trans: "t" }[query.gender]);
       if (query.search) params.set("keywords", query.search);
-      const response = await context.fetch(`https://chaturbate.com/api/ts/roomlist/room-list/?${params}`, {
+      const response = await chaturbateRequest(context, `https://chaturbate.com/api/ts/roomlist/room-list/?${params}`, {
         headers: {
           accept: "application/json", "x-requested-with": "XMLHttpRequest", referer: "https://chaturbate.com/",
           "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36",
@@ -322,6 +324,24 @@ export default definePlugin({
     const cams = pages.flatMap((page) => page.cams).slice(start - base, end - base);
     const total = pages[0]?.total ?? cams.length;
     return { cams, total, page: query.page, pageSize: query.pageSize, pages: Math.max(1, Math.ceil(total / query.pageSize)) };
+  },
+  async getLiveCam(context, cam) {
+    if (!/^[a-z0-9_]+$/i.test(cam.username)) throw new Error("Invalid Chaturbate room name");
+    const response = await chaturbateRequest(context, `https://chaturbate.com/api/chatvideocontext/${encodeURIComponent(cam.username)}/`, {
+      headers: { accept: "application/json", referer: cam.pageUrl, "user-agent": "Mozilla/5.0" }, signal: requestSignal(context),
+    });
+    if (!response.ok) throw new Error(`Chaturbate live status returned HTTP ${response.status}`);
+    const room = await response.json() as Record<string, unknown>;
+    const status = text(room.room_status);
+    if (!status || !["public", "offline", "private", "group", "away", "hidden", "password", "notconnected"].includes(status)) throw new Error("Chaturbate did not return a valid room status");
+    const username = text(room.broadcaster_username);
+    if (username && username.toLowerCase() !== cam.username.toLowerCase()) throw new Error("Chaturbate returned a different room");
+    const online = status === "public";
+    return { ...cam, online, statusUnavailable: false, title: text(room.room_title) ?? cam.title,
+      viewers: online ? whole(room.num_viewers) ?? 0 : 0,
+      gender: text(room.broadcaster_gender) ?? cam.gender,
+      thumbnailUrl: cam.thumbnailUrl ?? `https://roomimg.stream.highwebmedia.com/ri/${encodeURIComponent(cam.username)}.jpg`,
+    };
   },
   async listFollowedLiveCams(context) { return followedSnapshot(context); },
   async setLiveCamFavorite(context, cam, favorite) { return setRemoteFavorite(context, cam, favorite); },

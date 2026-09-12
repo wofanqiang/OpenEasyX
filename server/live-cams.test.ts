@@ -24,6 +24,117 @@ async function fixture() {
 }
 
 describe("Open EasyX live cams", () => {
+  it("uses the reconnected account immediately instead of its cached login failure", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    const followed = vi.fn().mockResolvedValueOnce({ authoritative: false, cams: [], skippedReason: "Session expired" })
+      .mockResolvedValue({ authoritative: true, cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice", online: true }] });
+    plugins.get("test.live").listFollowedLiveCams = followed;
+    const query = { page: 1, pageSize: 24, favoritesOnly: true };
+    expect((await service.list(query)).items).toHaveLength(0);
+    service.resetProviderSession("test.live");
+    expect(await service.syncFavorites("test.live")).toMatchObject({ authoritative: true, added: 1 });
+    expect((await service.list(query)).items).toMatchObject([{ username: "alice", online: true }]);
+    expect(followed).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let an old in-flight account read overwrite a reconnected session", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    let finishOld!: (value: { authoritative: boolean; cams: []; skippedReason: string }) => void;
+    let started!: () => void;
+    const oldStarted = new Promise<void>((resolve) => { started = resolve; });
+    const followed = vi.fn().mockImplementationOnce(() => { started(); return new Promise((resolve) => { finishOld = resolve; }); })
+      .mockResolvedValue({ authoritative: true, cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice", online: true }] });
+    plugins.get("test.live").listFollowedLiveCams = followed;
+    const oldSync = service.syncFavorites("test.live"); await oldStarted;
+    service.resetProviderSession("test.live");
+    expect(await service.syncFavorites("test.live")).toMatchObject({ authoritative: true });
+    finishOld({ authoritative: false, cams: [], skippedReason: "Old session expired" }); await oldSync;
+    expect((await service.list({ page: 1, pageSize: 24, favoritesOnly: true })).items).toMatchObject([{ username: "alice", online: true }]);
+    expect(followed).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares account reads across concurrent refreshes and scheduled synchronization", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    const followed = vi.fn(async () => ({ authoritative: true, cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice", online: true }] }));
+    plugins.get("test.live").listFollowedLiveCams = followed;
+    const [all, selected] = await Promise.all([
+      service.list({ page: 1, pageSize: 24, favoritesOnly: true }),
+      service.list({ page: 1, pageSize: 24, favoritesOnly: true, providerId: "test.live" }),
+      service.syncFavorites("test.live"),
+    ]);
+    expect(all.items).toHaveLength(1); expect(selected.items).toHaveLength(1);
+    expect(followed).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains 100 favorites without a request storm during 429 failures and automatically recovers", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    for (let i = 0; i < 100; i++) database.setLiveCamFavorite("test.live", { camId: `cam${i}`, username: `cam${i}`, pageUrl: `https://live.test/cam${i}` }, true);
+    const snapshot = vi.fn(async () => ({ authoritative: false, cams: [], skippedReason: "HTTP 429" }));
+    const lookup = vi.fn(); const plugin = plugins.get("test.live"); plugin.listFollowedLiveCams = snapshot; plugin.getLiveCam = lookup;
+    vi.useFakeTimers();
+    try {
+      const query = { page: 1, pageSize: 24, favoritesOnly: true };
+      for (let i = 0; i < 3; i++) {
+        const result = await service.list(query);
+        expect(result.total).toBe(100); expect(result.items).toHaveLength(24);
+        expect(result.items.every((cam) => cam.statusUnavailable)).toBe(true);
+        await vi.advanceTimersByTimeAsync(30_001);
+      }
+      await service.syncFavorites("test.live");
+      expect(snapshot).toHaveBeenCalledTimes(1); expect(lookup).not.toHaveBeenCalled();
+      expect(database.listLiveCamFavorites()).toHaveLength(100);
+      await vi.advanceTimersByTimeAsync(29_000);
+      await service.list(query); // A late refresh must not extend the failure cooldown.
+      plugin.listFollowedLiveCams = async () => ({ authoritative: true, cams: [{ id: "cam0", username: "cam0", pageUrl: "https://live.test/cam0", online: true }] });
+      await vi.advanceTimersByTimeAsync(1_001);
+      expect((await service.list(query)).items).toMatchObject([{ username: "cam0", online: true }]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("preserves partial imports and old favorites until a complete account snapshot is available", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    database.setLiveCamFavorite("test.live", { camId: "old", username: "old", pageUrl: "https://live.test/old" }, true);
+    plugins.get("test.live").listFollowedLiveCams = async () => ({ authoritative: false, skippedReason: "HTTP 429", cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice", online: true }] });
+    const result = await service.list({ page: 1, pageSize: 24, favoritesOnly: true });
+    expect(result.items).toMatchObject([{ username: "alice", online: true }, { username: "old", statusUnavailable: true }]);
+    expect(database.listLiveCamFavorites()).toHaveLength(2);
+  });
+
+  it("does not call unselected providers and reuses public results across tabs", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    const list = vi.fn(plugins.get("test.live").listLiveCams!); plugins.get("test.live").listLiveCams = list;
+    const query = { page: 1, pageSize: 24, providerId: "test.live" };
+    await Promise.all([service.list(query), service.list(query)]);
+    expect(list).toHaveBeenCalledTimes(1);
+    await service.list({ ...query, providerId: "other.live" });
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the public catalogue with an unavailable status when a refresh is rate limited", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    vi.useFakeTimers();
+    try {
+      const query = { page: 1, pageSize: 24, providerId: "test.live" };
+      expect((await service.list(query)).items).toHaveLength(1);
+      plugins.get("test.live").listLiveCams = async () => { throw new Error("HTTP 429. Automatic retry shortly."); };
+      await vi.advanceTimersByTimeAsync(30_001);
+      const result = await service.list(query);
+      expect(result.items).toMatchObject([{ username: "alice", statusUnavailable: true }]);
+      expect(result.providers).toMatchObject([{ warning: "HTTP 429. Automatic retry shortly." }]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("creates and repairs performer profiles when a creator is favorited", async () => {
+    const { database, plugins } = await fixture(); plugins.install("test.live");
+    const saveImage = vi.fn(); const service = new LiveCamService(database, plugins, fetch, saveImage);
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice", thumbnailUrl: "https://live.test/alice.jpg" };
+    await service.setFavorite("test.live", cam, true);
+    expect(database.listPerformers()).toMatchObject([{ name: "alice", imageUrl: cam.thumbnailUrl }]);
+    expect(saveImage).toHaveBeenCalledTimes(1);
+    await service.setFavorite("test.live", cam, true);
+    expect(database.listPerformers()).toHaveLength(1);
+  });
+
   it("aggregates every installed live provider without a Viewer bridge", async () => {
     const { plugins, service } = await fixture();
     plugins.install("test.live");
@@ -133,7 +244,7 @@ describe("Open EasyX live cams", () => {
     expect(service.listFavorites().map((favorite) => favorite.username)).toEqual(["alice", "bob"]);
   });
 
-  it("refreshes followed status after 30 seconds even when favorites are consulted repeatedly", async () => {
+  it("refreshes followed status after 60 seconds even when favorites are consulted repeatedly", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
     vi.useFakeTimers();
     try {
@@ -147,13 +258,13 @@ describe("Open EasyX live cams", () => {
       online = true;
       await vi.advanceTimersByTimeAsync(20_000);
       expect((await service.list(query)).items[0].online).toBe(false);
-      await vi.advanceTimersByTimeAsync(10_001);
+      await vi.advanceTimersByTimeAsync(40_001);
       expect((await service.list(query)).items[0].online).toBe(true);
       expect(followed).toHaveBeenCalledTimes(2);
     } finally { vi.useRealTimers(); }
   });
 
-  it.each(["disconnected", "expired", "failed"])("checks public live status for saved favorites when the account is %s", async (state) => {
+  it.each(["disconnected", "expired"])("checks public live status for saved favorites when the account is %s", async (state) => {
     const { database, plugins, service } = await fixture(); plugins.install("test.live");
     database.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
     database.setLiveCamFavorite("test.live", { camId: "bob", username: "bob", pageUrl: "https://live.test/bob" }, true);
@@ -199,6 +310,42 @@ describe("Open EasyX live cams", () => {
     await service.flushFavoriteChanges("test.live");
     await expect(service.list({ page: 1, pageSize: 24, favoritesOnly: true })).resolves.toMatchObject({
       total: 1, items: [{ username: "alice", online: true, favorite: true }],
+    });
+  });
+
+  it("uses exact room status and opens a favorite outside the provider's limited search catalogue", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    database.setLiveCamFavorite("test.live", { camId: "outside", username: "outside", pageUrl: "https://live.test/outside" }, true);
+    const plugin = plugins.get("test.live");
+    plugin.listFollowedLiveCams = async () => ({ cams: [], authoritative: false, skippedReason: "Session expired" });
+    const search = vi.fn(plugin.listLiveCams!); plugin.listLiveCams = search;
+    plugin.getLiveCam = async (_context, cam) => ({ ...cam, online: true, viewers: 20 });
+    await expect(service.list({ page: 1, pageSize: 24, favoritesOnly: true })).resolves.toMatchObject({
+      total: 1, items: [{ username: "outside", online: true }], providers: [{ warning: "Session expired" }],
+    });
+    await expect(service.get("test.live", "outside")).resolves.toMatchObject({ username: "outside", online: true });
+    expect(search).not.toHaveBeenCalled();
+  });
+
+  it("keeps failed live checks distinguishable from offline rooms and backs off retries", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    database.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+    const plugin = plugins.get("test.live");
+    plugin.listFollowedLiveCams = async () => ({ cams: [], authoritative: false, skippedReason: "Session expired" });
+    const lookup = vi.fn(async () => { throw new Error("HTTP 429"); }); plugin.getLiveCam = lookup;
+    const query = { page: 1, pageSize: 24, favoritesOnly: true };
+    for (let count = 0; count < 2; count++) await expect(service.list(query)).resolves.toMatchObject({
+      total: 1, items: [{ username: "alice", statusUnavailable: true }], providers: [{ warning: "Session expired" }],
+    });
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(database.listLiveCamFavorites("test.live")).toHaveLength(1);
+  });
+
+  it("reports account import failures even before any favorites have been imported", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    plugins.get("test.live").listFollowedLiveCams = async () => { throw new Error("Reconnect the account"); };
+    await expect(service.list({ page: 1, pageSize: 24, favoritesOnly: true })).resolves.toMatchObject({
+      total: 0, items: [], providers: [{ warning: "Reconnect the account" }],
     });
   });
 

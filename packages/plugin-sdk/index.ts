@@ -143,11 +143,13 @@ export type LiveCam = {
   title?: string;
   pageUrl: string;
   thumbnailUrl?: string;
+  profileImageUrl?: string;
   viewers?: number;
   age?: number;
   gender?: string;
   tags?: string[];
   online?: boolean;
+  statusUnavailable?: boolean;
 };
 
 export type LiveCamPage = {
@@ -183,6 +185,8 @@ export interface EasyXPlugin {
   listMedia?(context: PluginContext, source: MediaSource): Promise<MediaCandidate[]>;
   resolveDownload?(context: PluginContext, item: MediaCandidate): Promise<DownloadRequest>;
   listLiveCams?(context: PluginContext, query: LiveCamQuery): Promise<LiveCamPage>;
+  /** Look up one exact room, including its offline status, without catalogue search. */
+  getLiveCam?(context: PluginContext, cam: LiveCam): Promise<LiveCam>;
   listFollowedLiveCams?(context: PluginContext): Promise<LiveCamFavoriteSnapshot>;
   setLiveCamFavorite?(context: PluginContext, cam: LiveCam, favorite: boolean): Promise<LiveCamFavoriteUpdate>;
   resolveLiveStream?(context: PluginContext, cam: LiveCam): Promise<LiveStream>;
