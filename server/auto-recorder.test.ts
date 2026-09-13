@@ -42,7 +42,31 @@ async function fixture() {
   });
   const cams: Array<Record<string, unknown>> = [];
   const list = vi.fn(async () => ({ status: { ok: true }, providers: [{ id: "test.live", name: "Test Live", ok: true, count: cams.length }], items: cams }));
-  const liveCamsStub = { list, record } as unknown as LiveCamService;
+  const liveCamsStub = {
+    list, record,
+    autoRecordTargets: () => {
+      // Mirror LiveCams.autoRecordTargets against the real Database: poll every favorite
+      // armed directly, plus favorites that belong to a performer with auto-record on.
+      const targets: Array<{ providerId: string; username: string }> = [];
+      const seen = new Set<string>();
+      const push = (providerId: string, username: string) => {
+        const key = `${providerId}:${username.toLowerCase()}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        targets.push({ providerId, username });
+      };
+      for (const favorite of db.listLiveCamFavorites()) {
+        if (favorite.autoRecord) push(favorite.providerId, favorite.username);
+      }
+      for (const performer of db.listPerformers()) {
+        if (!performer.autoRecord) continue;
+        for (const favorite of db.listLiveCamFavorites()) {
+          if (favorite.providerId in performer.externalRefs) push(favorite.providerId, favorite.username);
+        }
+      }
+      return targets;
+    },
+  } as unknown as LiveCamService;
   const logs: string[] = [];
   const recorder = startAutoRecorder({ db: dbStub, liveCams: liveCamsStub, log: (message) => logs.push(message) });
   return {

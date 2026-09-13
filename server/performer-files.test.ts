@@ -24,7 +24,7 @@ describe("performer media directories", () => {
     fs.writeFileSync(path.join(directory, "example.test", "one.jpg"), "one");
     fs.mkdirSync(path.join(root, "Keep"));
     fs.writeFileSync(path.join(root, "Keep", "two.jpg"), "two");
-    const removed = deletePerformerFiles(root, { id: "p", name: "Example", aliases: [], externalRefs: {}, createdAt: "", updatedAt: "" }, []);
+    const removed = deletePerformerFiles(root, { id: "p", name: "Example", aliases: [], externalRefs: {}, autoRecord: false, createdAt: "", updatedAt: "" }, []);
     expect(removed).toBe(1);
     expect(fs.existsSync(directory)).toBe(false);
     expect(fs.existsSync(path.join(root, "Keep", "two.jpg"))).toBe(true);

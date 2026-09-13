@@ -73,13 +73,12 @@ export function startAutoRecorder({ db, liveCams, log }: {
     try {
       syncActive();
 
-      // Only providers that actually have an auto-record favorite are polled.
+      // Poll every favorite that is armed directly or belongs to a performer with auto-record on.
       const byProvider = new Map<string, string[]>();
-      for (const favorite of db.listLiveCamFavorites()) {
-        if (!favorite.autoRecord) continue;
-        const usernames = byProvider.get(favorite.providerId) ?? [];
-        usernames.push(favorite.username.toLowerCase());
-        byProvider.set(favorite.providerId, usernames);
+      for (const target of liveCams.autoRecordTargets()) {
+        const usernames = byProvider.get(target.providerId) ?? [];
+        usernames.push(target.username.trim().toLowerCase());
+        byProvider.set(target.providerId, usernames);
       }
 
       for (const [providerId, usernames] of byProvider) {

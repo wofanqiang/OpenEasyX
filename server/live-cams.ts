@@ -370,21 +370,41 @@ export class LiveCamService {
     });
   }
 
+  // Auto-record is now a first-class performer flag. We still honor a favorite that was
+  // toggled directly so existing data keeps working until it is re-saved at the performer level.
   performerAutoRecord(performer: Performer): boolean {
-    return this.performerFavoriteMatches(performer).some((favorite) => favorite.autoRecord);
+    return performer.autoRecord || this.performerFavoriteMatches(performer).some((favorite) => favorite.autoRecord);
   }
 
+  // Auto-record is a performer-level intent. We persist it on the performer and also mirror it
+  // onto any matched live-cam favorites so the watcher (which polls favorites) picks it up.
+  // No live-cam favorite is required: a performer can be armed even before a favorite exists.
   setPerformerAutoRecord(performerId: string, autoRecord: boolean): { performer: Performer; matched: number; favorites: LiveCamFavorite[] } {
     const performer = this.db.getPerformer(performerId);
     if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+    this.db.setPerformerAutoRecord(performerId, autoRecord);
     const matches = this.performerFavoriteMatches(performer);
-    // The watcher only polls saved favorites, so a toggle without one would be a no-op.
-    if (!matches.length) throw Object.assign(new Error("Save this creator as a live-cam favorite first — auto-record follows the favorite list"), { statusCode: 409 });
     const favorites: LiveCamFavorite[] = [];
     for (const favorite of matches) {
       if (this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, autoRecord)) favorites.push(favorite);
     }
-    return { performer, matched: favorites.length, favorites };
+    return { performer: { ...performer, autoRecord }, matched: favorites.length, favorites };
+  }
+
+  // The set of live-cam favorites the watcher should poll for auto-record. A favorite qualifies
+  // when it is armed directly OR belongs to a performer that has auto-record turned on.
+  autoRecordTargets(): Array<{ providerId: string; username: string }> {
+    const targets = new Map<string, { providerId: string; username: string }>();
+    for (const favorite of this.db.listLiveCamFavorites()) {
+      if (favorite.autoRecord) targets.set(`${favorite.providerId}:${favorite.username.toLowerCase()}`, { providerId: favorite.providerId, username: favorite.username });
+    }
+    for (const performer of this.db.listPerformers()) {
+      if (!performer.autoRecord) continue;
+      for (const favorite of this.performerFavoriteMatches(performer)) {
+        targets.set(`${favorite.providerId}:${favorite.username.toLowerCase()}`, { providerId: favorite.providerId, username: favorite.username });
+      }
+    }
+    return [...targets.values()];
   }
 
   favoriteChanges() {

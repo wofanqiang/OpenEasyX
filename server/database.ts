@@ -6,7 +6,7 @@ import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packag
 import { outputDefaults } from "../packages/output-settings.js";
 
 export type Performer = {
-  id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>;
+  id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>; autoRecord: boolean;
   createdAt: string; updatedAt: string;
 };
 
@@ -107,6 +107,8 @@ export class Database {
     `);
     const favoriteColumns = new Set((this.sqlite.prepare("PRAGMA table_info(live_cam_favorites)").all() as Array<{ name: string }>).map((column) => column.name));
     if (!favoriteColumns.has("auto_record")) this.sqlite.exec("ALTER TABLE live_cam_favorites ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0");
+    const performerColumns = new Set((this.sqlite.prepare("PRAGMA table_info(performers)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!performerColumns.has("auto_record")) this.sqlite.exec("ALTER TABLE performers ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0");
     const sourceColumns = new Set((this.sqlite.prepare("PRAGMA table_info(sources)").all() as Array<{ name: string }>).map((column) => column.name));
     if (!sourceColumns.has("scraper_plugin_id")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scraper_plugin_id TEXT");
     if (!sourceColumns.has("scrape_enabled")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scrape_enabled INTEGER NOT NULL DEFAULT 0");
@@ -272,8 +274,8 @@ export class Database {
 
   createPerformer(values: PerformerInput): Performer {
     const performerId = id("person"); const stamp = now();
-    this.sqlite.prepare("INSERT INTO performers VALUES(?,?,?,?,?,?,?)")
-      .run(performerId, values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, "{}", stamp, stamp);
+    this.sqlite.prepare("INSERT INTO performers(id,name,aliases_json,image_url,external_refs_json,auto_record,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+      .run(performerId, values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, "{}", 0, stamp, stamp);
     return this.getPerformer(performerId)!;
   }
 
@@ -283,6 +285,10 @@ export class Database {
     this.sqlite.prepare("UPDATE performers SET name=?,aliases_json=?,image_url=?,updated_at=? WHERE id=?")
       .run(values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, now(), performerId);
     return this.getPerformer(performerId);
+  }
+
+  setPerformerAutoRecord(performerId: string, autoRecord: boolean): boolean {
+    return this.sqlite.prepare("UPDATE performers SET auto_record=?,updated_at=? WHERE id=?").run(autoRecord ? 1 : 0, now(), performerId).changes > 0;
   }
 
   deletePerformer(performerId: string): boolean {
@@ -302,14 +308,14 @@ export class Database {
       return this.getPerformer(existing.id)!;
     }
     const performerId = id("person");
-    this.sqlite.prepare("INSERT INTO performers VALUES(?,?,?,?,?,?,?)")
-      .run(performerId, candidate.name, JSON.stringify(candidate.aliases ?? []), candidate.imageUrl ?? null, JSON.stringify({ [pluginId]: candidate.externalId }), stamp, stamp);
+    this.sqlite.prepare("INSERT INTO performers(id,name,aliases_json,image_url,external_refs_json,auto_record,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+      .run(performerId, candidate.name, JSON.stringify(candidate.aliases ?? []), candidate.imageUrl ?? null, JSON.stringify({ [pluginId]: candidate.externalId }), 0, stamp, stamp);
     return this.getPerformer(performerId)!;
   }
 
   private mapPerformer(row: any): Performer {
     return { id: row.id, name: row.name, aliases: asJson(row.aliases_json, []), imageUrl: row.image_url ?? undefined,
-      externalRefs: asJson(row.external_refs_json, {}), createdAt: row.created_at, updatedAt: row.updated_at };
+      externalRefs: asJson(row.external_refs_json, {}), autoRecord: !!row.auto_record, createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   addSource(performerId: string, pluginId: string, candidate: SourceCandidate): Source {
