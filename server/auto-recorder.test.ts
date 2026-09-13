@@ -24,7 +24,7 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
 
   const items = new Map<string, Pick<DownloadItem, "status">>();
   let itemCounter = 0;
-  const listedItems: Array<Pick<DownloadItem, "id" | "pluginId" | "externalId" | "status">> = [];
+  const listedItems: Array<Pick<DownloadItem, "id" | "pluginId" | "externalId" | "status" | "metadata">> = [];
   const dbStub = {
     getSettings: () => db.getSettings(),
     listLiveCamFavorites: () => db.listLiveCamFavorites(),
@@ -175,9 +175,30 @@ describe("auto recorder", () => {
       env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
       env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
       env.cams.push(makeCam());
-      env.listedItems.push({ id: "item-live", pluginId: "test.live", externalId: "manual-live:alice:2026-09-12T00-00-00-000Z", status: "downloading" });
+      env.listedItems.push({ id: "item-live", pluginId: "test.live", externalId: "manual-live:alice:2026-09-12T00-00-00-000Z", status: "downloading", metadata: { live: true, liveRoom: "alice" } });
       await env.recorder.tick();
       expect(env.record).not.toHaveBeenCalled();
+    } finally { env.cleanup(); }
+  });
+
+  it("treats a capture a scraper queued as the recording for that room", async () => {
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      // The scraper reached the same broadcast first: a different external-id shape, same room.
+      // The watcher must not stack a second recording onto it.
+      env.listedItems.push({ id: "item-scraped", pluginId: "test.live", externalId: "chaturbate:alice:1234", status: "downloading", metadata: { live: true, liveRoom: "alice" } });
+      await env.recorder.tick();
+      expect(env.record).not.toHaveBeenCalled();
+
+      // When that capture ends, the room is still on air: the watcher must record it normally
+      // after the usual cooldown rather than treating the ended capture as its own recording.
+      env.listedItems.splice(0, env.listedItems.length);
+      await env.recorder.tick();
+      expect(env.record).not.toHaveBeenCalled();
+      expect(env.logs.some((line) => line.includes("enters cooldown"))).toBe(true);
     } finally { env.cleanup(); }
   });
 

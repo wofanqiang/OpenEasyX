@@ -60,6 +60,16 @@ export function liveReferer(pageUrl: string | undefined): string | undefined {
  * a live capture or offers no live resolver, so the caller falls back to the
  * plugin's normal download path.
  */
+/**
+ * True when a candidate describes a live broadcast rather than a stored file. Scrapers use it to
+ * announce that a room is on air, but it is not a downloadable asset: acting on it opens a second
+ * ffmpeg on a broadcast that may already be recording, which ends both captures. The sync path
+ * therefore drops these and leaves live capture to the recorder.
+ */
+export function isLiveCandidate(candidate: MediaCandidate): boolean {
+  return (candidate.metadata as Record<string, unknown> | undefined)?.live === true;
+}
+
 export async function liveRecordingRequest(plugin: EasyXPlugin, context: PluginContext, item: MediaCandidate): Promise<CommandDownloadRequest | undefined> {
   const meta = item.metadata as Record<string, unknown> | undefined;
   if (meta?.live !== true || !plugin.resolveLiveStream) return undefined;

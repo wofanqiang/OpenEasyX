@@ -24,6 +24,7 @@ import { Catalog } from "./catalog.js";
 import { registerLibraryRoutes, parseMediaRange } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
+import { isLiveCandidate } from "../packages/live-capture.js";
 import { AuthService } from "./auth.js";
 import type { FastifyRequest, FastifyReply } from "fastify";
 
@@ -660,12 +661,18 @@ async function syncSource(sourceId: string) {
   const plugin = ensureScraperPlugin(source.scraperPluginId, source.profileUrl);
   if (!plugin.listMedia) throw Object.assign(new Error("This source is informational; its plugin does not list media"), { statusCode: 409 });
   try {
-    const candidates = await plugin.listMedia(plugins.context(source.scraperPluginId), source);
+    const found = await plugin.listMedia(plugins.context(source.scraperPluginId), source);
+    // A live stream is not a stored file, and queueing it would open a capture of a room that
+    // may already be recording. Live capture belongs to the recorder, so it is reported, not
+    // ingested.
+    const candidates = found.filter((candidate) => !isLiveCandidate(candidate));
+    const liveSkipped = found.length - candidates.length;
     const storedDateChanges: string[] = [];
     const result = db.ingestItems(source, candidates, (itemId) => storedDateChanges.push(itemId));
     await queue.applyStoredMediaDates(storedDateChanges);
     db.markSourceSynced(source.id, source.syncIntervalSeconds);
-    return { ...result, total: candidates.length };
+    if (liveSkipped) app.log.info({ scope: "scrape", sourceId: source.id, domain: source.domain, liveSkipped }, "Room is live; the broadcast is left to the live-cam recorder");
+    return { ...result, total: candidates.length, liveSkipped };
   } catch (error) {
     db.markSourceSynced(source.id, source.syncIntervalSeconds, error instanceof Error ? error.message : String(error));
     throw error;

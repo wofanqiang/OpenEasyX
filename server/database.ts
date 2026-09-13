@@ -412,7 +412,11 @@ export class Database {
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id("item"), source.performerId, source.id, source.scraperPluginId ?? source.pluginId, candidate.externalId, candidate.identityKey ?? null,
           candidate.title ?? null, candidate.pageUrl ?? null, candidate.mediaType, candidate.filename ?? null, candidate.qualityScore ?? 0,
-          candidate.expectedBytes ?? null, canonicalDate ?? null, JSON.stringify(candidate.metadata ?? {}), (source.autoDownload || autoGlobal) ? "queued" : "available", stamp, stamp);
+          candidate.expectedBytes ?? null, canonicalDate ?? null, JSON.stringify(candidate.metadata ?? {}),
+          // A live stream is not a stored file. The global "queue discovered media" switch must
+          // not turn a broadcast into a recording on its own, so live candidates only queue when
+          // this very source opted in (the recorder sets its own item to queued explicitly).
+          (source.autoDownload || (autoGlobal && (candidate.metadata as Record<string, unknown> | undefined)?.live !== true)) ? "queued" : "available", stamp, stamp);
       added++;
     }
     return { added, upgraded, skipped };
@@ -485,6 +489,19 @@ export class Database {
     const flag = "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')";
     const pool = live === undefined ? "" : live ? ` AND ${flag}=1` : ` AND coalesce(${flag},0)!=1`;
     const row = this.sqlite.prepare(`SELECT * FROM items WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?)${pool} ORDER BY created_at LIMIT 1`).get(now()) as any;
+    return row ? this.mapItem(row) : undefined;
+  }
+
+  // The live capture that is already in flight for a source, if any. One broadcast can be
+  // reached from two entry points (the recorder, and a scraper that lists the live stream as
+  // media), and two ffmpeg captures of one room fight over the same viewer session, the same
+  // CPU and the same disk budget until both die. Callers that would open or create a live
+  // capture consult this first, so the room only ever has one capture in flight.
+  activeLiveItemForSource(sourceId: string, exceptItemId?: string): DownloadItem | undefined {
+    const flag = "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')";
+    const row = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND id<>? AND ${flag}=1
+      AND status IN ('queued','downloading','paused','stopping','cancelling') ORDER BY created_at LIMIT 1`)
+      .get(sourceId, exceptItemId ?? "") as any;
     return row ? this.mapItem(row) : undefined;
   }
 

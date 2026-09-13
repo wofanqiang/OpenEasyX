@@ -641,6 +641,11 @@ export class LiveCamService {
     const externalId = `${options.origin === "auto" ? "auto-live" : "manual-live"}:${username.toLowerCase()}:${session}`;
     const safeName = username.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "live";
     const { performer, source } = this.createPerformer(providerId, cam);
+    // One capture per room: manual, automatic and scraper-driven entry points all land on this
+    // source, so returning the capture already in flight keeps every one of them idempotent
+    // instead of stacking a second ffmpeg onto the same broadcast.
+    const inFlight = this.db.activeLiveItemForSource(source.id);
+    if (inFlight) return { itemId: inFlight.id, status: inFlight.status };
     let recordingAudioUrl: string | undefined;
     if (plugin.resolveLiveStream) {
       try {
@@ -650,7 +655,10 @@ export class LiveCamService {
     }
     this.db.ingestItems(source, [{
       externalId, title: cam.title ?? `${username} live`, pageUrl: cam.pageUrl, mediaType: "video",
-      publishedAt: startedAt.toISOString(), filename: `${safeName}-${session}.mp4`, metadata: { extractorUrl: cam.pageUrl, live: true, ...(recordingAudioUrl ? { recordingAudioUrl } : {}) },
+      publishedAt: startedAt.toISOString(), filename: `${safeName}-${session}.mp4`,
+      // liveRoom names the room this capture belongs to, so anything that tracks "is this room
+      // already being captured" resolves the same key for every entry point.
+      metadata: { extractorUrl: cam.pageUrl, live: true, liveRoom: username.trim().toLowerCase(), ...(recordingAudioUrl ? { recordingAudioUrl } : {}) },
     }]);
     const item = this.db.getItemBySourceExternalId(source.id, externalId);
     if (!item) throw new Error("The live recording could not be added to the download queue");

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EasyXPlugin, PluginContext } from "./plugin-sdk/index.js";
-import { ffmpegLiveCaptureCommand, liveRecordingRequest, liveReferer } from "./live-capture.js";
+import { ffmpegLiveCaptureCommand, isLiveCandidate, liveRecordingRequest, liveReferer } from "./live-capture.js";
 
 const context: PluginContext = {
   config: {}, fetch, runCommand: async () => ({ exitCode: 1, stdout: "", stderr: "" }), log: () => undefined,
@@ -73,5 +73,11 @@ describe("live capture request", () => {
     const request = await liveRecordingRequest(plugin(async () => { throw new Error("room is offline"); }), { ...context, log }, liveItem);
     expect(request).toBeUndefined();
     expect(log).toHaveBeenCalledWith("warn", expect.stringContaining("falling back"), "room is offline");
+  });
+
+  it("recognises a live broadcast so the sync path can refuse to queue it", () => {
+    expect(isLiveCandidate(liveItem)).toBe(true);
+    expect(isLiveCandidate({ externalId: "clip", mediaType: "video", metadata: {} })).toBe(false);
+    expect(isLiveCandidate({ externalId: "clip", mediaType: "video" })).toBe(false);
   });
 });

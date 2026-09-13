@@ -37,6 +37,23 @@ describe("Open EasyX live cams", () => {
     expect(followed).toHaveBeenCalledTimes(2);
   });
 
+  it("reuses the live capture already in flight for a room", async () => {
+    const { plugins, service, database } = await fixture();
+    plugins.install("test.live");
+    const cam = { id: "alice", username: "alice", title: "Alice live", pageUrl: "https://live.test/alice" };
+    // Manual, automatic and scraper-driven entry points all resolve to this source, and two
+    // ffmpeg captures of one broadcast end together, so the second call must reuse the first.
+    const first = await service.record("test.live", cam);
+    const second = await service.record("test.live", cam);
+    expect(second.itemId).toBe(first.itemId);
+    expect(database.listItems(50)).toHaveLength(1);
+    // The next broadcast of the same room is a new recording, not a duplicate of this one.
+    database.setItemStatus(first.itemId, "completed");
+    const third = await service.record("test.live", cam);
+    expect(third.itemId).not.toBe(first.itemId);
+    expect(database.listItems(50)).toHaveLength(2);
+  });
+
   it("does not let an old in-flight account read overwrite a reconnected session", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
     let finishOld!: (value: { authoritative: boolean; cams: []; skippedReason: string }) => void;

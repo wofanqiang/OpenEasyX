@@ -188,6 +188,20 @@ export class DownloadQueue {
     for (const kind of slotPlan(this.activeCounts(), limits)) {
       const item = this.db.nextQueued(kind === "recording");
       if (!item || this.active.has(item.id)) continue;
+      // One capture per room. A second live item for a source that is already capturing would
+      // open another ffmpeg on the same broadcast; the two then starve each other and end
+      // together. Close the newcomer as a duplicate of the capture in flight instead.
+      if (kind === "recording") {
+        const inFlight = this.db.activeLiveItemForSource(item.sourceId, item.id);
+        if (inFlight) {
+          this.db.setItemStatus(item.id, "duplicate", {
+            duplicateOf: inFlight.id,
+            error: `Another live capture of this source is already running (${inFlight.id})`,
+          });
+          this.writeLog?.("warn", "download", "Live item closed as a duplicate: this source is already being captured", { itemId: item.id, duplicateOf: inFlight.id, title: item.title });
+          continue;
+        }
+      }
       this.startItem(item);
     }
   }

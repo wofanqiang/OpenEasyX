@@ -1,4 +1,4 @@
-import type { Database } from "./database.js";
+import type { Database, DownloadItem } from "./database.js";
 import type { LiveCamService } from "./live-cams.js";
 import type { LiveCam } from "../packages/plugin-sdk/index.js";
 import { freeBytes, recordingDiskGuard, type FreeSpaceProbe } from "./disk-space.js";
@@ -53,11 +53,25 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
   // Reconcile the in-memory active set with the DB on every tick: recordings that were
   // in flight when the process (re)started keep blocking new auto-starts for the same cam,
   // and recordings that finished (or vanished) move their cam onto the cooldown list.
+  // A live item is identified by the same metadata the downloader keys on, with the
+  // external-id prefix kept as a fallback for rows written before that field existed. The room
+  // key covers every entry point, so a capture a scraper queued blocks an auto-start just like
+  // one the watcher itself started (it used to be invisible, which let the watcher stack a
+  // second recording onto the same broadcast).
+  const isLiveItem = (item: DownloadItem) =>
+    (item.metadata as Record<string, unknown> | undefined)?.live === true || LIVE_ITEM.test(item.externalId);
+  const liveRoomOf = (item: DownloadItem): string | undefined => {
+    const meta = item.metadata as Record<string, unknown> | undefined;
+    const declared = typeof meta?.liveRoom === "string" ? meta.liveRoom : undefined;
+    return (declared ?? LIVE_ITEM.exec(item.externalId)?.[1])?.trim().toLowerCase();
+  };
+
   const syncActive = () => {
     const liveKeys = new Map<string, string>();
     for (const item of db.listItems(300)) {
-      const match = LIVE_ITEM.exec(item.externalId);
-      if (match && ACTIVE_STATUSES.has(item.status)) liveKeys.set(`${item.pluginId}:${match[1]}`, item.id);
+      if (!ACTIVE_STATUSES.has(item.status) || !isLiveItem(item)) continue;
+      const room = liveRoomOf(item);
+      if (room) liveKeys.set(`${item.pluginId}:${room}`, item.id);
     }
     for (const [key, itemId] of liveKeys) if (!active.has(key)) active.set(key, { itemId });
     for (const [key, entry] of [...active]) {

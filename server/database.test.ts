@@ -7,7 +7,7 @@ import { Database } from "./database.js";
 
 const dirs: string[] = [];
 function createDb() { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir); return new Database(dir); }
-afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { for (const dir of dirs.splice(0)) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows holds the SQLite handle briefly; cleanup is best-effort. */ } } });
 
 describe("Database", () => {
   it("persists live creator favorites independently from recorded media", () => {
@@ -40,6 +40,39 @@ describe("Database", () => {
 
     const reopened = new Database(dir);
     expect(reopened.getSettings().autoQueueDiscovered).toBe(false);
+  });
+
+  it("reports the live capture already in flight for a source", () => {
+    const db = createDb();
+    const person = db.createPerformer({ name: "Alice" });
+    const source = db.addSource(person.id, "test.live", { externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test" });
+    db.ingestItems(source, [{ externalId: "live-one", mediaType: "video", metadata: { live: true } }]);
+    const first = db.listItems().find((item) => item.externalId === "live-one")!;
+    db.setItemStatus(first.id, "queued", { progress: 0 });   // what LiveCamService.record() does
+    expect(db.activeLiveItemForSource(source.id)).toMatchObject({ id: first.id });
+
+    // A second live item for the same room is refused while the first is still in flight.
+    db.ingestItems(source, [{ externalId: "live-two", mediaType: "video", metadata: { live: true } }]);
+    const second = db.listItems().find((item) => item.externalId === "live-two")!;
+    db.setItemStatus(second.id, "queued", { progress: 0 });
+    expect(db.activeLiveItemForSource(source.id, second.id)).toMatchObject({ id: first.id });
+
+    // Ordinary downloads are never mistaken for a live capture, and an ended one frees the room.
+    db.ingestItems(source, [{ externalId: "photo", mediaType: "image" }]);
+    expect(db.activeLiveItemForSource(source.id)).toMatchObject({ id: first.id });
+    db.setItemStatus(first.id, "completed");
+    db.setItemStatus(second.id, "cancelled");
+    expect(db.activeLiveItemForSource(source.id)).toBeUndefined();
+  });
+
+  it("does not let the global queue switch turn a live stream into a recording", () => {
+    const db = createDb();
+    expect(db.getSettings().autoQueueDiscovered).toBe(true);
+    const person = db.createPerformer({ name: "Alice" });
+    const source = db.addSource(person.id, "test.live", { externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", metadata: { live: true } }, { externalId: "clip", mediaType: "video" }]);
+    expect(db.getItemBySourceExternalId(source.id, "live")?.status).toBe("available");
+    expect(db.getItemBySourceExternalId(source.id, "clip")?.status).toBe("queued");
   });
 
   it("migrates pre-scraper databases without losing source schedules", () => {
