@@ -17,6 +17,9 @@ type CatalogResult = { cataloged: boolean; reason?: string; storagePath?: string
 type ArchiveOutcome = { id: string; cataloged: boolean; reason?: string; failed?: boolean };
 type RecoveryStatus = "" | "waiting" | "in-library";
 type RecoverySort = "recent" | "oldest" | "largest" | "title";
+/** A single in-flight task. While `job` is not null every action button is locked so two jobs can
+ *  never overlap and corrupt the same staged files. */
+type Job = { kind: "recover" | "archive" | "delete"; label: string; total: number; done: number; current?: string; indeterminate: boolean; startedAt: number };
 
 function formatBytes(bytes = 0) {
   if (!bytes) return "0 B";
@@ -72,9 +75,9 @@ function previewMedia(item: Recovered) {
 export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void }) {
   const [items, setItems] = useState<Recovered[] | null>(null);
   const [search, setSearch] = useState(() => window.location.search);
-  const [recovering, setRecovering] = useState(false);
-  const [archiving, setArchiving] = useState<Set<string>>(new Set());
-  const [deleting, setDeleting] = useState(false);
+  const [job, setJob] = useState<Job | null>(null);
+  const busy = job !== null;
+  const [elapsed, setElapsed] = useState(0);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
@@ -90,6 +93,14 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   }, []);
   /** Selection never survives a filter change, so Archive/Delete can only ever touch visible rows. */
   useEffect(() => { setSelectedIds(new Set()); }, [query, status, sort]);
+  useEffect(() => {
+    if (!job) { setElapsed(0); return; }
+    const startedAt = job.startedAt;
+    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [job]);
 
   const playId = useMemo(() => new URLSearchParams(search).get("play"), [search]);
   const preview = useMemo(() => items?.find((item) => item.itemId === playId) ?? null, [items, playId]);
@@ -118,9 +129,11 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const closePreview = () => { window.history.pushState({}, "", "/recovery"); setSearch(""); };
 
   const refresh = async () => { setItems(await load()); };
+  const titleOf = (id: string) => items?.find((item) => item.itemId === id)?.title ?? id;
 
   const runRecovery = async () => {
-    setRecovering(true);
+    if (busy) return;
+    setJob({ kind: "recover", label: "Recovering…", total: 1, done: 0, indeterminate: true, startedAt: Date.now() });
     try {
       const report = await api<RecoveryReport>("/api/maintenance/cleanup-residual-ts", { method: "POST", body: JSON.stringify({ execute: true }) });
       await refresh();
@@ -128,11 +141,12 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
       if (!report.scanned) setNotice("Recovery finished — no leftover captures were found.");
       else setNotice(`Recovery finished — ${report.rescued} recording${report.rescued === 1 ? "" : "s"} rescued, ${report.deleted} leftover${report.deleted === 1 ? "" : "s"} cleaned, ${report.skipped} skipped${report.failed ? `, ${report.failed} failed` : ""}${leftover} (scanned ${report.scanned}).`);
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
-    finally { setRecovering(false); }
+    finally { setJob(null); }
   };
 
   const archiveOne = async (itemId: string) => {
-    setArchiving((current) => new Set(current).add(itemId));
+    if (busy) return;
+    setJob({ kind: "archive", label: "Archiving…", total: 1, done: 0, current: titleOf(itemId), indeterminate: true, startedAt: Date.now() });
     try {
       const result = await api<CatalogResult>(`/api/recovery/${encodeURIComponent(itemId)}/catalog`, { method: "POST" });
       await refresh();
@@ -142,18 +156,23 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
       else if (result.reason === "already-completed") setNotice("This recording was already in your library — the recovered copy was removed.");
       else setNotice("Recording cleared from the recovery folder.");
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
-    finally { setArchiving((current) => { const next = new Set(current); next.delete(itemId); return next; }); }
+    finally { setJob(null); }
   };
 
+  /** Archive the current selection one item at a time so the progress bar can show real done/total. */
   const archiveSelected = async () => {
     const ids = [...selectedIds];
-    if (!ids.length) return;
-    setArchiving(new Set(ids));
+    if (!ids.length || busy) return;
+    setJob({ kind: "archive", label: "Archiving…", total: ids.length, done: 0, indeterminate: false, startedAt: Date.now() });
+    const outcomes: ArchiveOutcome[] = [];
     try {
-      const outcomes: ArchiveOutcome[] = await Promise.all(ids.map(async (id) => {
-        try { return { id, ...(await api<CatalogResult>(`/api/recovery/${encodeURIComponent(id)}/catalog`, { method: "POST" })) }; }
-        catch (error) { return { id, cataloged: false, reason: error instanceof Error ? error.message : String(error), failed: true }; }
-      }));
+      for (let index = 0; index < ids.length; index++) {
+        const id = ids[index];
+        setJob((current) => current && ({ ...current, done: index, current: titleOf(id) }));
+        try { outcomes.push({ id, ...(await api<CatalogResult>(`/api/recovery/${encodeURIComponent(id)}/catalog`, { method: "POST" })) }); }
+        catch (error) { outcomes.push({ id, cataloged: false, reason: error instanceof Error ? error.message : String(error), failed: true }); }
+        setJob((current) => current && ({ ...current, done: index + 1 }));
+      }
       await refresh();
       setSelectedIds(new Set()); setSelectionMode(false);
       const archived = outcomes.filter((outcome) => outcome.cataloged).length;
@@ -166,21 +185,31 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
       if (failed) parts.push(`${failed} failed`);
       setNotice(parts.join(" · "));
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
-    finally { setArchiving(new Set()); }
+    finally { setJob(null); }
   };
 
+  /** Delete the current selection one item at a time so the progress bar can show real done/total. */
   const deleteSelected = async () => {
     const ids = [...selectedIds];
-    if (!ids.length || !window.confirm(`Permanently delete ${ids.length} recovered ${ids.length === 1 ? "file" : "files"}? This cannot be undone.`)) return;
-    setDeleting(true);
+    if (!ids.length || busy) return;
+    if (!window.confirm(`Permanently delete ${ids.length} recovered ${ids.length === 1 ? "file" : "files"}? This cannot be undone.`)) return;
+    setJob({ kind: "delete", label: "Deleting…", total: ids.length, done: 0, indeterminate: false, startedAt: Date.now() });
+    const deleted: string[] = []; const failed: Array<{ id: string; error: string }> = [];
     try {
-      const result = await api<{ deleted: string[]; failed: Array<{ id: string; error: string }> }>("/api/recovery", { method: "DELETE", body: JSON.stringify({ itemIds: ids }) });
+      for (let index = 0; index < ids.length; index++) {
+        const id = ids[index];
+        setJob((current) => current && ({ ...current, done: index, current: titleOf(id) }));
+        try {
+          const result = await api<{ deleted: string[]; failed: Array<{ id: string; error: string }> }>("/api/recovery", { method: "DELETE", body: JSON.stringify({ itemIds: [id] }) });
+          deleted.push(...result.deleted); failed.push(...result.failed);
+        } catch (error) { failed.push({ id, error: error instanceof Error ? error.message : String(error) }); }
+        setJob((current) => current && ({ ...current, done: index + 1 }));
+      }
       await refresh();
-      setSelectedIds(new Set()); if (!result.failed.length) setSelectionMode(false);
-      const failed = result.failed.length;
-      setNotice(`${result.deleted.length} recovered ${result.deleted.length === 1 ? "file" : "files"} permanently deleted${failed ? ` · ${failed} failed` : ""}.`);
+      setSelectedIds(new Set()); if (!failed.length) setSelectionMode(false);
+      setNotice(`${deleted.length} recovered ${deleted.length === 1 ? "file" : "files"} permanently deleted${failed.length ? ` · ${failed.length} failed` : ""}.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
-    finally { setDeleting(false); }
+    finally { setJob(null); }
   };
 
   const toggleSelected = (id: string) => setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
@@ -193,14 +222,16 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const total = items?.length ?? 0;
   const allSelected = Boolean(visible.length) && visible.every((item) => selectedIds.has(item.itemId));
   const filteredOut = Boolean(total) && !visible.length;
-  return <div className="library-mode recovery-shell">
+  const recovering = busy && job?.kind === "recover";
+  const deleting = busy && job?.kind === "delete";
+  return <div className={`library-mode recovery-shell${busy ? " recovery-busy" : ""}`}>
     <section className="library-page recovery-page">
       <div className="library-intro">
         <div><p>COLLECT</p><h2>Recovery</h2><span>{total} rescued {total === 1 ? "recording" : "recordings"} kept outside the library</span></div>
         <div className="selection-actions">
-          <button className="primary" disabled={recovering} onClick={() => void runRecovery()}>{recovering ? <LoaderCircle className="spin"/> : <RotateCcw/>}{recovering ? "Recovering…" : "Recovery"}</button>
-          <button className="quiet" disabled={!selectedIds.size || Boolean(archiving.size)} onClick={() => void archiveSelected()}><Archive/>Archive{selectedIds.size ? ` (${selectedIds.size})` : ""}</button>
-          {selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectAll}>{allSelected ? "Clear" : "Select all"}</button><button className="delete-selection" disabled={!selectedIds.size || deleting} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!total} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}
+          <button className="primary" disabled={busy} onClick={() => void runRecovery()}>{recovering ? <LoaderCircle className="spin"/> : <RotateCcw/>}{recovering ? "Recovering…" : "Recovery"}</button>
+          <button className="quiet" disabled={busy || !selectedIds.size} onClick={() => void archiveSelected()}><Archive/>Archive{selectedIds.size ? ` (${selectedIds.size})` : ""}</button>
+          {selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" disabled={busy} onClick={selectAll}>{allSelected ? "Clear" : "Select all"}</button><button className="delete-selection" disabled={busy || !selectedIds.size} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={busy} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={busy || !total} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}
         </div>
       </div>
       <div className="filters recovery-filters">
@@ -213,20 +244,21 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
         <label className="sort"><SlidersHorizontal/><select aria-label="Sort rescued recordings" value={sort} onChange={(event) => setSort(event.target.value as RecoverySort)}><option value="recent">Recently recovered</option><option value="oldest">Oldest first</option><option value="largest">Largest files</option><option value="title">Title A–Z</option></select></label>
       </div>
       <p className="recovery-hint"><FileWarning/><span><b>Recovery</b> scans staging and the recovery folder for leftover captures, remuxes playable ones into <code>recovered.mp4</code> and deletes the unplayable ones. <b>Archive</b> moves a rescued file back into its canonical library path. Files stay out of your library until you archive them.</span></p>
+      {job && <RecoveryJobBar job={job} elapsed={elapsed}/>}
       {items === null ? <div className="loading"><LoaderCircle className="spin"/>Loading rescued recordings…</div>
-        : visible.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{visible.map((item) => <RecoveryCard key={item.itemId} item={item} selectionMode={selectionMode} selected={selectedIds.has(item.itemId)} toggleSelected={toggleSelected} open={openPreview} archive={archiveOne} archiving={archiving.has(item.itemId)}/>)}</div>
+        : visible.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{visible.map((item) => <RecoveryCard key={item.itemId} item={item} selectionMode={selectionMode} selected={selectedIds.has(item.itemId)} busy={busy} toggleSelected={toggleSelected} open={openPreview} archive={archiveOne}/>)}</div>
         : <div className="empty-state"><FolderSearch2/><h3>{filteredOut ? "No recordings match" : "Nothing to recover"}</h3><p>{filteredOut ? "Adjust the search or filters to see your rescued recordings again." : "Run Recovery after an interrupted recording to look for leftover captures."}</p></div>}
     </section>
   </div>;
 }
 
-function RecoveryCard({ item, selectionMode, selected, toggleSelected, open, archive, archiving }: {
-  item: Recovered; selectionMode: boolean; selected: boolean; toggleSelected: (id: string) => void;
-  open: (item: Recovered) => void; archive: (id: string) => void; archiving: boolean;
+function RecoveryCard({ item, selectionMode, selected, busy, toggleSelected, open, archive }: {
+  item: Recovered; selectionMode: boolean; selected: boolean; busy: boolean; toggleSelected: (id: string) => void;
+  open: (item: Recovered) => void; archive: (id: string) => void;
 }) {
   const href = playUrl(item.itemId); const activate = () => selectionMode ? toggleSelected(item.itemId) : open(item);
   return <article className={`media-card ${selected ? "selected" : ""}`}>
-    {selectionMode && <button className="selection-control" aria-label={selected ? `Deselect ${item.title}` : `Select ${item.title}`} aria-pressed={selected} onClick={() => toggleSelected(item.itemId)}>{selected ? <CheckSquare/> : <Square/>}</button>}
+    {selectionMode && <button className="selection-control" aria-label={selected ? `Deselect ${item.title}` : `Select ${item.title}`} aria-pressed={selected} disabled={busy} onClick={() => toggleSelected(item.itemId)}>{selected ? <CheckSquare/> : <Square/>}</button>}
     <a className="poster" href={href} aria-label={selectionMode ? `${selected ? "Deselect" : "Select"} ${item.title}` : `Preview ${item.title}`} onClick={(event) => internalLink(event, activate)}>
       <span className="media-art"><img className="poster-still" src={`/api/recovery/${encodeURIComponent(item.itemId)}/thumbnail`} alt="" loading="lazy" decoding="async"/></span>
       <span className="play"><Play/></span><span className="type"><Film/></span>
@@ -238,6 +270,23 @@ function RecoveryCard({ item, selectionMode, selected, toggleSelected, open, arc
       <p>{item.performer || "Unsorted"}{item.source ? ` - ${sourceDomain(item.source)}` : ""} · {formatBytes(item.size)}</p>
       <div className="media-facts"><span>{qualityLabel(item)}</span><i/><time dateTime={item.recoveredAt}>{mediaDateLabel(item.recoveredAt)}</time></div>
     </div>
-    {!selectionMode && <button className="archive-button" aria-label={`Archive ${item.title}`} title="Archive — move into the library" disabled={archiving} onClick={() => archive(item.itemId)}>{archiving ? <LoaderCircle className="spin"/> : <Archive/>}</button>}
+    {!selectionMode && <button className="archive-button" aria-label={`Archive ${item.title}`} title="Archive — move into the library" disabled={busy} onClick={() => archive(item.itemId)}><Archive/></button>}
   </article>;
+}
+
+function RecoveryJobBar({ job, elapsed }: { job: Job; elapsed: number }) {
+  const percent = job.indeterminate ? 0 : Math.round((job.done / Math.max(1, job.total)) * 100);
+  const time = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
+  return <div className="recovery-job" role="status" aria-live="polite">
+    <LoaderCircle className="spin recovery-job-icon"/>
+    <div className="recovery-job-body">
+      <div className="recovery-job-label">{job.label}</div>
+      <div className="recovery-job-meta">
+        {job.indeterminate
+          ? `Running for ${time} — this step can take several minutes, keep this tab open.`
+          : `${job.done} / ${job.total} done${job.current ? ` · ${job.current}` : ""} · ${time}`}
+      </div>
+      <div className={`recovery-progress${job.indeterminate ? " indeterminate" : ""}`}><i style={job.indeterminate ? undefined : { width: `${percent}%` }}/></div>
+    </div>
+  </div>;
 }

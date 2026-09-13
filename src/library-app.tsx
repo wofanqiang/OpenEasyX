@@ -137,6 +137,7 @@ export function LibraryApp() {
   const [performers, setPerformers] = useState<Performer[]>([]);
   const [selected, setSelected] = useState<Selection | null>(null);
   const [notice, setNotice] = useState("");
+  const [refreshToken, setRefreshToken] = useState(0);
   const routeMedia = mediaRoute(location.pathname);
   const routeLiveCam = liveCamRoute(location.pathname);
   const page = routeMedia ? pageFromPath(location.state?.easyx?.from?.split("?")[0] ?? "/library") : pageFromPath(location.pathname);
@@ -184,7 +185,7 @@ export function LibraryApp() {
   };
   const rescan = async () => {
     setNotice("Scanning your media folders…");
-    try { const result = await api<{ indexed: number }>("/api/scan", { method: "POST" }); await refresh(); setNotice(`Library refreshed — ${result.indexed} media files indexed.`); }
+    try { const result = await api<{ indexed: number }>("/api/scan", { method: "POST" }); await refresh(); setRefreshToken((n) => n + 1); setNotice(`Library refreshed — ${result.indexed} media files indexed.`); }
     catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
   };
   const refreshAllPerformers = async () => {
@@ -234,10 +235,10 @@ export function LibraryApp() {
       {routeMedia ? selected ? <PlayerViewer media={selected.media} context={selected.context} autoStart={selected.autoStart} close={() => { const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); void refresh(); }} favorite={updateFavorite} advance={(media) => { const from = location.state?.easyx?.from ?? "/library"; setSelected({ media, context: selected.context, autoStart: true }); navigate(mediaUrl(media), { state: playbackLocationState(from, selected.context, true) }); }} setNotice={setNotice}/> : <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : routeLiveCam ? <LiveCamViewer providerId={routeLiveCam.providerId} camId={routeLiveCam.camId} close={() => navigate(location.state?.easyx?.from ?? "/live-cam", { replace: true })}/> : <div className="content">
         {page === "home" && <Home dashboard={dashboard} open={openMedia} go={go} favorite={updateFavorite}/>}
         {page === "live-cam" && <LiveCamPage preset={liveCamPreset} open={openLiveCam} route={(preset) => navigate(liveCamListUrl(preset), { replace: true })}/>}
-        {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("library", preset), { replace: true })}/>}
+        {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("library", preset), { replace: true })} refreshToken={refreshToken}/>}
         {page === "performers" && <Performers performers={performers} go={go} query={routePreset.query ?? ""} route={(query) => navigate(pageUrl("performers", { query }), { replace: true })}/>}
-        {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })}/>}
-        {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("history", preset), { replace: true })}/>}
+        {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })} refreshToken={refreshToken}/>}
+        {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("history", preset), { replace: true })} refreshToken={refreshToken}/>}
         {page === "statistics" && <Statistics stats={dashboard.stats}/>}
         {page === "settings" && <SettingsPage setNotice={setNotice}/>}
       </div>}
@@ -312,7 +313,7 @@ function Shelf({ title, subtitle, items, open, favorite, all }: { title: string;
   return <section className="shelf"><div className="section-head"><div><h2>{title}</h2><p>{subtitle}</p></div><button onClick={all}>View all</button></div><div className="media-row">{items.map((media) => <MediaCard key={media.id} media={media} open={(item) => open(item, { ids: items.map((entry) => entry.id) })} favorite={favorite}/>)}</div></section>;
 }
 
-function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open, favorite, remove, route }: { preset?: LibraryPreset; favoriteOnly?: boolean; historyOnly?: boolean; open: OpenMedia; favorite: (media: Media, value: boolean) => void; remove: DeleteMedia; route: (preset: LibraryPreset) => void }) {
+function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open, favorite, remove, route, refreshToken = 0 }: { preset?: LibraryPreset; favoriteOnly?: boolean; historyOnly?: boolean; open: OpenMedia; favorite: (media: Media, value: boolean) => void; remove: DeleteMedia; route: (preset: LibraryPreset) => void; refreshToken?: number }) {
   const [query, setQuery] = useState(preset.query ?? "");
   const [kind, setKind] = useState(preset.kind ?? "");
   const [performer, setPerformer] = useState(preset.performer ?? "");
@@ -349,7 +350,7 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
       void api<LibraryResult>(`/api/library?${params}`).then(setResult).finally(() => setLoading(false));
     }, 180);
     return () => clearTimeout(timer);
-  }, [params]);
+  }, [params, refreshToken]);
   useEffect(() => { setSelectionMode(false); setSelectedIds(new Set()); }, [params]);
   const title = favoriteOnly ? "Favorite media" : historyOnly ? "Watch history" : performer || "Media library";
   const resetPage = <T,>(setter: (value: T) => void, value: T) => { setter(value); setPage(1); };

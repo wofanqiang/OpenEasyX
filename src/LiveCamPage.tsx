@@ -276,6 +276,9 @@ export function LiveCamPage({ preset, route, open }: { preset: LiveCamPreset; ro
     loadFavorites(); window.addEventListener("easyx:live-favorites", loadFavorites);
     return () => window.removeEventListener("easyx:live-favorites", loadFavorites);
   }, []);
+  // Return to the top of the list whenever the page changes (Next / Previous), so a new page
+  // does not open scrolled down where the previous page left off.
+  useEffect(() => { window.scrollTo({ top: 0, behavior: "smooth" }); }, [page]);
   useEffect(() => {
     const filtersKey = `${search}\u0000${providerId}\u0000${gender ?? ""}\u0000${favoritesOnly ? "1" : "0"}`;
     const filtersChanged = filtersKeyRef.current !== filtersKey;
