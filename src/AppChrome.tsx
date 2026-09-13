@@ -111,7 +111,7 @@ export function AppChrome({ title, scanningLibrary = false, onScanLibrary, onRef
         <div className="easyx-header-actions">
           <button className="easyx-scan-button easyx-header-operation" aria-label={operationLabel("Scan library", { running: scanRunning, percent: scan.percent })} disabled={scanRunning} aria-busy={scanRunning} onClick={() => { scan.begin(); onScanLibrary(); }}><RefreshCw className={scanRunning ? "spin" : ""} size={17}/><span>{operationLabel("Scan library", { running: scanRunning, percent: scan.percent })}</span></button>
           <button className="primary easyx-header-operation" aria-label={operationLabel("Refresh performers", performers)} disabled={performers.running} aria-busy={performers.running} onClick={() => { performers.begin(); onRefreshPerformers(); }}><Search className={performers.running ? "spin" : ""} size={17}/><span>{operationLabel("Refresh performers", performers)}</span></button>
-          <button className="easyx-header-operation" aria-label="Sign out" onClick={() => void signOut()}><LogOut size={17}/><span>Sign out</span></button>
+          <button className="easyx-scan-button easyx-header-operation" aria-label="Sign out" onClick={() => void signOut()}><LogOut size={17}/><span>Sign out</span></button>
         </div>
       </header>
       {children}

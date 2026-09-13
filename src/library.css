@@ -96,7 +96,21 @@
 @media(max-width:1150px){.system-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.system-details{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:800px){.system-gauges{grid-template-columns:1fr}.system-metrics{grid-template-columns:1fr}.system-details{grid-template-columns:1fr}}
 /* Residual TS recovery (Recovery page under COLLECT) */
+/* Recovery page is rendered by the classic app shell, which sits outside the
+   .library-mode scope of this file — .recovery-shell re-opens that scope so the
+   page shares the Library design system (grid, cards, buttons, empty state). */
+.recovery-shell{min-height:0;background:none;color:#f4f4f5}
 .recovery-page .library-intro{align-items:flex-end}
+.recovery-page .selection-actions{gap:12px}
+.recovery-page .selection-actions button{min-height:40px;padding:0 15px;border-radius:10px;font-size:11px;font-weight:750}
+.recovery-page .selection-actions button svg{width:16px}
+.recovery-page .selection-actions .primary{border:1px solid rgba(255,113,131,.45);color:#fff;box-shadow:0 9px 28px rgba(250,64,88,.17)}
+.recovery-page .selection-actions .primary:hover:not(:disabled){background:#ff5369}
+.recovery-page .selection-actions .quiet{background:#17171b;border:1px solid #2a2a30;color:#b2b2ba}
+.recovery-page .selection-actions .quiet:hover:not(:disabled){background:#1d1d22;border-color:#3a3a43;color:#e8e8ec}
+.recovery-page .selection-actions .quiet:disabled{opacity:.5}
+.recovery-page .selection-actions button:disabled{cursor:not-allowed}
+.recovery-page .recovery-filters{margin-bottom:12px}
 .recovery-hint{display:flex;gap:10px;align-items:flex-start;margin:0 0 22px;padding:12px 15px;border:1px solid #2c2c33;border-radius:12px;background:var(--panel);font-size:10px;line-height:1.55;color:#8b8b95}
 .recovery-hint svg{width:15px;flex:none;color:#ff6d80;margin-top:1px}
 .recovery-hint b{color:#d7d7dd}
@@ -105,5 +119,5 @@
 .archive-button:hover:not(:disabled){background:var(--red);border-color:#ff7183;color:#fff}
 .archive-button:disabled{opacity:.45;cursor:not-allowed}
 .archive-button svg{width:15px}
-@media(max-width:800px){.recovery-page .library-intro{align-items:flex-start}}
+@media(max-width:800px){.recovery-page .library-intro{align-items:flex-start}.recovery-page .selection-actions{gap:8px}}
 @media(max-width:480px){.recovery-hint{display:none}}

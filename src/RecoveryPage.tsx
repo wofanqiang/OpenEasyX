@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Archive, CheckSquare, FileWarning, Film, FolderSearch2, ListChecks, LoaderCircle, Play, RotateCcw, Square, Trash2, X } from "lucide-react";
+import { Archive, CheckSquare, Clock3, FileWarning, Film, FolderSearch2, Library as LibraryIcon, ListChecks, LoaderCircle, Play, RotateCcw, Search, SlidersHorizontal, Square, Trash2, X } from "lucide-react";
 import { api } from "./api";
 import { PlayerViewer } from "./Player";
 import "./library.css";
@@ -15,6 +15,8 @@ type RecoveryReport = {
 };
 type CatalogResult = { cataloged: boolean; reason?: string; storagePath?: string };
 type ArchiveOutcome = { id: string; cataloged: boolean; reason?: string; failed?: boolean };
+type RecoveryStatus = "" | "waiting" | "in-library";
+type RecoverySort = "recent" | "oldest" | "largest" | "title";
 
 function formatBytes(bytes = 0) {
   if (!bytes) return "0 B";
@@ -31,6 +33,10 @@ function mediaDateLabel(value?: string): string {
   if (!value) return "Unknown date";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "Unknown date" : new Intl.DateTimeFormat("en-US", { day: "numeric", month: "short", year: "numeric" }).format(date);
+}
+function recoveredStamp(value?: string): number {
+  const stamp = new Date(value ?? "").getTime();
+  return Number.isNaN(stamp) ? 0 : stamp;
 }
 function qualityLabel(item: Pick<Recovered, "width" | "height">): string {
   if (item.width > 0 && item.height > 0) return `${Math.min(item.width, item.height)}p`;
@@ -71,6 +77,9 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const [deleting, setDeleting] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState<RecoveryStatus>("");
+  const [sort, setSort] = useState<RecoverySort>("recent");
 
   const load = useCallback(async () => api<Recovered[]>("/api/recovery"), []);
   useEffect(() => { void load().then(setItems).catch((error) => setNotice(error instanceof Error ? error.message : String(error))); }, [load, setNotice]);
@@ -79,9 +88,28 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
     window.addEventListener("popstate", changed);
     return () => window.removeEventListener("popstate", changed);
   }, []);
+  /** Selection never survives a filter change, so Archive/Delete can only ever touch visible rows. */
+  useEffect(() => { setSelectedIds(new Set()); }, [query, status, sort]);
 
   const playId = useMemo(() => new URLSearchParams(search).get("play"), [search]);
   const preview = useMemo(() => items?.find((item) => item.itemId === playId) ?? null, [items, playId]);
+
+  const waiting = useMemo(() => (items ?? []).filter((item) => !item.cataloged).length, [items]);
+  const inLibrary = (items?.length ?? 0) - waiting;
+  const visible = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    const matched = (items ?? []).filter((item) => {
+      if (status === "waiting" && item.cataloged) return false;
+      if (status === "in-library" && !item.cataloged) return false;
+      if (!term) return true;
+      return `${item.title} ${item.performer} ${item.source}`.toLowerCase().includes(term);
+    });
+    const order = [...matched];
+    if (sort === "largest") order.sort((a, b) => b.size - a.size);
+    else if (sort === "title") order.sort((a, b) => a.title.localeCompare(b.title));
+    else order.sort((a, b) => (sort === "oldest" ? 1 : -1) * (recoveredStamp(a.recoveredAt) - recoveredStamp(b.recoveredAt)));
+    return order;
+  }, [items, query, status, sort]);
 
   const openPreview = (item: Recovered) => {
     window.history.pushState({}, "", playUrl(item.itemId));
@@ -156,27 +184,40 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   };
 
   const toggleSelected = (id: string) => setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
-  const selectAll = () => setSelectedIds((current) => items?.every((item) => current.has(item.itemId)) ? new Set() : new Set(items?.map((item) => item.itemId) ?? []));
+  const selectAll = () => setSelectedIds((current) => visible.every((item) => current.has(item.itemId)) ? new Set() : new Set(visible.map((item) => item.itemId)));
   const cancelSelection = () => { setSelectionMode(false); setSelectedIds(new Set()); };
 
   if (preview) return <PlayerViewer media={previewMedia(preview)} context={{}} autoStart={false} readOnly
     close={closePreview} favorite={() => {}} advance={() => {}} setNotice={setNotice}/>;
 
-  const allSelected = Boolean(items?.length) && items!.every((item) => selectedIds.has(item.itemId));
-  return <section className="library-page recovery-page">
-    <div className="library-intro">
-      <div><p>COLLECT</p><h2>Recovery</h2><span>{items?.length ?? 0} rescued {items?.length === 1 ? "recording" : "recordings"} waiting outside the library</span></div>
-      <div className="selection-actions">
-        <button className="primary" disabled={recovering} onClick={() => void runRecovery()}>{recovering ? <LoaderCircle className="spin"/> : <RotateCcw/>}{recovering ? "Recovering…" : "Recovery"}</button>
-        <button className="quiet" disabled={!selectedIds.size || Boolean(archiving.size)} onClick={() => void archiveSelected()}><Archive/>归档{selectedIds.size ? ` (${selectedIds.size})` : ""}</button>
-        {selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectAll}>{allSelected ? "Clear" : "Select all"}</button><button className="delete-selection" disabled={!selectedIds.size || deleting} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!items?.length} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}
+  const total = items?.length ?? 0;
+  const allSelected = Boolean(visible.length) && visible.every((item) => selectedIds.has(item.itemId));
+  const filteredOut = Boolean(total) && !visible.length;
+  return <div className="library-mode recovery-shell">
+    <section className="library-page recovery-page">
+      <div className="library-intro">
+        <div><p>COLLECT</p><h2>Recovery</h2><span>{total} rescued {total === 1 ? "recording" : "recordings"} kept outside the library</span></div>
+        <div className="selection-actions">
+          <button className="primary" disabled={recovering} onClick={() => void runRecovery()}>{recovering ? <LoaderCircle className="spin"/> : <RotateCcw/>}{recovering ? "Recovering…" : "Recovery"}</button>
+          <button className="quiet" disabled={!selectedIds.size || Boolean(archiving.size)} onClick={() => void archiveSelected()}><Archive/>Archive{selectedIds.size ? ` (${selectedIds.size})` : ""}</button>
+          {selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectAll}>{allSelected ? "Clear" : "Select all"}</button><button className="delete-selection" disabled={!selectedIds.size || deleting} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!total} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}
+        </div>
       </div>
-    </div>
-    <p className="recovery-hint"><FileWarning/><span><b>Recovery</b> scans staging and the recovery folder for leftover captures, remuxes playable ones into <code>recovered.mp4</code> and deletes the unplayable ones. <b>归档</b> moves a rescued file back into its canonical library path. Files stay out of your library until you archive them.</span></p>
-    {items === null ? <div className="loading"><LoaderCircle className="spin"/>Loading recovered recordings…</div>
-      : items.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{items.map((item) => <RecoveryCard key={item.itemId} item={item} selectionMode={selectionMode} selected={selectedIds.has(item.itemId)} toggleSelected={toggleSelected} open={openPreview} archive={archiveOne} archiving={archiving.has(item.itemId)}/>)}</div>
-      : <div className="empty-state"><FolderSearch2/><h3>Nothing to recover</h3><p>Run Recovery after an interrupted recording to look for leftover captures.</p></div>}
-  </section>;
+      <div className="filters recovery-filters">
+        <label><Search/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search rescued recordings…" aria-label="Search rescued recordings"/></label>
+        <div className="filter-buttons">
+          <button className={status ? "" : "active"} onClick={() => setStatus("")}>All</button>
+          <button className={status === "waiting" ? "active" : ""} onClick={() => setStatus("waiting")}><Clock3/>Waiting {waiting}</button>
+          <button className={status === "in-library" ? "active" : ""} onClick={() => setStatus("in-library")}><LibraryIcon/>In library {inLibrary}</button>
+        </div>
+        <label className="sort"><SlidersHorizontal/><select aria-label="Sort rescued recordings" value={sort} onChange={(event) => setSort(event.target.value as RecoverySort)}><option value="recent">Recently recovered</option><option value="oldest">Oldest first</option><option value="largest">Largest files</option><option value="title">Title A–Z</option></select></label>
+      </div>
+      <p className="recovery-hint"><FileWarning/><span><b>Recovery</b> scans staging and the recovery folder for leftover captures, remuxes playable ones into <code>recovered.mp4</code> and deletes the unplayable ones. <b>Archive</b> moves a rescued file back into its canonical library path. Files stay out of your library until you archive them.</span></p>
+      {items === null ? <div className="loading"><LoaderCircle className="spin"/>Loading rescued recordings…</div>
+        : visible.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{visible.map((item) => <RecoveryCard key={item.itemId} item={item} selectionMode={selectionMode} selected={selectedIds.has(item.itemId)} toggleSelected={toggleSelected} open={openPreview} archive={archiveOne} archiving={archiving.has(item.itemId)}/>)}</div>
+        : <div className="empty-state"><FolderSearch2/><h3>{filteredOut ? "No recordings match" : "Nothing to recover"}</h3><p>{filteredOut ? "Adjust the search or filters to see your rescued recordings again." : "Run Recovery after an interrupted recording to look for leftover captures."}</p></div>}
+    </section>
+  </div>;
 }
 
 function RecoveryCard({ item, selectionMode, selected, toggleSelected, open, archive, archiving }: {
@@ -197,6 +238,6 @@ function RecoveryCard({ item, selectionMode, selected, toggleSelected, open, arc
       <p>{item.performer || "Unsorted"}{item.source ? ` - ${sourceDomain(item.source)}` : ""} · {formatBytes(item.size)}</p>
       <div className="media-facts"><span>{qualityLabel(item)}</span><i/><time dateTime={item.recoveredAt}>{mediaDateLabel(item.recoveredAt)}</time></div>
     </div>
-    {!selectionMode && <button className="archive-button" aria-label={`归档 ${item.title}`} title="归档 — move into the library" disabled={archiving} onClick={() => archive(item.itemId)}>{archiving ? <LoaderCircle className="spin"/> : <Archive/>}</button>}
+    {!selectionMode && <button className="archive-button" aria-label={`Archive ${item.title}`} title="Archive — move into the library" disabled={archiving} onClick={() => archive(item.itemId)}>{archiving ? <LoaderCircle className="spin"/> : <Archive/>}</button>}
   </article>;
 }
