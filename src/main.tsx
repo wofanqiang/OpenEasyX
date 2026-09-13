@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, Box, Captions, Check, ChevronLeft, ChevronRight, CircleAlert, ClipboardPaste, CloudDownload, Database, Download, ExternalLink, FolderOpen, Gauge, Globe2, HardDrive, LayoutDashboard, Link2, LoaderCircle, PackagePlus, Pause, Pencil, Play, Plug, Plus, RefreshCw, Search, Settings, ShieldCheck, Sparkles, Square, Terminal, Trash2, UserRound, Users, X } from "lucide-react";
+import { Activity, Box, Captions, Check, ChevronLeft, ChevronRight, CircleAlert, ClipboardPaste, CloudDownload, Database, Download, ExternalLink, FolderOpen, Gauge, Globe2, HardDrive, LayoutDashboard, LifeBuoy, Link2, LoaderCircle, PackagePlus, Pause, Pencil, Play, Plug, Plus, RefreshCw, Search, Settings, ShieldCheck, Sparkles, Square, Terminal, Trash2, UserRound, Users, X } from "lucide-react";
 import { api } from "./api.js";
 import { activitySourceDomains, confirmItemDeletion, downloadTime } from "./activity.js";
 import { pluginFaviconUrl } from "./plugin-icon.js";
 import { canonicalEntryPath, pageFromPath, pagePath, type PageKey } from "./routes.js";
 import { LogsPage } from "./logs.js";
+import { RecoveryPage } from "./RecoveryPage.js";
 import { isLibraryRoute, LibraryApp } from "./library-app.js";
 import { AuthGate } from "./AuthGate.js";
 import { AppChrome } from "./AppChrome.js";
@@ -36,7 +37,7 @@ type DiscoveryProvider = { pluginId: string; pluginName: string; ok: boolean; re
 
 const nav = [
   ["dashboard", "Home", LayoutDashboard], ["library", "Performers", Users],
-  ["activity", "Activity", Activity], ["logs", "Logs", Terminal], ["plugins", "Plugins", Plug], ["settings", "Settings", Settings],
+  ["activity", "Activity", Activity], ["recovery", "Recovery", LifeBuoy], ["logs", "Logs", Terminal], ["plugins", "Plugins", Plug], ["settings", "Settings", Settings],
 ] as const;
 
 function formatBytes(bytes = 0) {
@@ -151,6 +152,7 @@ function App() {
         {page === "dashboard" && <Overview dashboard={dashboard} plugins={plugins} go={navigate} discover={openPerformerDiscovery}/>}
         {page === "library" && <Library dashboard={dashboard} plugins={plugins} run={run}/>}
         {page === "activity" && <ActivityPage performers={dashboard.performers} sources={dashboard.sources} run={run}/>}
+        {page === "recovery" && <RecoveryPage setNotice={(text) => setNotice({ kind: "ok", text })}/>}
         {page === "logs" && <LogsPage/>}
         {page === "plugins" && <PluginsPage plugins={plugins} repositories={repositories} run={run}/>}
         {page === "settings" && <SettingsPage settings={settings} run={run} onSettingsChange={setSettings} setNotice={(text) => setNotice({ kind: "ok", text })}/>}

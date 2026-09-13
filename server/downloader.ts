@@ -218,38 +218,7 @@ export class DownloadQueue {
             // shifted by the measured delta via `asetpts` while re-encoding to
             // AAC. Video is copied. Without a sidecar, fall back to probing
             // start_time (works for sources whose raw PTS differ visibly).
-            let audioShift = readAvSyncSidecar(tsPath + ".avsync.json") ?? 0;
-            if (audioShift === 0) {
-              try {
-                const probe = await this.capture("ffprobe", [
-                  "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", tsPath,
-                ]);
-                const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; start_time?: string }> };
-                let videoStart: number | undefined;
-                let audioStart: number | undefined;
-                for (const stream of parsed.streams ?? []) {
-                  if (stream.codec_type === "video" && videoStart === undefined) videoStart = Number(stream.start_time ?? 0) || 0;
-                  if (stream.codec_type === "audio" && audioStart === undefined) audioStart = Number(stream.start_time ?? 0) || 0;
-                }
-                // Only correct a clear, sane skew: tiny deltas are measurement noise,
-                // and huge deltas would indicate something other than a sync issue.
-                if (videoStart !== undefined && audioStart !== undefined) {
-                  const delta = videoStart - audioStart;
-                  if (Math.abs(delta) > 0.15 && Math.abs(delta) <= 30) audioShift = delta;
-                }
-              } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
-            }
-            const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
-            await this.runCommandDownload("ffmpeg", [
-              "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
-              "-map", "0", "-c:v", "copy", "-c:a", "aac",
-              ...(audioFilter ? ["-af", audioFilter] : []),
-              // Still corrects any drift inside the audio timeline itself.
-              "-async", "1",
-              "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
-            ], temporaryDirectory, undefined, () => {}, control);
-            if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
-            if (!fs.existsSync(mp4Staging) || !fs.statSync(mp4Staging).size) throw new Error("Remux to MP4 produced no output");
+            await this.remuxCaptureToMp4(tsPath, mp4Staging, control);
             fs.unlinkSync(tsPath);
             fs.renameSync(mp4Staging, temporary);
           }
@@ -559,6 +528,252 @@ export class DownloadQueue {
     const settled = result.then(() => undefined, () => undefined);
     this.finalizers.set(key, settled);
     try { return await result; }
-    finally { if (this.finalizers.get(key) === settled) this.finalizers.delete(key); }
+      finally { if (this.finalizers.get(key) === settled) this.finalizers.delete(key); }
+  }
+
+  // --- Residual TS recovery (Recovery page) ---------------------------------
+
+  /** Recovered recordings live here, outside the library, until the user archives them. */
+  private get recoveryRoot() { return path.join(this.mediaRoot, ".recording-recovery"); }
+
+  recoveredStreamPath(itemId: string): string | null {
+    const file = path.join(this.recoveryRoot, safeSegment(itemId), "recovered.mp4");
+    return fs.existsSync(file) && fs.statSync(file).size > 0 ? file : null;
+  }
+  recoveredPosterPath(itemId: string): string | null {
+    const file = path.join(this.recoveryRoot, safeSegment(itemId), "recovered.poster.jpg");
+    return fs.existsSync(file) && fs.statSync(file).size > 0 ? file : null;
+  }
+
+  /** Remux a live MPEG-TS capture into an MP4, shifting the audio by the measured A/V skew. */
+  private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload): Promise<number> {
+    let audioShift = readAvSyncSidecar(tsPath + ".avsync.json") ?? 0;
+    if (audioShift === 0) {
+      try {
+        const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", tsPath]);
+        const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; start_time?: string }> };
+        let videoStart: number | undefined;
+        let audioStart: number | undefined;
+        for (const stream of parsed.streams ?? []) {
+          if (stream.codec_type === "video" && videoStart === undefined) videoStart = Number(stream.start_time ?? 0) || 0;
+          if (stream.codec_type === "audio" && audioStart === undefined) audioStart = Number(stream.start_time ?? 0) || 0;
+        }
+        // Only correct a clear, sane skew: tiny deltas are measurement noise,
+        // and huge deltas would indicate something other than a sync issue.
+        if (videoStart !== undefined && audioStart !== undefined) {
+          const delta = videoStart - audioStart;
+          if (Math.abs(delta) > 0.15 && Math.abs(delta) <= 30) audioShift = delta;
+        }
+      } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
+    }
+    const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
+    await this.runCommandDownload("ffmpeg", [
+      "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
+      "-map", "0", "-c:v", "copy", "-c:a", "aac",
+      ...(audioFilter ? ["-af", audioFilter] : []),
+      // Still corrects any drift inside the audio timeline itself.
+      "-async", "1",
+      "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
+    ], path.dirname(mp4Staging), undefined, () => {}, control);
+    if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
+    if (!fs.existsSync(mp4Staging) || !fs.statSync(mp4Staging).size) throw new Error("Remux to MP4 produced no output");
+    return audioShift;
+  }
+
+  private findCaptureSource(dir: string): string | undefined {
+    for (const candidate of ["capture.ts", "capture.mkv", "capture.mp4"]) {
+      const candidatePath = path.join(dir, candidate);
+      if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).size > 0) return candidatePath;
+    }
+    try {
+      const ts = fs.readdirSync(dir).filter((file) => file.endsWith(".ts") && fs.statSync(path.join(dir, file)).size > 0);
+      if (ts.length) return path.join(dir, ts[0]);
+    } catch { /* directory read failed */ }
+    return undefined;
+  }
+
+  private async isPlayableCapture(tsPath: string): Promise<boolean> {
+    try {
+      const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type", "-of", "json", tsPath]);
+      const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string }> };
+      return (parsed.streams ?? []).some((stream) => stream.codec_type === "video" || stream.codec_type === "audio");
+    } catch { return false; }
+  }
+
+  private async probeVideo(file: string): Promise<{ duration: number; width: number; height: number }> {
+    try {
+      const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries", "stream=duration,width,height", "-of", "json", file]);
+      const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ duration?: string; width?: number; height?: number }> };
+      const video = parsed.streams?.find((stream) => stream.width);
+      let duration = 0;
+      for (const stream of parsed.streams ?? []) if (stream.duration) duration = Number(stream.duration) || duration;
+      return { duration, width: video?.width ?? 0, height: video?.height ?? 0 };
+    } catch { return { duration: 0, width: 0, height: 0 }; }
+  }
+
+  async ensureRecoveredPoster(itemId: string, mp4?: string): Promise<string | null> {
+    const dir = path.join(this.recoveryRoot, safeSegment(itemId));
+    const poster = path.join(dir, "recovered.poster.jpg");
+    if (fs.existsSync(poster) && fs.statSync(poster).size > 0) return poster;
+    const source = mp4 ?? path.join(dir, "recovered.mp4");
+    if (!fs.existsSync(source)) return null;
+    try {
+      await this.capture("ffmpeg", ["-y", "-v", "error", "-ss", "1", "-i", source, "-frames:v", "1", "-vf", "scale=320:-1", poster]);
+      if (fs.existsSync(poster) && fs.statSync(poster).size > 0) return poster;
+    } catch { /* Poster is optional; the UI falls back to a placeholder. */ }
+    return null;
+  }
+
+  /** Scan both the active download staging area and the recovery folder for leftover captures. */
+  async recoverResidualTs(options: { dryRun?: boolean; execute?: boolean } = {}): Promise<{
+    scanned: number; rescued: number; deleted: number; failed: number; skipped: number; dryRun: boolean;
+    items: Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" }>;
+  }> {
+    const dryRun = options.dryRun === true || options.execute !== true;
+    const execute = options.execute === true;
+    const report = {
+      scanned: 0, rescued: 0, deleted: 0, failed: 0, skipped: 0, dryRun,
+      items: [] as Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" }>,
+    };
+    const roots = [this.downloadsRoot, this.recoveryRoot];
+    const ACTIVE = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
+    for (const root of roots) {
+      if (!fs.existsSync(root)) continue;
+      let names: string[] = [];
+      try {
+        names = fs.readdirSync(root).filter((name) => { try { return fs.statSync(path.join(root, name)).isDirectory(); } catch { return false; } });
+      } catch { continue; }
+      for (const name of names) {
+        const itemId = name;
+        // A recovery folder that already holds a rescued MP4 is a finished rescue, not a
+        // residual capture, so it is not counted as a scan candidate.
+        if (root === this.recoveryRoot && fs.existsSync(path.join(root, name, "recovered.mp4"))) continue;
+        report.scanned++;
+        const item = this.db.getItem(itemId);
+        if (this.active.has(itemId) || (item && ACTIVE.has(item.status))) {
+          report.skipped++; report.items.push({ itemId, action: "skipped" }); continue;
+        }
+        const tsPath = this.findCaptureSource(path.join(root, name));
+        if (!tsPath) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
+        const recoverable = await this.isPlayableCapture(tsPath);
+        if (!recoverable) {
+          if (execute) { try { fs.rmSync(path.join(root, name), { recursive: true, force: true }); report.deleted++; } catch { report.failed++; } }
+          else report.deleted++;
+          report.items.push({ itemId, action: "deleted" });
+          continue;
+        }
+        const recoveryDir = path.join(this.recoveryRoot, safeSegment(itemId));
+        const outPath = path.join(recoveryDir, "recovered.mp4");
+        // Nothing is written during a dry run, so the recovery folder is only created on execute.
+        if (dryRun) { report.rescued++; report.items.push({ itemId, action: "rescued" }); continue; }
+        try {
+          this.prepareOutputDirectory(recoveryDir);
+          await this.remuxCaptureToMp4(tsPath, outPath, { action: undefined, paused: false, encoding: false } as ActiveDownload);
+          const probe = await this.probeVideo(outPath);
+          const sidecar = {
+            itemId, title: item?.title ?? itemId,
+            performer: item?.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
+            source: item?.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
+            duration: probe.duration, width: probe.width, height: probe.height,
+            size: fs.statSync(outPath).size, recoveredAt: new Date().toISOString(), avsyncDelta: 0,
+          };
+          fs.writeFileSync(path.join(recoveryDir, "recovered.json"), JSON.stringify(sidecar, null, 2));
+          await this.ensureRecoveredPoster(itemId, outPath);
+          if (path.resolve(tsPath) !== path.resolve(outPath)) { try { fs.unlinkSync(tsPath); } catch { /* keep on cleanup failure */ } }
+          report.rescued++; report.items.push({ itemId, action: "rescued" });
+        } catch (error) {
+          report.failed++; report.items.push({ itemId, action: "failed" });
+          this.writeLog?.("warn", "download", "Residual TS remux failed", { itemId, error: String(error) });
+        }
+      }
+    }
+    return report;
+  }
+
+  async listRecovered(): Promise<Array<{
+    itemId: string; title: string; performer: string; source: string;
+    duration: number; width: number; height: number; size: number; recoveredAt: string; cataloged: boolean;
+  }>> {
+    const entries: Array<{
+      itemId: string; title: string; performer: string; source: string;
+      duration: number; width: number; height: number; size: number; recoveredAt: string; cataloged: boolean;
+    }> = [];
+    if (!fs.existsSync(this.recoveryRoot)) return entries;
+    for (const name of fs.readdirSync(this.recoveryRoot)) {
+      const dir = path.join(this.recoveryRoot, name);
+      if (!fs.statSync(dir).isDirectory()) continue;
+      const mp4 = path.join(dir, "recovered.mp4");
+      if (!fs.existsSync(mp4) || !fs.statSync(mp4).size) continue;
+      const itemId = name;
+      const item = this.db.getItem(itemId);
+      let sidecar: Record<string, unknown> = {};
+      try { sidecar = JSON.parse(fs.readFileSync(path.join(dir, "recovered.json"), "utf8")); } catch { /* sidecar missing */ }
+      const performerName = typeof sidecar.performer === "string" ? sidecar.performer
+        : (item?.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "");
+      const sourceDomain = typeof sidecar.source === "string" ? sidecar.source
+        : (item?.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "");
+      const cataloged = Boolean(item && item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath)));
+      entries.push({
+        itemId,
+        title: typeof sidecar.title === "string" ? sidecar.title : (item?.title ?? itemId),
+        performer: performerName, source: sourceDomain,
+        duration: Number(sidecar.duration ?? 0), width: Number(sidecar.width ?? 0), height: Number(sidecar.height ?? 0),
+        size: fs.statSync(mp4).size, recoveredAt: typeof sidecar.recoveredAt === "string" ? sidecar.recoveredAt : (item?.updatedAt ?? new Date().toISOString()),
+        cataloged,
+      });
+    }
+    return entries.sort((a, b) => (a.recoveredAt < b.recoveredAt ? 1 : -1));
+  }
+
+  /** Move a recovered recording into the library at its canonical path (reuses the finalize logic). */
+  async catalogRecovered(itemId: string): Promise<{ cataloged: boolean; reason?: string; storagePath?: string }> {
+    const mp4 = path.join(this.recoveryRoot, safeSegment(itemId), "recovered.mp4");
+    if (!fs.existsSync(mp4) || !fs.statSync(mp4).size) throw Object.assign(new Error("No recovered file for this item"), { statusCode: 404 });
+    const item = this.db.getItem(itemId);
+    if (!item) throw Object.assign(new Error("Recording item not found"), { statusCode: 404 });
+    // Guard: the item is already a completed library entry with its file on disk — never overwrite it.
+    if (item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
+      this.clearRecovery(itemId);
+      return { cataloged: false, reason: "already-completed" };
+    }
+    const performer = this.db.getPerformer(item.performerId);
+    const source = this.db.getSource(item.sourceId);
+    const settings = outputSettings(this.db.getSettings());
+    const filename = safeSegment(item.filename ?? `${item.externalId}.mp4`, `${item.externalId}.mp4`);
+    const destination = path.join(this.mediaRoot, downloadOutputPath(settings, item, performer?.name ?? "Unsorted", source?.domain ?? "recovered", filename));
+    this.prepareOutputDirectory(path.dirname(destination));
+    const finalPath = this.availableDestination(destination, item.id);
+    const canonicalDate = this.db.setCanonicalMediaDate(item.id, item.publishedAt);
+    return this.withFinalizeLock("output", async () => {
+      await this.applyMediaDate(mp4, item.mediaType, canonicalDate);
+      fs.renameSync(mp4, finalPath);
+      const relativePath = path.relative(this.mediaRoot, finalPath);
+      const checksum = await this.hashFile(finalPath);
+      const duplicate = this.db.findByChecksum(checksum, item.id, item.performerId);
+      if (duplicate && duplicate.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
+        fs.unlinkSync(finalPath);
+        this.db.setItemStatus(item.id, "duplicate", { progress: 1, checksum, duplicateOf: duplicate.id });
+        this.clearRecovery(itemId);
+        return { cataloged: false, reason: "duplicate" };
+      }
+      this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+      this.clearRecovery(itemId);
+      return { cataloged: true, storagePath: relativePath };
+    });
+  }
+
+  private clearRecovery(itemId: string) {
+    const dir = path.join(this.recoveryRoot, safeSegment(itemId));
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+
+  async deleteRecovered(itemIds: string[]): Promise<{ deleted: string[]; failed: Array<{ id: string; error: string }> }> {
+    const deleted: string[] = [];
+    const failed: Array<{ id: string; error: string }> = [];
+    for (const id of itemIds) {
+      try { this.clearRecovery(id); deleted.push(id); }
+      catch (error) { failed.push({ id, error: error instanceof Error ? error.message : String(error) }); }
+    }
+    return { deleted, failed };
   }
 }

@@ -32,8 +32,8 @@ function safePlay(element: HTMLVideoElement) {
   void element.play().catch(() => {});
 }
 
-export function PlayerViewer({ media, context, autoStart = false, close, favorite, advance, setNotice }: {
-  media: Media; context: PlaybackContext; autoStart?: boolean; close: () => void;
+export function PlayerViewer({ media, context, autoStart = false, readOnly = false, close, favorite, advance, setNotice }: {
+  media: Media; context: PlaybackContext; autoStart?: boolean; readOnly?: boolean; close: () => void;
   favorite: (media: Media, value: boolean) => void; advance: (media: Media) => void; setNotice: (value: string) => void;
 }) {
   const video = useRef<HTMLVideoElement>(null); const player = useRef<HTMLDivElement>(null); const lastSaved = useRef(0); const hideTimer = useRef<number | undefined>(undefined);
@@ -49,6 +49,8 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   const [languages, setLanguages] = useState<Language[]>([]); const [uploadLanguage, setUploadLanguage] = useState("en"); const [uploading, setUploading] = useState(false);
 
   const save = (completed = false, force = false) => {
+    // Recovered files have no library entry, so playback progress is never tracked for them.
+    if (readOnly) return Promise.resolve();
     const element = video.current; if (!element || !Number.isFinite(element.duration)) return Promise.resolve();
     if (!force && !completed && Math.abs(element.currentTime - lastSaved.current) < 8) return Promise.resolve();
     lastSaved.current = element.currentTime;
@@ -65,6 +67,7 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   const selectTrack = (id: string) => { setSubtitleTrack(id); localStorage.setItem("open-easyx.subtitle-track", id); setCaptionMenu(false); };
   const toggleAutoplay = () => { const value = !autoplay; setAutoplay(value); localStorage.setItem("open-easyx.autoplay", String(value)); };
   const next = async () => {
+    if (readOnly) return;
     await save(true, true);
     if (!autoplay) return;
     let ids = context.ids ?? [];
@@ -75,8 +78,9 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   };
 
   useEffect(() => {
-    if (media.kind === "image") void api(`/api/media/${media.id}/progress`, { method: "PUT", body: JSON.stringify({ position: 0, duration: 0, completed: true }) }).catch(() => {});
-  }, [media.id, media.kind]);
+    if (readOnly || media.kind !== "image") return;
+    void api(`/api/media/${media.id}/progress`, { method: "PUT", body: JSON.stringify({ position: 0, duration: 0, completed: true }) }).catch(() => {});
+  }, [media.id, media.kind, readOnly]);
   useEffect(() => {
     lastSaved.current = 0; window.clearTimeout(hideTimer.current);
     if (media.kind === "video" && video.current) {
@@ -98,7 +102,7 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
     return () => { window.clearInterval(interval); window.clearTimeout(timer); };
   }, [media.id, media.kind, autoplay, photoReady]);
   useEffect(() => {
-    if (media.kind !== "video") return;
+    if (media.kind !== "video" || readOnly) return;
     let cancelled = false;
     const refresh = () => api<SubtitleState>(`/api/media/${media.id}/subtitles`).then((value) => { if (!cancelled) setSubtitles(value); }).catch(() => {});
     void refresh(); void api<{ subtitleLanguages: Language[] }>("/api/settings").then((value) => setLanguages(value.subtitleLanguages)).catch(() => {});
@@ -160,7 +164,7 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
             <button className="player-icon-button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>{fullscreen ? <Minimize/> : <Maximize/>}</button></div></div></div>
     </div> : <div ref={player} className={`image-stage ${pageFullscreen ? "page-fullscreen" : ""}`}><img src={media.streamUrl} alt={media.title} onLoad={() => setPhotoReady(true)} onError={() => setPhotoReady(true)}/><div className="photo-controls"><div className="photo-timeline"><i style={{ width: `${autoplay && photoReady ? (PHOTO_AUTOPLAY_SECONDS - photoRemaining) / PHOTO_AUTOPLAY_SECONDS * 100 : 0}%` }}/></div><div className="photo-control-row"><span>{autoplay ? photoReady ? `Next item in ${photoRemaining}s` : "Loading photo…" : "Autoplay is off"}</span><div><button className={`player-autoplay ${autoplay ? "active" : ""}`} aria-label="Autoplay" aria-pressed={autoplay} onClick={toggleAutoplay}><span>Auto</span><i/></button><button className="player-icon-button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>{fullscreen ? <Minimize/> : <Maximize/>}</button></div></div></div></div>}</div>
     <section className="watch-info">
-      <div className="watch-heading"><div><span className="watch-eyebrow">{media.source || "Local library"} · {media.kind === "video" ? "Video" : "Photo"}</span><h1>{media.title}</h1><p>{media.performer || "Unsorted"}</p></div><div className="watch-actions"><button className="quiet" onClick={() => void favorite(media, !media.favorite)}><Heart className={media.favorite ? "filled" : ""}/>{media.favorite ? "In favorites" : "Add to favorites"}</button><button className="quiet" onClick={closeViewer}><ArrowLeft/>Back</button></div></div>
+      <div className="watch-heading"><div><span className="watch-eyebrow">{media.source || "Local library"} · {media.kind === "video" ? "Video" : "Photo"}</span><h1>{media.title}</h1><p>{media.performer || "Unsorted"}</p></div><div className="watch-actions">{!readOnly && <button className="quiet" onClick={() => void favorite(media, !media.favorite)}><Heart className={media.favorite ? "filled" : ""}/>{media.favorite ? "In favorites" : "Add to favorites"}</button>}<button className="quiet" onClick={closeViewer}><ArrowLeft/>Back</button></div></div>
       <div className="watch-meta"><span><Clock3/>{media.completed ? "Completed" : media.progressSeconds > 0 ? `${Math.round(media.progressSeconds / Math.max(1, media.duration) * 100)}% watched` : "Not started"}</span><span>{media.viewCount} {media.viewCount === 1 ? "view" : "views"}</span>{duration > 0 && <span>{playerTime(duration)}</span>}{media.width > 0 && media.height > 0 && <span>{media.width}×{media.height}</span>}<span><Grid3X3/>{media.extension.replace(".", "").toUpperCase()} · {bytes(media.size)}</span></div>
       <div className="watch-file"><span>Local file</span><code title={media.relativePath}>{media.relativePath}</code></div>
     </section>

@@ -2,6 +2,7 @@ export const pageRoutes = {
   dashboard: "/overview",
   library: "/performers",
   activity: "/activity",
+  recovery: "/recovery",
   logs: "/logs",
   plugins: "/plugins",
   settings: "/settings",

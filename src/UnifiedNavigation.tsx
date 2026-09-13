@@ -1,4 +1,4 @@
-import { Activity, BarChart3, Heart, History, House, Library, Logs, Plug, Radio, Settings, Users } from "lucide-react";
+import { Activity, BarChart3, Heart, History, House, Library, LifeBuoy, Logs, Plug, Radio, Settings, Users } from "lucide-react";
 
 const groups = [
   { label: "OPEN EASYX", items: [
@@ -12,6 +12,7 @@ const groups = [
   { label: "COLLECT", items: [
     { href: "/performers", label: "Performers", icon: Users },
     { href: "/activity", label: "Activity", icon: Activity },
+    { href: "/recovery", label: "Recovery", icon: LifeBuoy },
   ] },
   { label: "SYSTEM", items: [
     { href: "/plugins", label: "Plugins", icon: Plug },

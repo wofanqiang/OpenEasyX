@@ -95,3 +95,15 @@
 .system-stats-foot{margin:14px 0 0;color:#5c5c66;font-size:8px}
 @media(max-width:1150px){.system-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.system-details{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:800px){.system-gauges{grid-template-columns:1fr}.system-metrics{grid-template-columns:1fr}.system-details{grid-template-columns:1fr}}
+/* Residual TS recovery (Recovery page under COLLECT) */
+.recovery-page .library-intro{align-items:flex-end}
+.recovery-hint{display:flex;gap:10px;align-items:flex-start;margin:0 0 22px;padding:12px 15px;border:1px solid #2c2c33;border-radius:12px;background:var(--panel);font-size:10px;line-height:1.55;color:#8b8b95}
+.recovery-hint svg{width:15px;flex:none;color:#ff6d80;margin-top:1px}
+.recovery-hint b{color:#d7d7dd}
+.recovery-hint code{color:#b9b9c2;background:rgba(255,255,255,.05);border-radius:4px;padding:1px 5px}
+.archive-button{position:absolute;right:8px;bottom:13px;z-index:3;width:30px;height:30px;display:grid;place-items:center;border:1px solid #2c2c33;border-radius:9px;background:rgba(20,20,24,.86);color:#b2b2ba;backdrop-filter:blur(8px)}
+.archive-button:hover:not(:disabled){background:var(--red);border-color:#ff7183;color:#fff}
+.archive-button:disabled{opacity:.45;cursor:not-allowed}
+.archive-button svg{width:15px}
+@media(max-width:800px){.recovery-page .library-intro{align-items:flex-start}}
+@media(max-width:480px){.recovery-hint{display:none}}

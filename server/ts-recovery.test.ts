@@ -1,0 +1,186 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Database } from "./database.js";
+import { PluginManager } from "./plugin-manager.js";
+import { DownloadQueue } from "./downloader.js";
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) {
+    // Windows can still hold handles on a just-remuxed file; the directory is disposable.
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+  }
+});
+const temp = (name: string) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), `${name}-`)); dirs.push(dir); return dir; };
+
+/** Recovery needs a real probe/remux, so the suite is skipped where ffmpeg is unavailable. */
+function ffmpegAvailable() {
+  try { execFileSync("ffmpeg", ["-version"], { stdio: "ignore" }); execFileSync("ffprobe", ["-version"], { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+const hasFfmpeg = ffmpegAvailable();
+
+/** Writes the shape a killed live recording leaves behind: a raw MPEG-TS capture with A/V streams. */
+function writePlayableCapture(file: string) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  execFileSync("ffmpeg", [
+    "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10",
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "1",
+    "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-f", "mpegts", file,
+  ]);
+}
+function writeUnplayableCapture(file: string) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "definitely not a transport stream");
+}
+
+async function harness() {
+  const dataDir = temp("easyx-recovery-data"); const mediaDir = temp("easyx-recovery-media"); const pluginDir = temp("easyx-recovery-plugins");
+  const db = new Database(dataDir);
+  const manager = new PluginManager(db, [pluginDir]); await manager.load();
+  const queue = new DownloadQueue(db, manager, mediaDir);
+  const person = db.upsertPerformer({ externalId: "person", name: "Recovery Performer" }, "test.recovery");
+  const source = db.addSource(person.id, "test.recovery", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+  const item = (externalId: string, status = "failed") => {
+    db.ingestItems(source, [{ externalId, mediaType: "video", filename: `${externalId}.mp4`, metadata: {} }]);
+    const created = db.listItems().find((entry) => entry.externalId === externalId)!;
+    db.setItemStatus(created.id, status);
+    return created;
+  };
+  return { db, queue, mediaDir, item, captureDir: (id: string) => path.join(mediaDir, ".downloads", id), recoveryDir: (id: string) => path.join(mediaDir, ".recording-recovery", id) };
+}
+
+describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
+  it("reports a dry run, then rescues playable captures and deletes unplayable ones", async () => {
+    const env = await harness();
+    const playable = env.item("playable"); const broken = env.item("broken");
+    writePlayableCapture(path.join(env.captureDir(playable.id), "capture.ts"));
+    writeUnplayableCapture(path.join(env.captureDir(broken.id), "capture.ts"));
+
+    const dry = await env.queue.recoverResidualTs({ dryRun: true });
+    expect(dry.dryRun).toBe(true);
+    expect(dry.scanned).toBe(2);
+    expect(dry.rescued).toBe(1);
+    expect(dry.deleted).toBe(1);
+    // A dry run must not touch the disk.
+    expect(fs.existsSync(path.join(env.captureDir(playable.id), "capture.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(env.captureDir(broken.id), "capture.ts"))).toBe(true);
+    expect(fs.existsSync(env.recoveryDir(playable.id))).toBe(false);
+
+    // Calling with no options is a dry run too, so the UI never mutates by accident.
+    const implicit = await env.queue.recoverResidualTs();
+    expect(implicit.dryRun).toBe(true);
+    expect(fs.existsSync(path.join(env.captureDir(playable.id), "capture.ts"))).toBe(true);
+
+    const report = await env.queue.recoverResidualTs({ execute: true });
+    expect(report.dryRun).toBe(false);
+    expect(report.rescued).toBe(1);
+    expect(report.deleted).toBe(1);
+    expect(report.failed).toBe(0);
+
+    const recovered = path.join(env.recoveryDir(playable.id), "recovered.mp4");
+    expect(fs.existsSync(recovered)).toBe(true);
+    expect(fs.statSync(recovered).size).toBeGreaterThan(0);
+    // The leftover TS is consumed, and the unplayable staging folder is gone.
+    expect(fs.existsSync(path.join(env.captureDir(playable.id), "capture.ts"))).toBe(false);
+    expect(fs.existsSync(env.captureDir(broken.id))).toBe(false);
+
+    // A finished rescue is not a residual capture, so a second pass never touches it again.
+    const again = await env.queue.recoverResidualTs({ execute: true });
+    expect(again.rescued).toBe(0);
+    expect(again.deleted).toBe(0);
+    expect(again.failed).toBe(0);
+    expect(fs.existsSync(recovered)).toBe(true);
+
+    const listed = await env.queue.listRecovered();
+    expect(listed.map((entry) => entry.itemId)).toEqual([playable.id]);
+    expect(listed[0].size).toBeGreaterThan(0);
+    expect(listed[0].performer).toBe("Recovery Performer");
+    expect(listed[0].source).toBe("example.test");
+    expect(listed[0].cataloged).toBe(false);
+  });
+
+  it("skips a capture whose recording is still active", async () => {
+    const env = await harness();
+    const active = env.item("active", "downloading");
+    writePlayableCapture(path.join(env.captureDir(active.id), "capture.ts"));
+
+    const report = await env.queue.recoverResidualTs({ execute: true });
+    expect(report.scanned).toBe(1);
+    expect(report.skipped).toBe(1);
+    expect(report.rescued).toBe(0);
+    expect(report.items[0]).toEqual({ itemId: active.id, action: "skipped" });
+    expect(fs.existsSync(path.join(env.captureDir(active.id), "capture.ts"))).toBe(true);
+    expect(fs.existsSync(env.recoveryDir(active.id))).toBe(false);
+    expect(await env.queue.listRecovered()).toEqual([]);
+  });
+
+  it("archives a recovered recording into its canonical library path", async () => {
+    const env = await harness();
+    const rescued = env.item("archive-me");
+    writePlayableCapture(path.join(env.captureDir(rescued.id), "capture.ts"));
+    await env.queue.recoverResidualTs({ execute: true });
+
+    const result = await env.queue.catalogRecovered(rescued.id);
+    expect(result.cataloged).toBe(true);
+    expect(result.storagePath).toBeTruthy();
+    const stored = path.join(env.mediaDir, result.storagePath!);
+    expect(fs.existsSync(stored)).toBe(true);
+    expect(fs.statSync(stored).size).toBeGreaterThan(0);
+
+    // The recovered copy is consumed and the item becomes a normal library entry.
+    expect(fs.existsSync(env.recoveryDir(rescued.id))).toBe(false);
+    expect(env.db.getItem(rescued.id)?.status).toBe("completed");
+    expect(await env.queue.listRecovered()).toEqual([]);
+  });
+
+  it("never overwrites a recording that is already completed in the library", async () => {
+    const env = await harness();
+    const completed = env.item("already-done");
+    writePlayableCapture(path.join(env.captureDir(completed.id), "capture.ts"));
+    await env.queue.recoverResidualTs({ execute: true });
+
+    // Pretend the item finished normally and its file is already in the library.
+    const libraryFile = path.join(env.mediaDir, "Recovery Performer", "example.test", "already-done.mp4");
+    fs.mkdirSync(path.dirname(libraryFile), { recursive: true });
+    fs.writeFileSync(libraryFile, "the original library copy");
+    env.db.setItemStatus(completed.id, "completed", { progress: 1, storagePath: path.join("Recovery Performer", "example.test", "already-done.mp4") });
+
+    const result = await env.queue.catalogRecovered(completed.id);
+    expect(result).toEqual({ cataloged: false, reason: "already-completed" });
+    expect(fs.readFileSync(libraryFile, "utf8")).toBe("the original library copy");
+    expect(fs.existsSync(env.recoveryDir(completed.id))).toBe(false);
+  });
+
+  it("deletes recovered recordings in bulk and reports failures per id", async () => {
+    const env = await harness();
+    const first = env.item("bulk-one"); const second = env.item("bulk-two");
+    writePlayableCapture(path.join(env.captureDir(first.id), "capture.ts"));
+    writePlayableCapture(path.join(env.captureDir(second.id), "capture.ts"));
+    await env.queue.recoverResidualTs({ execute: true });
+    expect((await env.queue.listRecovered()).length).toBe(2);
+
+    const removal = await env.queue.deleteRecovered([first.id, second.id]);
+    expect(removal.deleted.sort()).toEqual([first.id, second.id].sort());
+    expect(removal.failed).toEqual([]);
+    expect(fs.existsSync(env.recoveryDir(first.id))).toBe(false);
+    expect(fs.existsSync(env.recoveryDir(second.id))).toBe(false);
+    expect(await env.queue.listRecovered()).toEqual([]);
+  });
+
+  it("serves stream and poster paths only while a recovered file exists", async () => {
+    const env = await harness();
+    const rescued = env.item("stream-me");
+    writePlayableCapture(path.join(env.captureDir(rescued.id), "capture.ts"));
+
+    expect(env.queue.recoveredStreamPath(rescued.id)).toBeNull();
+    await env.queue.recoverResidualTs({ execute: true });
+    expect(env.queue.recoveredStreamPath(rescued.id)).toBe(path.join(env.recoveryDir(rescued.id), "recovered.mp4"));
+
+    await env.queue.catalogRecovered(rescued.id);
+    expect(env.queue.recoveredStreamPath(rescued.id)).toBeNull();
+  });
+});

@@ -21,7 +21,7 @@ import { SystemStatsService } from "./system-stats.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
 import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
-import { registerLibraryRoutes } from "./library-routes.js";
+import { registerLibraryRoutes, parseMediaRange } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
 import { AuthService } from "./auth.js";
@@ -158,8 +158,8 @@ app.get("/api/auth/me", async (request, reply) => {
   if (auth.verifySession(sessionCookie(request))) return { authenticated: true, user: "admin" };
   return reply.status(401).send({ error: "unauthorized" });
 });
-// Performer responses carry the derived auto-record flag (any matching live-cam favorite
-// with auto_record=1) so the Performers UI can render its toggle without extra requests.
+// Performer responses carry the auto-record flag (a first-class performer setting that is also
+// mirrored onto matched live-cam favorites) so the Performers UI can render its toggle directly.
 function publicPerformer(performer: Performer) {
   return { ...performer, autoRecord: liveCams.performerAutoRecord(performer) };
 }
@@ -702,6 +702,40 @@ app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) =>
   return queue.cancel(request.params.id);
 });
 app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queue.delete(request.params.id));
+
+// Residual TS recovery (Recovery page under COLLECT).
+app.post("/api/maintenance/cleanup-residual-ts", async (request) => {
+  const body = (request.body ?? {}) as { dryRun?: boolean; execute?: boolean };
+  return queue.recoverResidualTs({ dryRun: body.dryRun, execute: body.execute });
+});
+app.get("/api/recovery", async () => queue.listRecovered());
+app.post<{ Params: { id: string } }>("/api/recovery/:id/catalog", async (request) => queue.catalogRecovered(request.params.id));
+app.delete<{ Body: { itemIds?: unknown } }>("/api/recovery", async (request) => {
+  const ids = (request.body ?? {}).itemIds;
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 100 || ids.some((id) => typeof id !== "string")) {
+    throw Object.assign(new Error("itemIds must contain between 1 and 100 media IDs"), { statusCode: 400 });
+  }
+  return queue.deleteRecovered(ids as string[]);
+});
+app.get<{ Params: { id: string } }>("/api/recovery/:id/stream", async (request, reply) => {
+  const file = queue.recoveredStreamPath(request.params.id);
+  if (!file) return reply.status(404).send({ error: "Recovered file not found" });
+  let stat: fs.Stats;
+  try { stat = fs.statSync(file); } catch { return reply.status(404).send({ error: "Recovered file not found" }); }
+  const range = request.headers.range;
+  reply.header("accept-ranges", "bytes").header("content-type", "video/mp4").header("cache-control", "private, max-age=3600");
+  if (!range) return reply.header("content-length", stat.size).send(fs.createReadStream(file));
+  const parsed = parseMediaRange(range, stat.size);
+  if (!parsed) return reply.status(416).header("content-range", `bytes */${stat.size}`).send();
+  const { start, end } = parsed;
+  return reply.status(206).header("content-range", `bytes ${start}-${end}/${stat.size}`).header("content-length", end - start + 1).send(fs.createReadStream(file, { start, end }));
+});
+app.get<{ Params: { id: string } }>("/api/recovery/:id/thumbnail", async (request, reply) => {
+  const poster = queue.recoveredPosterPath(request.params.id) ?? (await queue.ensureRecoveredPoster(request.params.id));
+  if (poster && fs.existsSync(poster)) return reply.type("image/jpeg").header("cache-control", "public, max-age=31536000, immutable").send(fs.createReadStream(poster));
+  const placeholder = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64");
+  return reply.type("image/png").header("cache-control", "no-store").send(placeholder);
+});
 
 app.get("/api/settings", async () => {
   // Never expose the admin password hash to the client.
