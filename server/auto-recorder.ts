@@ -1,5 +1,6 @@
 import type { Database } from "./database.js";
 import type { LiveCamService } from "./live-cams.js";
+import type { LiveCam } from "../packages/plugin-sdk/index.js";
 
 // Download statuses that mean "a recording for this cam is still in flight".
 // Mirrors the buckets used by Database.listItems(); kept local to avoid coupling.
@@ -73,33 +74,33 @@ export function startAutoRecorder({ db, liveCams, log }: {
     try {
       syncActive();
 
-      // Poll every favorite that is armed directly or belongs to a performer with auto-record on.
-      const byProvider = new Map<string, string[]>();
+      // Poll every favorite armed directly and every performer armed through its live-cam
+      // identity, so a performer without a saved favorite is recorded just the same.
+      const byProvider = new Map<string, Array<{ username: string; pageUrl: string }>>();
       for (const target of liveCams.autoRecordTargets()) {
-        const usernames = byProvider.get(target.providerId) ?? [];
-        usernames.push(target.username.trim().toLowerCase());
-        byProvider.set(target.providerId, usernames);
+        const list = byProvider.get(target.providerId) ?? [];
+        list.push({ username: target.username, pageUrl: target.pageUrl });
+        byProvider.set(target.providerId, list);
       }
 
-      for (const [providerId, usernames] of byProvider) {
-        let items;
+      for (const [providerId, targets] of byProvider) {
+        let items: LiveCam[];
         try {
-          // Reuses the favorites status path and its caches (getLiveCam TTL 60s), so the
+          // Shares the per-cam status cache with the favorites path (getLiveCam TTL 60s), so the
           // watcher adds no extra provider traffic beyond refreshing stale snapshots.
-          const result = await liveCams.list({ providerId, favoritesOnly: true, page: 1, pageSize: 48 });
-          const providerStatus = result.providers.find((provider) => provider.id === providerId);
-          if (providerStatus && !providerStatus.ok) {
-            log?.(`auto-record: ${providerId} status check failed: ${providerStatus.error ?? "unknown error"}`);
+          const result = await liveCams.autoRecordStatuses(providerId, targets);
+          if (!result.ok) {
+            log?.(`auto-record: ${providerId} status check failed: ${result.error ?? "unknown error"}`);
             continue;
           }
-          items = result.items;
+          items = result.cams;
         } catch (error) {
           log?.(`auto-record: ${providerId} status check threw: ${error instanceof Error ? error.message : String(error)}`);
           continue;
         }
         for (const cam of items) {
           const usernameKey = cam.username.trim().toLowerCase();
-          if (!usernames.includes(usernameKey)) continue;
+          if (!targets.some((target) => target.username.trim().toLowerCase() === usernameKey)) continue;
           const key = keyOf(providerId, cam.username);
           if (active.has(key)) continue;
           if (suppressed.has(key)) {

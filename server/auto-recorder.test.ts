@@ -45,26 +45,39 @@ async function fixture() {
   const liveCamsStub = {
     list, record,
     autoRecordTargets: () => {
-      // Mirror LiveCams.autoRecordTargets against the real Database: poll every favorite
-      // armed directly, plus favorites that belong to a performer with auto-record on.
-      const targets: Array<{ providerId: string; username: string }> = [];
+      // Mirror LiveCams.autoRecordTargets against the real Database: poll every favorite armed
+      // directly plus every armed performer resolved through its live-cam identity (refs/sources).
+      const targets: Array<{ providerId: string; username: string; pageUrl: string }> = [];
       const seen = new Set<string>();
-      const push = (providerId: string, username: string) => {
+      const push = (providerId: string, username: string, pageUrl: string) => {
         const key = `${providerId}:${username.toLowerCase()}`;
-        if (seen.has(key)) return;
+        if (seen.has(key) || !pageUrl) return;
         seen.add(key);
-        targets.push({ providerId, username });
+        targets.push({ providerId, username, pageUrl });
       };
       for (const favorite of db.listLiveCamFavorites()) {
-        if (favorite.autoRecord) push(favorite.providerId, favorite.username);
+        if (favorite.autoRecord) push(favorite.providerId, favorite.username, favorite.pageUrl);
       }
+      const sources = db.listSources();
       for (const performer of db.listPerformers()) {
         if (!performer.autoRecord) continue;
+        for (const [pluginId, externalId] of Object.entries(performer.externalRefs)) {
+          const source = sources.find((entry) => entry.performerId === performer.id && entry.pluginId === pluginId);
+          push(pluginId, externalId, source?.profileUrl ?? "");
+        }
+        for (const source of sources) {
+          if (source.performerId === performer.id) push(source.pluginId, source.externalId, source.profileUrl);
+        }
         for (const favorite of db.listLiveCamFavorites()) {
-          if (favorite.providerId in performer.externalRefs) push(favorite.providerId, favorite.username);
+          if (favorite.providerId in performer.externalRefs) push(favorite.providerId, favorite.username, favorite.pageUrl);
         }
       }
       return targets;
+    },
+    autoRecordStatuses: (providerId: string, targets: Array<{ username: string; pageUrl: string }>) => {
+      const wanted = new Set(targets.map((target) => target.username.toLowerCase()));
+      const items = cams.filter((cam) => String(cam.providerId) === providerId && wanted.has(String(cam.username).toLowerCase()));
+      return Promise.resolve({ ok: true, cams: items });
     },
   } as unknown as LiveCamService;
   const logs: string[] = [];
@@ -81,6 +94,19 @@ describe("auto recorder", () => {
     try {
       env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
       env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      expect(env.record).toHaveBeenCalledWith("test.live", expect.objectContaining({ username: "alice" }), { origin: "auto" });
+    } finally { env.cleanup(); }
+  });
+
+  it("records a performer armed without any live-cam favorite", async () => {
+    const env: Harness = await fixture();
+    try {
+      const performer = env.db.upsertPerformer({ name: "alice", aliases: [], externalId: "alice" }, "test.live");
+      env.db.addSource(performer.id, "test.live", { externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test" });
+      env.db.setPerformerAutoRecord(performer.id, true);
       env.cams.push(makeCam());
       await env.recorder.tick();
       expect(env.record).toHaveBeenCalledTimes(1);

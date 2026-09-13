@@ -391,20 +391,86 @@ export class LiveCamService {
     return { performer: { ...performer, autoRecord }, matched: favorites.length, favorites };
   }
 
-  // The set of live-cam favorites the watcher should poll for auto-record. A favorite qualifies
-  // when it is armed directly OR belongs to a performer that has auto-record turned on.
-  autoRecordTargets(): Array<{ providerId: string; username: string }> {
-    const targets = new Map<string, { providerId: string; username: string }>();
+  // The live-cam rooms the watcher should poll for auto-record: every favorite armed directly,
+  // plus every armed performer resolved through its live-cam identity (external refs + sources).
+  // A performer therefore no longer needs a saved favorite to be recorded once it is armed.
+  autoRecordTargets(): Array<{ providerId: string; username: string; pageUrl: string }> {
+    const targets = new Map<string, { providerId: string; username: string; pageUrl: string }>();
+    const providers = new Set(this.livePlugins().map((entry) => entry.manifest.id));
+    const push = (providerId: string, username: string, pageUrl: string) => {
+      const name = username.trim();
+      // A room we cannot express as a provider URL cannot be looked up or recorded, so skip it.
+      if (!name || !pageUrl) return;
+      targets.set(`${providerId}:${name.toLowerCase()}`, { providerId, username: name, pageUrl });
+    };
     for (const favorite of this.db.listLiveCamFavorites()) {
-      if (favorite.autoRecord) targets.set(`${favorite.providerId}:${favorite.username.toLowerCase()}`, { providerId: favorite.providerId, username: favorite.username });
+      if (favorite.autoRecord) push(favorite.providerId, favorite.username, favorite.pageUrl);
     }
+    const sources = this.db.listSources();
     for (const performer of this.db.listPerformers()) {
       if (!performer.autoRecord) continue;
-      for (const favorite of this.performerFavoriteMatches(performer)) {
-        targets.set(`${favorite.providerId}:${favorite.username.toLowerCase()}`, { providerId: favorite.providerId, username: favorite.username });
+      for (const [pluginId, externalId] of Object.entries(performer.externalRefs)) {
+        if (!providers.has(pluginId)) continue;
+        const source = sources.find((entry) => entry.performerId === performer.id && entry.pluginId === pluginId);
+        push(pluginId, externalId, source?.profileUrl ?? "");
       }
+      for (const source of sources) {
+        if (source.performerId !== performer.id || !providers.has(source.pluginId)) continue;
+        push(source.pluginId, source.externalId, source.profileUrl);
+      }
+      for (const favorite of this.performerFavoriteMatches(performer)) push(favorite.providerId, favorite.username, favorite.pageUrl);
     }
     return [...targets.values()];
+  }
+
+  // Resolve live status for the auto-record targets of one provider. Favorites reuse the
+  // followed-account snapshot when available; every target is then validated with the plugin's
+  // exact-room lookup (getLiveCam) or a bounded catalogue search, sharing the per-cam status
+  // cache with the favorites path. This is what lets a favorite-less performer be recorded.
+  async autoRecordStatuses(providerId: string, targets: Array<{ username: string; pageUrl: string }>): Promise<{ ok: boolean; error?: string; cams: LiveCam[] }> {
+    const entry = this.livePlugins(providerId)[0];
+    if (!entry) return { ok: false, error: "The live-cam plugin is not installed or enabled", cams: [] };
+    const plugin = this.plugins.get(providerId);
+    if (!plugin.listLiveCams) return { ok: false, error: "The live-cam plugin cannot list rooms", cams: [] };
+    let remote = new Map<string, LiveCam>();
+    let transientFailure = false;
+    if (plugin.listFollowedLiveCams) {
+      const snapshot = await this.followedSnapshot(providerId);
+      remote = new Map(snapshot.cams.map((cam) => [cam.username.toLowerCase(), cam]));
+      transientFailure = !snapshot.authoritative && /429|limit|fetch|timeout|timed out|network|HTTP 5/i.test(snapshot.skippedReason ?? "");
+    }
+    const cams: LiveCam[] = [];
+    let checks = 0;
+    for (let offset = 0; offset < targets.length; offset += 4) {
+      const batch = await Promise.all(targets.slice(offset, offset + 4).map(async (target): Promise<LiveCam> => {
+        const username = target.username.trim();
+        const followed = remote.get(username.toLowerCase());
+        if (followed) return followed;
+        const key = `${providerId}:${username.toLowerCase()}`;
+        const cached = this.favoriteStatuses.get(key);
+        if (cached && cached.expiresAt > Date.now()) return cached.cam;
+        const offline: LiveCam = { id: username, username, pageUrl: target.pageUrl, online: false };
+        // Never auto-start from an uncertain status; a missing check is better than a false live.
+        if (transientFailure || checks >= 24) return { ...(cached?.cam ?? offline), statusUnavailable: true };
+        checks += 1;
+        try {
+          let cam: LiveCam;
+          const signal = AbortSignal.timeout(45_000);
+          if (plugin.getLiveCam) cam = await plugin.getLiveCam(this.plugins.context(providerId, signal), offline);
+          else {
+            const result = await plugin.listLiveCams!(this.plugins.context(providerId, signal), { page: 1, pageSize: 8, search: username });
+            const match = result.cams.find((candidate) => candidate.username.toLowerCase() === username.toLowerCase());
+            cam = match ? { ...match, online: match.online !== false } : offline;
+          }
+          this.favoriteStatuses.set(key, { cam, expiresAt: Date.now() + (plugin.getLiveCam ? 60_000 : 30_000) });
+          return cam;
+        } catch {
+          return { ...(cached?.cam ?? offline), statusUnavailable: true };
+        }
+      }));
+      cams.push(...batch);
+    }
+    return { ok: true, cams };
   }
 
   favoriteChanges() {
