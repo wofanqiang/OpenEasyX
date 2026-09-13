@@ -16,6 +16,32 @@ import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
 
 type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean };
 
+/**
+ * Whether the download stall timer should give up on the running item.
+ *
+ * Post-processing (TS remux, live re-encode) reports no progress by design: ffmpeg frame
+ * counters are not relayed as download progress and the staging directory already holds the
+ * capture, so `lastActivity` freezes for the whole step. Treating that as a stall SIGKILLs
+ * ffmpeg halfway through the `+faststart` pass, which for a multi-GB capture takes minutes --
+ * exactly how long recordings used to "fail" right after the capture had already finished.
+ * Those steps run under `postProcessDeadlineMs` instead.
+ */
+export function stalledDownload(control: Pick<ActiveDownload, "encoding" | "action" | "paused">, lastActivity: number, now: number, timeoutMs: number): boolean {
+  if (control.encoding) return false;
+  if (control.action || control.paused) return false;
+  return now - lastActivity > timeoutMs;
+}
+
+/**
+ * Deadline for a post-processing step that cannot report progress. The budget scales with
+ * the input because `+faststart` rewrites the whole file and a re-encode runs slower than
+ * realtime: 4 MiB/s, floored at 8 minutes and capped at 45 minutes.
+ */
+export function postProcessDeadlineMs(inputBytes: number): number {
+  const scaled = Math.ceil(Math.max(0, inputBytes) / (4 * 1024 * 1024)) * 1000;
+  return Math.min(45 * 60_000, Math.max(8 * 60_000, scaled));
+}
+
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
   private finalizers = new Map<string, Promise<void>>();
@@ -134,9 +160,8 @@ export class DownloadQueue {
     };
     const stallTimeoutMs = Math.max(0, Number(this.db.getSettings().downloadStallTimeoutSeconds ?? 120)) * 1000;
     const stallTimer = stallTimeoutMs > 0 ? setInterval(() => {
-      if (!control.action && !control.paused && Date.now() - lastActivity > stallTimeoutMs) {
-        control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");
-      }
+      if (!stalledDownload(control, lastActivity, Date.now(), stallTimeoutMs)) return;
+      control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");
     }, 5000) : undefined;
     stallTimer?.unref();
     try {
@@ -244,10 +269,13 @@ export class DownloadQueue {
       if (control.action === "cancel" || control.action === "delete") throw new Error("Download cancelled");
       if (item.mediaType === "video" && item.metadata.live === true && settings.recordingPreset && settings.recordingPreset !== "source") {
         const encoded = path.join(temporaryDirectory, "encoded.mp4");
+        const preset = settings.recordingPreset;
         control.action = undefined; control.encoding = true;
         this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
-        this.writeLog?.("info", "download", "Encoding live recording", { itemId: item.id, preset: settings.recordingPreset });
-        await this.runCommandDownload("ffmpeg", recordingEncodingArgs(settings.recordingPreset, temporary, encoded), temporaryDirectory, undefined, () => {}, control);
+        this.writeLog?.("info", "download", "Encoding live recording", { itemId: item.id, preset });
+        let encodeBytes = 0; try { encodeBytes = fs.statSync(temporary).size; } catch { /* keep 0 */ }
+        await this.withPostProcessDeadline(control, encodeBytes, "Re-encode",
+          () => this.runCommandDownload("ffmpeg", recordingEncodingArgs(preset, temporary, encoded), temporaryDirectory, undefined, () => {}, control));
         if (control.action === "cancel" || control.action === "delete") throw new Error("Encoding cancelled");
         if (!fs.existsSync(encoded) || !fs.statSync(encoded).size) throw new Error("Encoder completed without producing a media file");
         fs.unlinkSync(temporary); temporary = encoded;
@@ -545,6 +573,27 @@ export class DownloadQueue {
     return fs.existsSync(file) && fs.statSync(file).size > 0 ? file : null;
   }
 
+  /**
+   * Run a post-processing step under its own deadline. The download stall timer is suspended
+   * while `control.encoding` is set (see `stalledDownload`), so this deadline is what keeps a
+   * genuinely hung ffmpeg from blocking the queue forever.
+   */
+  private async withPostProcessDeadline<T>(control: ActiveDownload, inputBytes: number, label: string, run: () => Promise<T>): Promise<T> {
+    const budgetMs = postProcessDeadlineMs(inputBytes);
+    let expired = false;
+    const deadline = setTimeout(() => { expired = true; this.signal(control, "SIGKILL"); }, budgetMs);
+    deadline.unref();
+    try {
+      return await run();
+    } catch (error) {
+      // Replace the opaque "exited with code null" (SIGKILL leaves no exit code).
+      if (expired) throw new Error(`${label} timed out after ${Math.round(budgetMs / 1000)}s; the capture is preserved for recovery`);
+      throw error;
+    } finally {
+      clearTimeout(deadline);
+    }
+  }
+
   /** Remux a live MPEG-TS capture into an MP4, shifting the audio by the measured A/V skew. */
   private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload): Promise<number> {
     let audioShift = readAvSyncSidecar(tsPath + ".avsync.json") ?? 0;
@@ -567,14 +616,17 @@ export class DownloadQueue {
       } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
     }
     const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
-    await this.runCommandDownload("ffmpeg", [
+    // `+faststart` rewrites the whole file after the muxer has written it, so this step takes
+    // minutes on a multi-GB capture and must not read as a stalled download.
+    let captureBytes = 0; try { captureBytes = fs.statSync(tsPath).size; } catch { /* keep 0 */ }
+    await this.withPostProcessDeadline(control, captureBytes, "Remux", () => this.runCommandDownload("ffmpeg", [
       "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
       "-map", "0", "-c:v", "copy", "-c:a", "aac",
       ...(audioFilter ? ["-af", audioFilter] : []),
       // Still corrects any drift inside the audio timeline itself.
       "-async", "1",
       "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
-    ], path.dirname(mp4Staging), undefined, () => {}, control);
+    ], path.dirname(mp4Staging), undefined, () => {}, control));
     if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
     if (!fs.existsSync(mp4Staging) || !fs.statSync(mp4Staging).size) throw new Error("Remux to MP4 produced no output");
     return audioShift;

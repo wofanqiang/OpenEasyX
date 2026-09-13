@@ -6,7 +6,7 @@ import path from "node:path";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue } from "./downloader.js";
+import { DownloadQueue, postProcessDeadlineMs, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 
@@ -194,5 +194,42 @@ describe("DownloadQueue", () => {
     expect(fs.existsSync(file)).toBe(false);
     expect(libraryDb.listMedia().total).toBe(0);
     libraryDb.close();
+  });
+});
+
+describe("stalledDownload", () => {
+  const idle = { encoding: false, paused: false } as const;
+  const timeout = 120_000;
+
+  it("never reports a stall while a live capture is being remuxed or re-encoded", () => {
+    // Post-processing reports no progress for minutes on end: ffmpeg frame counters are not
+    // relayed as download progress, so `lastActivity` is frozen for the whole step.
+    expect(stalledDownload({ ...idle, encoding: true }, 0, 60 * 60_000, timeout)).toBe(false);
+  });
+
+  it("still reports a stall for a download that has gone quiet", () => {
+    expect(stalledDownload(idle, 0, timeout, timeout)).toBe(false);
+    expect(stalledDownload(idle, 0, timeout + 1, timeout)).toBe(true);
+  });
+
+  it("leaves paused, stopped and cancelled items to their own handling", () => {
+    const now = timeout * 2;
+    expect(stalledDownload({ ...idle, paused: true }, 0, now, timeout)).toBe(false);
+    expect(stalledDownload({ ...idle, action: "stop" }, 0, now, timeout)).toBe(false);
+    expect(stalledDownload({ ...idle, action: "cancel" }, 0, now, timeout)).toBe(false);
+  });
+});
+
+describe("postProcessDeadlineMs", () => {
+  it("scales with the capture size, with an 8 minute floor and a 45 minute cap", () => {
+    expect(postProcessDeadlineMs(0)).toBe(8 * 60_000);
+    expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBe(512_000);       // 2 GiB at 4 MiB/s
+    expect(postProcessDeadlineMs(100 * 1024 ** 3)).toBe(45 * 60_000); // capped
+  });
+
+  it("gives a multi-GB remux far more room than the download stall timeout", () => {
+    // The regression: a ~2 GB capture was SIGKILLed mid-remux at ~122s, i.e. right on the
+    // 120s download stall timeout, and the whole recording was written off as failed.
+    expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBeGreaterThan(120_000 * 2);
   });
 });
