@@ -80,6 +80,7 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     expect(report.rescued).toBe(1);
     expect(report.deleted).toBe(1);
     expect(report.failed).toBe(0);
+    expect(report.leftover).toBe(0);
 
     const recovered = path.join(env.recoveryDir(playable.id), "recovered.mp4");
     expect(fs.existsSync(recovered)).toBe(true);

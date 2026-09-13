@@ -626,13 +626,13 @@ export class DownloadQueue {
 
   /** Scan both the active download staging area and the recovery folder for leftover captures. */
   async recoverResidualTs(options: { dryRun?: boolean; execute?: boolean } = {}): Promise<{
-    scanned: number; rescued: number; deleted: number; failed: number; skipped: number; dryRun: boolean;
+    scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; dryRun: boolean;
     items: Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" }>;
   }> {
     const dryRun = options.dryRun === true || options.execute !== true;
     const execute = options.execute === true;
     const report = {
-      scanned: 0, rescued: 0, deleted: 0, failed: 0, skipped: 0, dryRun,
+      scanned: 0, rescued: 0, deleted: 0, skipped: 0, failed: 0, leftover: 0, dryRun,
       items: [] as Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" }>,
     };
     const roots = [this.downloadsRoot, this.recoveryRoot];
@@ -679,7 +679,16 @@ export class DownloadQueue {
           };
           fs.writeFileSync(path.join(recoveryDir, "recovered.json"), JSON.stringify(sidecar, null, 2));
           await this.ensureRecoveredPoster(itemId, outPath);
-          if (path.resolve(tsPath) !== path.resolve(outPath)) { try { fs.unlinkSync(tsPath); } catch { /* keep on cleanup failure */ } }
+          if (path.resolve(tsPath) !== path.resolve(outPath)) {
+            // The rescue itself succeeded, so the item is still reported as rescued; only the
+            // leftover capture could not be removed (for example a staging folder the server
+            // user cannot write to). Count it instead of hiding a failed cleanup.
+            try { fs.unlinkSync(tsPath); }
+            catch (error) {
+              report.leftover++;
+              this.writeLog?.("warn", "download", "Rescued capture could not be deleted", { itemId, path: tsPath, error: String(error) });
+            }
+          }
           report.rescued++; report.items.push({ itemId, action: "rescued" });
         } catch (error) {
           report.failed++; report.items.push({ itemId, action: "failed" });

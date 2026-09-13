@@ -10,7 +10,7 @@ type Recovered = {
 };
 type RecoveryAction = "rescued" | "deleted" | "skipped" | "failed";
 type RecoveryReport = {
-  scanned: number; rescued: number; deleted: number; failed: number; skipped: number; dryRun: boolean;
+  scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; dryRun: boolean;
   items: Array<{ itemId: string; action: RecoveryAction }>;
 };
 type CatalogResult = { cataloged: boolean; reason?: string; storagePath?: string };
@@ -96,8 +96,9 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
     try {
       const report = await api<RecoveryReport>("/api/maintenance/cleanup-residual-ts", { method: "POST", body: JSON.stringify({ execute: true }) });
       await refresh();
+      const leftover = report.leftover ? ` · ${report.leftover} rescued file${report.leftover === 1 ? "" : "s"} could not be removed from staging` : "";
       if (!report.scanned) setNotice("Recovery finished — no leftover captures were found.");
-      else setNotice(`Recovery finished — ${report.rescued} recording${report.rescued === 1 ? "" : "s"} rescued, ${report.deleted} leftover${report.deleted === 1 ? "" : "s"} cleaned, ${report.skipped} skipped${report.failed ? `, ${report.failed} failed` : ""} (scanned ${report.scanned}).`);
+      else setNotice(`Recovery finished — ${report.rescued} recording${report.rescued === 1 ? "" : "s"} rescued, ${report.deleted} leftover${report.deleted === 1 ? "" : "s"} cleaned, ${report.skipped} skipped${report.failed ? `, ${report.failed} failed` : ""}${leftover} (scanned ${report.scanned}).`);
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { setRecovering(false); }
   };
