@@ -1,6 +1,7 @@
 import type { Database } from "./database.js";
 import type { LiveCamService } from "./live-cams.js";
 import type { LiveCam } from "../packages/plugin-sdk/index.js";
+import { freeBytes, recordingDiskGuard, type FreeSpaceProbe } from "./disk-space.js";
 
 // Download statuses that mean "a recording for this cam is still in flight".
 // Mirrors the buckets used by Database.listItems(); kept local to avoid coupling.
@@ -21,10 +22,14 @@ export type AutoRecorder = {
   clearSuppression: (providerId: string, username: string) => boolean;
 };
 
-export function startAutoRecorder({ db, liveCams, log }: {
+export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = freeBytes }: {
   db: Database;
   liveCams: LiveCamService;
   log?: (message: string) => void;
+  /** Filesystem watched for free space before a recording is opened. */
+  mediaRoot: string;
+  /** Injectable probe so the disk guard is testable without filling a real volume. */
+  freeSpace?: FreeSpaceProbe;
 }): AutoRecorder {
   // providerId:usernameLower -> itemId of the recording we are tracking.
   const active = new Map<string, { itemId: string }>();
@@ -34,6 +39,8 @@ export function startAutoRecorder({ db, liveCams, log }: {
   const suppressed = new Set<string>();
   let running = false;
   let timer: NodeJS.Timeout | undefined;
+  // Tracks the disk guard so the log gets one line per transition, not one per tick.
+  let diskPaused = false;
 
   const keyOf = (providerId: string, username: string) => `${providerId}:${username.trim().toLowerCase()}`;
 
@@ -73,6 +80,22 @@ export function startAutoRecorder({ db, liveCams, log }: {
     running = true;
     try {
       syncActive();
+
+      // A full disk fails late and loudly (ffmpeg dies mid-write), so the floor is checked
+      // before anything is queued. Skipping the whole poll also stops burning provider
+      // requests while nothing could be recorded anyway.
+      const disk = await recordingDiskGuard(db.getSettings(), mediaRoot, freeSpace);
+      if (disk.paused) {
+        if (!diskPaused) {
+          diskPaused = true;
+          log?.(`auto-record: paused; only ${(disk.freeGb ?? 0).toFixed(2)} GB free on the media disk, below the ${disk.thresholdGb} GB floor`);
+        }
+        return;
+      }
+      if (diskPaused) {
+        diskPaused = false;
+        log?.(`auto-record: resumed; ${(disk.freeGb ?? 0).toFixed(2)} GB free on the media disk`);
+      }
 
       // Poll every favorite armed directly and every performer armed through its live-cam
       // identity, so a performer without a saved favorite is recorded just the same.

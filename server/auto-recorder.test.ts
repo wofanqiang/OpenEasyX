@@ -14,7 +14,7 @@ function makeCam(overrides: Record<string, unknown> = {}) {
 
 type Harness = Awaited<ReturnType<typeof fixture>>;
 
-async function fixture() {
+async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Promise<number | undefined> } = {}) {
   const { Database } = await import("./database.js");
   const os = await import("node:os");
   const fs = await import("node:fs");
@@ -26,7 +26,7 @@ async function fixture() {
   let itemCounter = 0;
   const listedItems: Array<Pick<DownloadItem, "id" | "pluginId" | "externalId" | "status">> = [];
   const dbStub = {
-    getSettings: () => ({ autoRecordCheckSeconds: 30 }),
+    getSettings: () => db.getSettings(),
     listLiveCamFavorites: () => db.listLiveCamFavorites(),
     listItems: () => listedItems,
     getItem: (id: string) => {
@@ -81,7 +81,12 @@ async function fixture() {
     },
   } as unknown as LiveCamService;
   const logs: string[] = [];
-  const recorder = startAutoRecorder({ db: dbStub, liveCams: liveCamsStub, log: (message) => logs.push(message) });
+  // Plenty of free space by default so the disk guard never makes an unrelated test flaky.
+  const recorder = startAutoRecorder({
+    db: dbStub, liveCams: liveCamsStub, mediaRoot: dir,
+    freeSpace: probe ?? (async () => 50 * 1024 ** 3),
+    log: (message) => logs.push(message),
+  });
   return {
     recorder, record, list, cams, items, listedItems, logs, db,
     cleanup: () => { recorder.stop(); db.close(); try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort on Windows */ } },
@@ -219,6 +224,50 @@ describe("auto recorder", () => {
       await env.recorder.tick();
       expect(env.record).toHaveBeenCalledTimes(2);
       expect(env.recorder.clearSuppression("test.live", "alice")).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("pauses auto-record below the free-space floor and resumes once it clears", async () => {
+    let free = 0.4 * 1024 ** 3;
+    const env: Harness = await fixture({ freeSpace: async () => free });
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+
+      // 0.4 GB < the 1 GB default floor: nothing is opened, and the reason is logged once.
+      await env.recorder.tick();
+      await env.recorder.tick();
+      expect(env.record).not.toHaveBeenCalled();
+      expect(env.logs.filter((line) => line.includes("below the 1 GB floor")).length).toBe(1);
+
+      free = 12 * 1024 ** 3;
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      expect(env.logs.some((line) => line.includes("auto-record: resumed"))).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("records again once the floor is turned off", async () => {
+    const env: Harness = await fixture({ freeSpace: async () => 0 });
+    try {
+      env.db.updateSettings({ minFreeDiskGb: 0 });
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+    } finally { env.cleanup(); }
+  });
+
+  it("keeps recording when the free-space probe fails", async () => {
+    const env: Harness = await fixture({ freeSpace: async () => undefined });
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
     } finally { env.cleanup(); }
   });
 

@@ -62,7 +62,7 @@ systemStats.start();
 const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });
 const discoveryStatus = { running: false, completed: 0, total: 0, progress: 0, query: "", error: "" };
 const performerRefreshStatus = { running: false, completed: 0, total: 0, progress: 0, error: "" };
-const autoRecorder = startAutoRecorder({ db, liveCams, log: (message) => app.log.info({ scope: "auto-record" }, message) });
+const autoRecorder = startAutoRecorder({ db, liveCams, mediaRoot: mediaDir, log: (message) => app.log.info({ scope: "auto-record" }, message) });
 
 function ensureBrowserLoginEnabled() {
   if (process.env.EASYX_ENABLE_BROWSER_LOGIN !== "true") {

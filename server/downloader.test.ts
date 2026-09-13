@@ -6,12 +6,19 @@ import path from "node:path";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, postProcessDeadlineMs, stalledDownload } from "./downloader.js";
+import { DownloadQueue, concurrentLimit, postProcessDeadlineMs, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 
 const dirs: string[] = [];
-afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+// Windows keeps a temp tree locked for a moment after SQLite handles and spawned children go
+// away, so rmSync can throw EPERM. An unclean temp directory is harmless while a throwing
+// afterEach would mark a passing test as failed and hide the result that matters.
+afterEach(() => {
+  for (const dir of dirs.splice(0)) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* the OS temp cleaner gets it later */ }
+  }
+});
 const temp = (name: string) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), `${name}-`)); dirs.push(dir); return dir; };
 async function waitFor(check: () => boolean) {
   const deadline = Date.now() + 4000;
@@ -231,5 +238,89 @@ describe("postProcessDeadlineMs", () => {
     // The regression: a ~2 GB capture was SIGKILLed mid-remux at ~122s, i.e. right on the
     // 120s download stall timeout, and the whole recording was written off as failed.
     expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBeGreaterThan(120_000 * 2);
+  });
+});
+
+it("runs a recording and a download side by side, one slot per pool", async () => {
+  const dataDir = temp("easyx-pools-data"); const mediaDir = temp("easyx-pools-media"); const pluginDir = temp("easyx-pools-plugins");
+  const releases: Array<() => void> = [];
+  const server = http.createServer((request, response) => {
+    response.setHeader("content-length", "10");
+    response.write("first");
+    // Different tail per endpoint so the two finished files are not byte-identical
+    // (identical content would be stored as a duplicate rather than completed).
+    releases.push(() => response.end(request.url?.includes("live") ? "live!" : "last!"));
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("Missing test server address");
+  const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+  fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.pools", name: "Pools", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveDownload(_context, item) { return { url: item.metadata.url, filename: item.filename }; } };`);
+  const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+  db.setPluginState("test.pools", { installed: true, enabled: true });
+  // One slot per pool. While both pools shared a single counter, the second item here
+  // stayed queued until the first finished, which is exactly the starvation this fixes.
+  db.updateSettings({ maxConcurrentDownloads: 1, maxConcurrentRecordings: 1 });
+  const person = db.upsertPerformer({ externalId: "person", name: "Pool Performer" }, "test.pools");
+  const source = db.addSource(person.id, "test.pools", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+  db.ingestItems(source, [
+    { externalId: "live-asset", mediaType: "video", filename: "live-asset.mp4", metadata: { url: `http://127.0.0.1:${address.port}/live.mp4`, live: true } },
+    { externalId: "plain-asset", mediaType: "video", filename: "plain-asset.mp4", metadata: { url: `http://127.0.0.1:${address.port}/plain.mp4` } },
+  ]);
+  const items = db.listItems();
+  const recording = items.find((entry) => entry.externalId === "live-asset"); const download = items.find((entry) => entry.externalId === "plain-asset");
+  if (!recording || !download) throw new Error("Missing ingested items");
+  for (const item of items) db.setItemStatus(item.id, "queued");
+  const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+  const staged = (item: { id: string; filename?: string }) => path.join(mediaDir, ".downloads", item.id, item.filename ?? "");
+  try {
+    await waitFor(() => fs.existsSync(staged(recording)) && fs.existsSync(staged(download)));
+    expect(db.getItem(recording.id)?.status).toBe("downloading");
+    expect(db.getItem(download.id)?.status).toBe("downloading");
+    for (const release of releases) release();
+    await waitFor(() => db.getItem(recording.id)?.status === "completed" && db.getItem(download.id)?.status === "completed");
+    expect(fs.readFileSync(path.join(mediaDir, "Pool Performer", "example.test", "live-asset.mp4"), "utf8")).toBe("firstlive!");
+    expect(fs.readFileSync(path.join(mediaDir, "Pool Performer", "example.test", "plain-asset.mp4"), "utf8")).toBe("firstlast!");
+  } finally { queue.stop(); server.close(); }
+});
+
+describe("concurrentLimit", () => {
+  it("keeps downloads inside their historical 1..8 range", () => {
+    expect(concurrentLimit(2, 2, 8)).toBe(2);
+    expect(concurrentLimit(99, 2, 8)).toBe(8);
+    expect(concurrentLimit(0, 2, 8)).toBe(1);
+    expect(concurrentLimit(-4, 2, 8)).toBe(1);
+  });
+
+  it("lets recordings reach 32 but never beyond", () => {
+    expect(concurrentLimit(8, 8, 32)).toBe(8);
+    expect(concurrentLimit(32, 8, 32)).toBe(32);
+    expect(concurrentLimit(1000, 8, 32)).toBe(32);
+  });
+
+  it("falls back and truncates for values that are not whole numbers", () => {
+    expect(concurrentLimit(undefined, 8, 32)).toBe(8);
+    expect(concurrentLimit(Number.NaN, 2, 8)).toBe(2);
+    expect(concurrentLimit("6", 2, 8)).toBe(6);
+    expect(concurrentLimit(3.7, 2, 8)).toBe(3);
+  });
+});
+
+describe("slotPlan", () => {
+  it("offers every free slot in both pools", () => {
+    expect(slotPlan({ recordings: 0, downloads: 0 }, { recordings: 2, downloads: 2 }))
+      .toEqual(["recording", "recording", "download", "download"]);
+  });
+
+  it("keeps a saturated recording pool from consuming download slots", () => {
+    // The regression: one shared pool meant eight running broadcasts left no room for
+    // anything else, and equally a backfill could keep a live room unrecorded.
+    expect(slotPlan({ recordings: 8, downloads: 0 }, { recordings: 8, downloads: 2 }))
+      .toEqual(["download", "download"]);
+    expect(slotPlan({ recordings: 0, downloads: 2 }, { recordings: 8, downloads: 2 }))
+      .toEqual(["recording", "recording", "recording", "recording", "recording", "recording", "recording", "recording"]);
+  });
+
+  it("offers nothing once both pools are full", () => {
+    expect(slotPlan({ recordings: 32, downloads: 8 }, { recordings: 32, downloads: 8 })).toEqual([]);
   });
 });

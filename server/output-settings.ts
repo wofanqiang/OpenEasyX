@@ -8,6 +8,10 @@ const template = (kind: "path" | "filename") => z.string().superRefine((value, c
 });
 export const settingsSchema = z.object({
   retentionDays: z.number().int().min(0).max(36500).optional(), maxConcurrentDownloads: z.number().int().min(1).max(8).optional(),
+  // Live recordings occupy their own pool, so a long broadcast no longer holds a download slot.
+  maxConcurrentRecordings: z.number().int().min(1).max(32).optional(),
+  // No upper bound on purpose: an archive volume may legitimately need a large floor.
+  minFreeDiskGb: z.number().min(0).optional(),
   autoQueueDiscovered: z.boolean().optional(), legalAccepted: z.boolean().optional(),
   defaultScrapeIntervalMinutes: z.number().int().min(5).max(525600).optional(), defaultLiveIntervalSeconds: z.number().int().min(5).max(3600).optional(),
   autoRecordCheckSeconds: z.number().int().min(30).max(3600).optional(),

@@ -128,6 +128,8 @@ export class Database {
     this.migrateNitterToPublicX();
     this.setDefault("retentionDays", 0);
     this.setDefault("maxConcurrentDownloads", 2);
+    this.setDefault("maxConcurrentRecordings", 8);
+    this.setDefault("minFreeDiskGb", 1);
     this.setDefault("downloadRetryAttempts", 5);
     this.setDefault("downloadRetryBaseSeconds", 30);
     this.setDefault("downloadStallTimeoutSeconds", 120);
@@ -476,8 +478,13 @@ export class Database {
     return this.getItem(row.id);
   }
 
-  nextQueued(): DownloadItem | undefined {
-    const row = this.sqlite.prepare("SELECT * FROM items WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY created_at LIMIT 1").get(now()) as any;
+  // `live` picks the pool: true = live recordings, false = ordinary downloads,
+  // undefined = whatever is oldest. CASE guards json_extract so a row with malformed
+  // metadata (or none at all) reads as "not live" instead of failing the query.
+  nextQueued(live?: boolean): DownloadItem | undefined {
+    const flag = "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')";
+    const pool = live === undefined ? "" : live ? ` AND ${flag}=1` : ` AND coalesce(${flag},0)!=1`;
+    const row = this.sqlite.prepare(`SELECT * FROM items WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?)${pool} ORDER BY created_at LIMIT 1`).get(now()) as any;
     return row ? this.mapItem(row) : undefined;
   }
 

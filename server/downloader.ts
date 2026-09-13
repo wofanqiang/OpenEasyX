@@ -14,7 +14,36 @@ import { liveRecordingRequest } from "../packages/live-capture.js";
 import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
 import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
 
-type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean };
+type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean };
+
+// Concurrency lives in two independent pools. Downloads keep their historical range so the
+// setting keeps meaning what it always meant; recordings get their own, larger one because a
+// broadcast is time sensitive and cannot be retried later.
+const DEFAULT_MAX_DOWNLOADS = 2;
+const MAX_DOWNLOADS = 8;
+const DEFAULT_MAX_RECORDINGS = 8;
+const MAX_RECORDINGS = 32;
+
+/** Clamp a configured concurrency value into the range the pool can serve. */
+export function concurrentLimit(value: unknown, fallback: number, max: number): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(1, Math.min(max, Math.trunc(raw)));
+}
+
+/**
+ * The slots that may start right now, recordings first. Recordings lead because a live
+ * broadcast cannot be re-downloaded later, while a backfill download can wait.
+ */
+export function slotPlan(
+  counts: { recordings: number; downloads: number },
+  limits: { recordings: number; downloads: number },
+): Array<"recording" | "download"> {
+  const plan: Array<"recording" | "download"> = [];
+  for (let i = Math.max(0, limits.recordings - counts.recordings); i > 0; i--) plan.push("recording");
+  for (let i = Math.max(0, limits.downloads - counts.downloads); i > 0; i--) plan.push("download");
+  return plan;
+}
 
 /**
  * Whether the download stall timer should give up on the running item.
@@ -130,16 +159,36 @@ export class DownloadQueue {
     return this.db.setItemStatus(itemId, action === "stop" ? "stopping" : "cancelling");
   }
 
-  private async tick() {
-    const max = Math.max(1, Math.min(8, Number(this.db.getSettings().maxConcurrentDownloads ?? 2)));
-    while (this.active.size < max) {
-      const item = this.db.nextQueued();
-      if (!item || this.active.has(item.id)) return;
-      const control: ActiveDownload = { paused: false };
-      this.active.set(item.id, control);
-      this.db.setItemStatus(item.id, "downloading", { progress: 0 });
-      this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
-      void this.download(item, control).finally(() => this.active.delete(item.id));
+  /** Active items split by pool: live recordings and everything else. */
+  private activeCounts() {
+    let recordings = 0;
+    for (const control of this.active.values()) if (control.live) recordings++;
+    return { recordings, downloads: this.active.size - recordings };
+  }
+
+  private startItem(item: DownloadItem) {
+    // Read the live flag off the item itself, so slot accounting can never disagree with
+    // the branch download() takes (both keyed on metadata.live).
+    const control: ActiveDownload = { paused: false, live: (item.metadata as Record<string, unknown> | undefined)?.live === true };
+    this.active.set(item.id, control);
+    this.db.setItemStatus(item.id, "downloading", { progress: 0 });
+    this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
+    void this.download(item, control).finally(() => this.active.delete(item.id));
+  }
+
+  private tick() {
+    const settings = this.db.getSettings();
+    const limits = {
+      recordings: concurrentLimit(settings.maxConcurrentRecordings, DEFAULT_MAX_RECORDINGS, MAX_RECORDINGS),
+      downloads: concurrentLimit(settings.maxConcurrentDownloads, DEFAULT_MAX_DOWNLOADS, MAX_DOWNLOADS),
+    };
+    // Each pool drains only its own queue, so a recording can never be blocked behind a
+    // backfill and a backfill can never be blocked behind a broadcast. A pool whose queue
+    // is empty yields nothing and the plan simply moves on to the other one.
+    for (const kind of slotPlan(this.activeCounts(), limits)) {
+      const item = this.db.nextQueued(kind === "recording");
+      if (!item || this.active.has(item.id)) continue;
+      this.startItem(item);
     }
   }
 
