@@ -37,6 +37,12 @@ const scanIntervalMinutes = Math.max(1, Number(process.env.EASYX_SCAN_INTERVAL_M
 const appVersion = process.env.APP_VERSION?.trim() || "dev";
 const logStore = new LogStore();
 const appLogger = pino({ level: process.env.EASYX_LOG_LEVEL ?? "info" }, logStore.stream);
+// Node ends the process on an unhandled promise rejection by default. A single stray
+// rejection (a late database write, a plugin callback) would therefore kill every
+// in-flight recording and download, so log it loudly and keep serving instead.
+process.on("unhandledRejection", (reason) => {
+  appLogger.error({ scope: "process", err: reason instanceof Error ? { message: reason.message, stack: reason.stack } : reason }, "Unhandled promise rejection");
+});
 const writeLog: LogWriter = (level, scope, message, details) => appLogger[level]({ scope, ...(details === undefined ? {} : { details }) }, message);
 const db = new Database(dataDir);
 const auth = new AuthService(db, process.env.EASYX_SESSION_SECRET, (line) => appLogger.info({ scope: "auth" }, line));
@@ -380,6 +386,9 @@ app.get<{ Params: { tokenPath: string }; Querystring: Record<string, unknown> }>
 
 app.get<{ Querystring: { q?: string } }>("/api/discover", async (request) => {
   const query = z.string().trim().min(2).max(120).parse(request.query.q);
+  // Two concurrent searches would share one status object: the first to finish clears
+  // `running` while the other is still working, and progress figures overwrite each other.
+  if (discoveryStatus.running) throw Object.assign(new Error("A discovery search is already running"), { statusCode: 409 });
   Object.assign(discoveryStatus, { running: true, completed: 0, total: 0, progress: 0, query, error: "" });
   try {
     const result = await discoverPeople(plugins, query, (progress) => Object.assign(discoveryStatus, progress));

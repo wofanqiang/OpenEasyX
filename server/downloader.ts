@@ -208,7 +208,12 @@ export class DownloadQueue {
     this.active.set(item.id, control);
     this.db.setItemStatus(item.id, "downloading", { progress: 0 });
     this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
-    void this.download(item, control).finally(() => this.active.delete(item.id));
+    // `.finally()` does not swallow rejections. Anything thrown while recording the
+    // outcome (setItemStatus, scheduleRetry) would otherwise escape as an unhandled
+    // rejection, so catch it here and keep the queue's slot accounting intact.
+    void this.download(item, control).catch((error) => {
+      this.writeLog?.("error", "download", "Download failed outside of its own error handling", { itemId: item.id, error: error instanceof Error ? error.message : String(error) });
+    }).finally(() => this.active.delete(item.id));
   }
 
   private tick() {

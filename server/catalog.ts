@@ -281,7 +281,7 @@ export class Catalog {
       const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
       child.stdout.on("data", (chunk) => { output += String(chunk).slice(0, 64 * 1024); });
       child.stderr.on("data", (chunk) => { error += String(chunk).slice(0, 2000); });
-      child.on("error", reject);
+      child.on("error", (error) => { clearTimeout(timer); reject(error); });
       child.on("close", (code) => {
         clearTimeout(timer);
         if (code !== 0) return reject(new Error(error || "FFprobe could not inspect this video"));
