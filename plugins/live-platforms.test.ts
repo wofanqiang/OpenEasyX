@@ -7,14 +7,16 @@ import livejasmin from "./livejasmin/index.js";
 import camsoda from "./camsoda/index.js";
 import cams from "./cams/index.js";
 import xcams from "./xcams/index.js";
+import superchatlive from "./superchatlive/index.js";
 
 describe("bundled live platforms", () => {
-  const plugins = [cam4, stripchat, bongacams, myfreecams, livejasmin, camsoda, cams, xcams];
+  const plugins = [cam4, stripchat, bongacams, myfreecams, livejasmin, camsoda, cams, xcams, superchatlive];
 
   it("ships every requested provider as a unique live-cam plugin", () => {
     expect(plugins.map((plugin) => plugin.manifest.id)).toEqual([
       "org.easyx.cam4", "org.easyx.stripchat", "org.easyx.bongacams", "org.easyx.myfreecams",
       "org.easyx.livejasmin", "org.easyx.camsoda", "org.easyx.cams", "org.easyx.xcams",
+      "org.easyx.superchatlive",
     ]);
     expect(new Set(plugins.map((plugin) => plugin.manifest.id))).toHaveProperty("size", plugins.length);
     for (const plugin of plugins) {
