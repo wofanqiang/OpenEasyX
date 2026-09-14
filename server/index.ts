@@ -57,6 +57,12 @@ const queue = new DownloadQueue(
   (item) => catalog.deleteStoredMedia(item.storagePath!),
 );
 const browserLogin = new BrowserLoginManager(dataDir);
+// The /browser proxy is deliberately outside the session gate (the hook above only
+// guards /api/), and x11vnc runs without a password, so enabling this exposes a remote
+// desktop to anyone who can reach the port. Say so loudly at boot.
+if (process.env.EASYX_ENABLE_BROWSER_LOGIN === "true") {
+  appLogger.warn({ scope: "browser-login" }, "Browser login is enabled: /browser (noVNC) is served without authentication and the VNC server has no password. Only enable it on a trusted network.");
+}
 const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
 const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); });
 for (const favorite of db.listLiveCamFavorites()) {
