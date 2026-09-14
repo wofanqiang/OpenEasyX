@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LiveCamCard, LiveCamFavoriteButton, LiveCamPerformerButton, LiveCamRecordButton, LiveCamUnavailable, LivePlayer, liveCamListUrl, liveCamPresetFromSearch, liveCamUrl, mergeLiveCamRefresh, shouldRecoverNativeLiveMediaError } from "./LiveCamPage";
+import { LiveCamCard, LiveCamFavoriteButton, LiveCamPerformerButton, LiveCamRecordButton, LiveCamUnavailable, LivePlayer, liveCamListUrl, liveCamPresetFromSearch, liveCamUrl, markLiveCamInterrupted, mergeLiveCamRefresh, shouldRecoverNativeLiveMediaError } from "./LiveCamPage";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -86,5 +86,24 @@ describe("Live Cam availability", () => {
     expect(mergeLiveCamRefresh(previous, pending)).toMatchObject({ items: previous.items, total: 1 });
     expect(mergeLiveCamRefresh(previous, { ...pending, complete: true })).toMatchObject({ items: [], total: 0 });
     expect(mergeLiveCamRefresh(null, pending)).toEqual(pending);
+  });
+
+  it("stops advertising a provider that never answered as still loading", () => {
+    const result = {
+      available: true,
+      items: [{ id: "alice", username: "alice", providerId: "fast.live", providerName: "Fast Live", pageUrl: "https://live.test/alice" }],
+      total: 1, page: 1, pageSize: 24, pages: 1, complete: false,
+      providers: [
+        { id: "fast.live", name: "Fast Live", ok: true, count: 1 },
+        { id: "slow.live", name: "Slow Live", ok: true, count: 0, pending: true },
+      ],
+    };
+    const interrupted = markLiveCamInterrupted(result);
+    expect(interrupted.items).toEqual(result.items);
+    expect(interrupted.providers[0]).toBe(result.providers[0]);
+    expect(interrupted.providers[1]).toMatchObject({ id: "slow.live", pending: false, ok: false, error: expect.stringContaining("Did not respond") });
+    // A snapshot with nothing outstanding is returned untouched.
+    const settled = { ...result, providers: result.providers.map((provider) => ({ ...provider, pending: false })) };
+    expect(markLiveCamInterrupted(settled)).toBe(settled);
   });
 });
