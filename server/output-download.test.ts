@@ -65,7 +65,8 @@ describe("custom download output", () => {
     expect(db.getItem(item.id)?.error).toContain("symbolic links"); expect(fs.readdirSync(outside)).toEqual([]);
   });
   it.each(["source", "h264-high", "h264-small", "h265"])("produces a playable live recording with the %s preset", async (recordingPreset) => {
-    const { db, plugins, media, queue, add } = await fixture({ recordingPreset, outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-live" });
+    // autoRecordMinBytes: 0 -- these synthetic recordings are a few KB, real live streams are not.
+    const { db, plugins, media, queue, add } = await fixture({ recordingPreset, outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-live", autoRecordMinBytes: 0 });
     plugins.get("test.output").resolveDownload = async () => ({ kind: "command", command: "ffmpeg", filename: "live.webm", args: ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1440x810:rate=10", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "0.3", "-c:v", "libvpx-vp9", "-cpu-used", "8", "-c:a", "libopus", "{output}"] });
     const item = add("one", true); queue.start(); const done = await complete(db, item.id); queue.stop();
     const filename = path.join(media, done.storagePath!);
