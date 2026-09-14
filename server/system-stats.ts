@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -203,13 +204,15 @@ type Reading = {
   cgroupUsageSeconds?: number;
   containerMemoryBytes: number;
   containerMemoryLimitBytes: number;
-  recordings: { activeDirectories: number; bytesOnDisk: number };
+  recordings: { activeDirectories: number; bytesOnDisk: number; sampledAt: number };
 };
 
 export type SystemStatsOptions = {
   mediaDir: string;
   /** Where in-flight downloads keep their partial files (defaults to `mediaDir/.downloads`). */
   recordingsRoot?: string;
+  /** Where interrupted recordings wait to be rescued (defaults to `mediaDir/.recording-recovery`). */
+  recoveryRoot?: string;
   sampleIntervalMs?: number;
   platform?: NodeJS.Platform;
 };
@@ -217,6 +220,7 @@ export type SystemStatsOptions = {
 export class SystemStatsService {
   private readonly mediaDir: string;
   private readonly recordingsRoot: string;
+  private readonly recoveryRoot: string;
   private readonly intervalMs: number;
   private readonly platform: NodeJS.Platform;
   private timer?: NodeJS.Timeout;
@@ -226,6 +230,7 @@ export class SystemStatsService {
   constructor(options: SystemStatsOptions) {
     this.mediaDir = path.resolve(options.mediaDir);
     this.recordingsRoot = path.resolve(options.recordingsRoot ?? path.join(options.mediaDir, ".downloads"));
+    this.recoveryRoot = path.resolve(options.recoveryRoot ?? path.join(options.mediaDir, ".recording-recovery"));
     this.intervalMs = Math.max(250, options.sampleIntervalMs ?? 1000);
     this.platform = options.platform ?? process.platform;
     this.snapshot = this.emptySnapshot(this.platform === "linux" ? "Waiting for the first sample" : `System metrics are only collected on Linux hosts (this host is ${this.platform})`);
@@ -300,35 +305,59 @@ export class SystemStatsService {
     return { cpu: aggregate, perCore, memory, load, uptimeSeconds, network, diskIo, cgroupVersion, cgroupUsageSeconds, containerMemoryBytes, containerMemoryLimitBytes, recordings: this.recordingUsage() };
   }
 
-  /** Size and directory count of the in-flight download area (one level deep). */
-  private recordingUsage(): { activeDirectories: number; bytesOnDisk: number } {
-    let activeDirectories = 0;
-    let bytesOnDisk = 0;
+  // The recording-buffer scan is asynchronous and cached for 5s (A3): a blocking directory
+  // walk every second starved the event loop on the single-core host, and the dashboard does
+  // not need second-fresh buffer sizes. The count covers both in-flight downloads and the
+  // recovery area, so "recording buffer" means "bytes not yet in the library" (P7).
+  private recordingCache: { activeDirectories: number; bytesOnDisk: number; sampledAt: number } = { activeDirectories: 0, bytesOnDisk: 0, sampledAt: 0 };
+  private recordingScan?: Promise<void>;
+
+  private recordingUsage(): { activeDirectories: number; bytesOnDisk: number; sampledAt: number } {
+    if (Date.now() - this.recordingCache.sampledAt >= 5000 && !this.recordingScan) {
+      this.recordingScan = this.scanRecordingAreas()
+        .then((value) => { this.recordingCache = { ...value, sampledAt: Date.now() }; })
+        .catch(() => { this.recordingCache = { ...this.recordingCache, sampledAt: Date.now() }; })
+        .finally(() => { this.recordingScan = undefined; });
+    }
+    return this.recordingCache;
+  }
+
+  private async scanRecordingAreas(): Promise<{ activeDirectories: number; bytesOnDisk: number }> {
+    const [active, recovered] = await Promise.all([
+      this.directoryUsage(this.recordingsRoot),
+      this.directoryUsage(this.recoveryRoot),
+    ]);
+    return { activeDirectories: active.directories + recovered.directories, bytesOnDisk: active.bytes + recovered.bytes };
+  }
+
+  private async directoryUsage(root: string): Promise<{ directories: number; bytes: number }> {
+    let directories = 0;
+    let bytes = 0;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(this.recordingsRoot, { withFileTypes: true });
+      entries = await fsp.readdir(root, { withFileTypes: true });
     } catch {
-      return { activeDirectories, bytesOnDisk };
+      return { directories, bytes };
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      activeDirectories += 1;
+      directories += 1;
       let files: fs.Dirent[];
       try {
-        files = fs.readdirSync(path.join(this.recordingsRoot, entry.name), { withFileTypes: true });
+        files = await fsp.readdir(path.join(root, entry.name), { withFileTypes: true });
       } catch {
         continue;
       }
       for (const file of files) {
         if (!file.isFile()) continue;
         try {
-          bytesOnDisk += fs.statSync(path.join(this.recordingsRoot, entry.name, file.name)).size;
+          bytes += (await fsp.stat(path.join(root, entry.name, file.name))).size;
         } catch {
           // A partial file can vanish between readdir and stat; ignore it.
         }
       }
     }
-    return { activeDirectories, bytesOnDisk };
+    return { directories, bytes };
   }
 
   private collect() {
@@ -383,7 +412,11 @@ export class SystemStatsService {
       disks: this.disks(),
       recordings: {
         ...recordings,
-        writeBytesPerSecond: previous && seconds ? Math.max(0, (recordings.bytesOnDisk - previous.recordings.bytesOnDisk) / seconds) : 0,
+        // The buffer size is cached for 5s, so rate it over the real gap between the two
+        // cached measurements instead of the 1s sampling interval (A3).
+        writeBytesPerSecond: previous && recordings.sampledAt > previous.recordings.sampledAt
+          ? Math.max(0, (recordings.bytesOnDisk - previous.recordings.bytesOnDisk) / Math.max(0.001, (recordings.sampledAt - previous.recordings.sampledAt) / 1000))
+          : 0,
       },
     };
 

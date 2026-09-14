@@ -152,7 +152,7 @@ export function SystemStats() {
           ? `${container.memoryLimitBytes > 0 ? `Limit ${formatBytes(container.memoryLimitBytes)}` : "No memory limit"} · cgroup ${container.cgroupVersion} · excl. reclaimable cache`
           : "Running outside a container"}/>
       <Metric icon={HardDrive} label="Recording buffer" value={`${recordings.activeDirectories} active`}
-        caption={`${formatBytes(recordings.bytesOnDisk)} on disk · ${formatRate(recordings.writeBytesPerSecond)}`}/>
+        caption={`${formatBytes(recordings.bytesOnDisk)} on disk, including pending recovery · ${formatRate(recordings.writeBytesPerSecond)}`}/>
     </div>
     <div className="system-details">
       <div><span>Media disk</span><b>{mediaDisk ? `${formatBytes(mediaDisk.freeBytes)} free (${100 - mediaDisk.percent}%)` : "Unavailable"}</b></div>
