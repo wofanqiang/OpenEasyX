@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Database } from "./database.js";
 import { LiveCamImages } from "./live-cam-images.js";
+import { isSafeImageUrl } from "./live-cam-images.js";
 import type { PluginManager } from "./plugin-manager.js";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -44,6 +45,48 @@ describe("Locally stored live performer portraits", () => {
     await images.ensure("test", cam, performer);
     expect(request).toHaveBeenCalledTimes(1);
     expect(db.getPerformer(performer.id)?.imageUrl).toBe(performer.imageUrl);
+    db.close();
+  });
+});
+
+
+describe("Portrait URL safety", () => {
+  it("accepts ordinary public image URLs", () => {
+    for (const url of ["https://cdn.example.com/a/b.jpg", "http://images.test/alice.png", "https://8.8.8.8/pic.jpg", "https://1.1.1.1:8443/x.jpg"]) {
+      expect(isSafeImageUrl(url)).toBe(true);
+    }
+  });
+
+  it("rejects internal, loopback and metadata targets", () => {
+    for (const url of [
+      "http://169.254.169.254/latest/meta-data/",   // cloud metadata
+      "http://127.0.0.1:8080/admin",
+      "https://localhost/x.jpg",
+      "http://10.1.2.3/a.jpg",
+      "http://192.168.1.1/a.jpg",
+      "http://172.16.0.5/a.jpg",
+      "http://172.31.255.255/a.jpg",
+      "http://100.64.0.1/x.jpg",                    // carrier-grade NAT / docker
+      "http://[::1]/a.jpg",
+      "http://[fd00::1]/a.jpg",
+      "http://[fe80::1]/a.jpg",
+      "http://printer.local/x.jpg",
+      "http://nas.internal/x.jpg",
+    ]) expect(isSafeImageUrl(url)).toBe(false);
+  });
+
+  it("rejects anything that is not an http(s) URL", () => {
+    for (const url of ["file:///etc/passwd", "gopher://internal/", "data:image/png;base64,AAAA", "not a url"]) {
+      expect(isSafeImageUrl(url)).toBe(false);
+    }
+  });
+
+  it("never requests an unsafe portrait URL", async () => {
+    const { db, performer, request, directory, images } = fixture();
+    const cam = { id: "alice", username: "alice", pageUrl: "https://provider.test/alice", profileImageUrl: "http://169.254.169.254/latest/meta-data/" };
+    await images.ensure("test", cam, performer);
+    expect(request).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(directory, `${performer.id}.jpg`))).toBe(false);
     db.close();
   });
 });
