@@ -1,8 +1,7 @@
-import { randomBytes } from "node:crypto";
-import { Readable } from "node:stream";
 import type { FastifyReply } from "fastify";
 import type { LiveCam, LiveCamFavoriteSnapshot, LiveCamQuery, LiveStream } from "../packages/plugin-sdk/index.js";
 import type { Database, LiveCamFavorite, Performer, Source } from "./database.js";
+import { HlsProxy } from "./hls-proxy.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 
 export type PublicLiveCam = LiveCam & { providerId: string; providerName: string; favorite: boolean; autoRecord: boolean; performerId?: string };
@@ -15,7 +14,6 @@ export type LiveCamFavoriteSyncResult = {
   providerId: string; synced: number; added: number; removed: number; authoritative: boolean; skippedReason?: string;
 };
 
-type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; expiresAt: number };
 type ProviderResult = { items: PublicLiveCam[]; total: number; status: LiveCamProviderStatus };
 type LiveCamListQuery = LiveCamQuery & { providerId?: string; favoritesOnly?: boolean };
 
@@ -54,8 +52,6 @@ function usernameFromUrl(value: string): string {
 }
 
 export class LiveCamService {
-  private proxyEntries = new Map<string, ProxyEntry>();
-  private proxyReverse = new Map<string, string>();
   private recentCams = new Map<string, { cam: PublicLiveCam; expiresAt: number }>();
   private snapshotLoads = new Map<string, Promise<LiveCamFavoriteSnapshot>>();
   private providerLoads = new Map<string, Promise<ProviderResult>>();
@@ -66,7 +62,7 @@ export class LiveCamService {
   private favoriteWrites = new Map<string, Promise<void>>();
   private favoriteEpoch = new Map<string, number>();
 
-  constructor(private readonly db: Database, private readonly plugins: PluginManager, private readonly request: typeof fetch = fetch, private readonly saveImage?: (providerId: string, cam: LiveCam, performer: Performer) => void) {}
+  constructor(private readonly db: Database, private readonly plugins: PluginManager, private readonly request: typeof fetch = fetch, private readonly saveImage?: (providerId: string, cam: LiveCam, performer: Performer) => void, private readonly hlsProxy: HlsProxy = new HlsProxy(request)) {}
 
   resetProviderSession(providerId: string): void {
     // A newly captured session must not reuse failures or account reads from the old one.
@@ -676,118 +672,16 @@ export class LiveCamService {
     return { streamUrl: this.registerProxy(stream) };
   }
 
+  /**
+   * Hand the caller a short-lived proxy URL for a resolved stream. Everything a recorder needs
+   * lives in the proxy: it replays the provider's headers upstream and, for CDNs that obfuscate
+   * their playlists, rewrites each playlist on the way through.
+   */
   private registerProxy(stream: LiveStream): string {
-    if (stream.audioUrl) {
-      const videoUrl = this.proxyUrl(stream.url, stream.headers ?? {}, ".m3u8");
-      const audioUrl = this.proxyUrl(stream.audioUrl, stream.headers ?? {}, ".m3u8");
-      return this.proxyBody([
-        "#EXTM3U", "#EXT-X-VERSION:6",
-        `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="${audioUrl}"`,
-        "#EXT-X-STREAM-INF:BANDWIDTH=6500000,AUDIO=\"audio\"", videoUrl, "",
-      ].join("\n"), ".m3u8");
-    }
-    return this.proxyUrl(stream.url, stream.headers ?? {}, ".m3u8");
-  }
-
-  private proxyBody(body: string, suffix: string) {
-    const token = randomBytes(24).toString("base64url");
-    this.proxyEntries.set(token, { body, headers: {}, expiresAt: Date.now() + 15 * 60_000 });
-    return `/api/live-cams/proxy/${token}${suffix}`;
-  }
-
-  private proxyUrl(url: string, headers: Record<string, string>, suffix = "") {
-    this.pruneProxyEntries();
-    const key = JSON.stringify([url, Object.entries(headers).sort(), suffix]);
-    const existingToken = this.proxyReverse.get(key); const existing = existingToken ? this.proxyEntries.get(existingToken) : undefined;
-    if (existing && existing.expiresAt > Date.now()) {
-      existing.expiresAt = Date.now() + 15 * 60_000;
-      return `/api/live-cams/proxy/${existingToken}${suffix}`;
-    }
-    const token = randomBytes(24).toString("base64url");
-    this.proxyEntries.set(token, { url, headers, expiresAt: Date.now() + 15 * 60_000 });
-    this.proxyReverse.set(key, token);
-    return `/api/live-cams/proxy/${token}${suffix}`;
-  }
-
-  private pruneProxyEntries() {
-    const now = Date.now();
-    for (const [token, entry] of this.proxyEntries) if (entry.expiresAt <= now) this.proxyEntries.delete(token);
-    for (const [key, token] of this.proxyReverse) if (!this.proxyEntries.has(token)) this.proxyReverse.delete(key);
-  }
-
-  private rewritePlaylist(body: string, sourceUrl: string, headers: Record<string, string>) {
-    const proxied = (raw: string) => {
-      const absolute = new URL(raw, sourceUrl).toString();
-      let suffix = "";
-      try { const ext = new URL(absolute).pathname.match(/\.[a-z0-9]{1,8}$/i)?.[0]; if (ext) suffix = ext; } catch { /* Keep the token extensionless. */ }
-      return this.proxyUrl(absolute, headers, suffix);
-    };
-    return body.split(/\r?\n/).map((line) => {
-      if (!line) return line;
-      if (!line.startsWith("#")) return proxied(line.trim());
-      return line.replace(/URI="([^"]+)"/g, (_match, uri: string) => `URI="${proxied(uri)}"`);
-    }).join("\n");
+    return this.hlsProxy.register(stream);
   }
 
   async proxy(tokenPath: string, reply: FastifyReply, query: Record<string, unknown> = {}, range?: string) {
-    const token = tokenPath.split(".", 1)[0];
-    const entry = this.proxyEntries.get(token);
-    if (!entry || entry.expiresAt <= Date.now()) {
-      this.proxyEntries.delete(token); return reply.status(404).send({ error: "Live stream link expired" });
-    }
-    entry.expiresAt = Date.now() + 15 * 60_000;
-    if (entry.body !== undefined) return reply.type("application/vnd.apple.mpegurl").header("cache-control", "no-store").send(entry.body);
-    const sourceUrl = new URL(entry.url!);
-    for (const key of ["_HLS_msn", "_HLS_part", "_HLS_skip"]) {
-      const value = text(query[key]); if (value) sourceUrl.searchParams.set(key, value);
-    }
-    let response: Response;
-    try { response = await this.fetchUpstream(sourceUrl, entry.headers, range); }
-    catch (error) {
-      return reply.status(502).send({ error: `Upstream live provider unreachable: ${error instanceof Error ? error.message : String(error)}` });
-    }
-    if (!response.ok) return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
-    const contentType = response.headers.get("content-type") ?? "application/octet-stream";
-    const contentRange = response.headers.get("content-range");
-    const acceptRanges = response.headers.get("accept-ranges");
-    const passthroughHeaders = () => {
-      reply.header("cache-control", "no-store");
-      if (contentRange) reply.header("content-range", contentRange);
-      if (acceptRanges) reply.header("accept-ranges", acceptRanges);
-    };
-    // Playlists are tiny and must be rewritten so every nested URL points back
-    // through this proxy. Buffering the whole body here is cheap and safe.
-    if (contentType.includes("mpegurl")) {
-      const playlist = Buffer.from(await response.arrayBuffer()).toString("utf8");
-      passthroughHeaders();
-      return reply.status(response.status)
-        .type("application/vnd.apple.mpegurl")
-        .send(this.rewritePlaylist(playlist, response.url, entry.headers));
-    }
-    // Media segments are opaque binary that do not need rewriting. Stream them
-    // straight to the client with zero buffering and zero disk writes so playback
-    // stays real-time instead of waiting for each segment to fully download on the
-    // server first (the old arrayBuffer() + writeProxyCache path caused stutter).
-    if (!response.body) {
-      const fallback = Buffer.from(await response.arrayBuffer());
-      passthroughHeaders();
-      return reply.status(response.status).type(contentType).send(fallback);
-    }
-    const nodeStream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
-    passthroughHeaders();
-    return reply.status(response.status).type(contentType).send(nodeStream);
-  }
-
-  private async fetchUpstream(url: URL, headers: Record<string, string>, range: string | undefined): Promise<Response> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        return await this.request(url, { headers: { ...headers, ...(range ? { range } : {}) }, signal: AbortSignal.timeout(60_000) });
-      } catch (error) {
-        lastError = error;
-        if (attempt < 2) await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1000 * (attempt + 1)); timer.unref?.(); });
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error("Upstream fetch failed");
+    return this.hlsProxy.serve(tokenPath, reply, query, range);
   }
 }

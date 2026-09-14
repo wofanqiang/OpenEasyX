@@ -12,9 +12,10 @@ import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js"
 import { outputSettings } from "../packages/output-settings.js";
 import { liveRecordingRequest } from "../packages/live-capture.js";
 import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
-import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
+import type { LiveStream, MediaCandidate } from "../packages/plugin-sdk/index.js";
 import type { LogLevel } from "./log-store.js";
 import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
+import type { HlsProxy } from "./hls-proxy.js";
 
 type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean };
 
@@ -91,7 +92,20 @@ export class DownloadQueue {
     private writeLog?: LogWriter,
     private onCompleted?: () => unknown | Promise<unknown>,
     private onDeleteCompleted?: (item: DownloadItem) => unknown,
+    private readonly liveProxy?: HlsProxy,
+    private readonly selfOrigin?: string,
   ) {}
+
+  /**
+   * Record through the app's own HLS proxy when a plugin asks for it by setting
+   * `playlistDecodeKey`. ffmpeg cannot de-obfuscate a playlist itself, and it does not send a
+   * provider's private headers, so for those streams the proxy is not an optimisation but the
+   * only thing that makes recording possible. Providers that do not opt in are untouched.
+   */
+  private recordThroughProxy(stream: LiveStream): string | undefined {
+    if (!stream.playlistDecodeKey || !this.liveProxy || !this.selfOrigin) return undefined;
+    return this.selfOrigin + this.liveProxy.register(stream);
+  }
 
   start() {
     fs.mkdirSync(this.mediaRoot, { recursive: true });
@@ -277,7 +291,7 @@ export class DownloadQueue {
       // records as ffmpeg MPEG-TS (then the remux below turns it into MP4) no matter
       // which plugin resolved it. Non-live items and plugins without a live resolver
       // keep using resolveDownload unchanged.
-      const request = (await liveRecordingRequest(plugin, context, candidate))
+      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream)))
         ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
       if (!request) throw new Error("This plugin cannot resolve downloads");
       const fallback = `${item.externalId}.${item.mediaType === "image" ? "jpg" : item.mediaType === "video" ? "mp4" : "bin"}`;

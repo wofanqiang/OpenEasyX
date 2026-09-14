@@ -23,6 +23,18 @@ async function fixture() {
   return { database, plugins, service: new LiveCamService(database, plugins) };
 }
 
+/** Minimal FastifyReply stand-in so the live proxy can be driven directly in a test. */
+function replyStub() {
+  const state: { status?: number; body?: unknown } = {};
+  const reply = {
+    status(code: number) { state.status = code; return reply; },
+    type() { return reply; },
+    header() { return reply; },
+    send(body: unknown) { state.body = body; return body; },
+  };
+  return Object.assign(reply, { state });
+}
+
 describe("Open EasyX live cams", () => {
   it("uses the reconnected account immediately instead of its cached login failure", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
@@ -496,6 +508,63 @@ describe("Open EasyX live cams", () => {
     const { plugins, service } = await fixture(); plugins.install("org.easyx.viewer"); plugins.install("test.live");
     await expect(service.resolve("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }))
       .resolves.toEqual({ streamUrl: expect.stringMatching(/^\/api\/live-cams\/proxy\/[A-Za-z0-9_-]+\.m3u8$/) });
+  });
+
+  it("decrypts anti-leech segment addresses while rewriting a proxied playlist", async () => {
+    const { database, plugins } = await fixture(); plugins.install("org.easyx.viewer"); plugins.install("test.live");
+    // A real capture from vr.superchat.live: the URI lines carry a decoy, the #EXT-X-MOUFLON:URI
+    // hints carry the real but encrypted addresses. `_gFbIS9EhCnNf0nWm_` is what that token
+    // decodes to, and the CDN served it with HTTP 200 when this was probed.
+    const media = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:6",
+      "#EXT-X-MOUFLON:PSCH:v2:Ook7quaiNgiyuhai",
+      "#EXT-X-TARGETDURATION:2",
+      "#EXT-X-MEDIA-SEQUENCE:5385",
+      '#EXT-X-MAP:URI="https://cdn.test/alice/1440p60_h264_init_jTdPdxMGUO9mHHRQ.mp4"',
+      "#EXT-X-MOUFLON:URI:https://cdn.test/alice/1440p60_h264_5385_Ao5b8oKcwmYOOsIxLlofVy_1789400984_part0.mp4",
+      '#EXT-X-PART:DURATION=0.500,URI="https://cdn.test/alice/media.mp4",INDEPENDENT=YES',
+      "#EXTINF:2.000",
+      "#EXT-X-MOUFLON:URI:https://cdn.test/alice/1440p60_h264_5385_Ao5b8oKcwmYOOsIxLlofVy_1789400984.mp4",
+      "https://cdn.test/alice/media.mp4",
+      "#EXTINF:2.000",
+      "#EXT-X-MOUFLON:URI:https://cdn.test/alice/1440p60_h264_5386_Qv9/c29MAps+NroUJhdD1w_1789400986.mp4",
+      "https://cdn.test/alice/media.mp4",
+    ].join("\n");
+
+    const fetched: string[] = [];
+    const request = vi.fn(async (url: URL | string) => {
+      const href = String(url); fetched.push(href);
+      return {
+        ok: true, status: 200, url: href,
+        headers: new Headers({ "content-type": "application/vnd.apple.mpegurl", "cache-control": "max-age=1" }),
+        async arrayBuffer() { return new TextEncoder().encode(media).buffer; },
+        async text() { return media; },
+        body: null,
+      };
+    });
+    const service = new LiveCamService(database, plugins, request as never);
+    plugins.get("test.live").resolveLiveStream = async () => ({
+      url: "https://cdn.test/alice/1440p60.m3u8?psch=v2&pkey=Ook7quaiNgiyuhai",
+      headers: { Referer: "https://live.test/" },
+      playlistDecodeKey: "EQueeGh2kaewa3ch",
+    });
+
+    const { streamUrl } = await service.resolve("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" });
+    const body = String(await service.proxy(streamUrl.replace("/api/live-cams/proxy/", ""), replyStub() as never, {}, undefined));
+
+    // Every nested address is proxied, so resolve each token and inspect what the proxy fetched.
+    const tokens = [...new Set([...body.matchAll(/\/api\/live-cams\/proxy\/([A-Za-z0-9_-]+)/g)].map((match) => match[1]!))];
+    expect(tokens.length).toBeGreaterThan(2);
+    for (const token of tokens) await service.proxy(token, replyStub() as never, {}, undefined);
+
+    expect(fetched.some((url) => url.includes("/1440p60_h264_5385_gFbIS9EhCnNf0nWm_1789400984_part0.mp4"))).toBe(true);
+    expect(fetched.some((url) => url.includes("/1440p60_h264_5386_mAWYzYYTwQJQJgSp_1789400986.mp4"))).toBe(true);
+    // The decoy and the still-encrypted form must never reach the CDN.
+    expect(fetched.some((url) => url.endsWith("/media.mp4"))).toBe(false);
+    expect(fetched.some((url) => url.includes("_Ao5b8oKcwmYOOsIxLlofVy_"))).toBe(false);
+    // The init segment is not obfuscated and must pass through unchanged.
+    expect(fetched.some((url) => url.includes("1440p60_h264_init_jTdPdxMGUO9mHHRQ.mp4"))).toBe(true);
   });
 
   it("uses provider totals and returns only the requested aggregate page", async () => {

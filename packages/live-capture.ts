@@ -70,7 +70,19 @@ export function isLiveCandidate(candidate: MediaCandidate): boolean {
   return (candidate.metadata as Record<string, unknown> | undefined)?.live === true;
 }
 
-export async function liveRecordingRequest(plugin: EasyXPlugin, context: PluginContext, item: MediaCandidate): Promise<CommandDownloadRequest | undefined> {
+/**
+ * @param rewrite  Optional hook that replaces the stream's address before ffmpeg sees it. A
+ *   provider whose playlist is obfuscated (or needs private headers) cannot be recorded
+ *   directly: ffmpeg parses the playlist as written and fetches the decoys. The server's HLS
+ *   proxy rewrites it on the way through, so callers that have one pass a hook here. The
+ *   proxied address carries no headers of its own - the proxy replays the provider's.
+ */
+export async function liveRecordingRequest(
+  plugin: EasyXPlugin,
+  context: PluginContext,
+  item: MediaCandidate,
+  rewrite?: (stream: LiveStream) => string | undefined,
+): Promise<CommandDownloadRequest | undefined> {
   const meta = item.metadata as Record<string, unknown> | undefined;
   if (meta?.live !== true || !plugin.resolveLiveStream) return undefined;
   const pageUrl = item.pageUrl ?? (typeof meta.extractorUrl === "string" ? meta.extractorUrl : undefined);
@@ -78,7 +90,11 @@ export async function liveRecordingRequest(plugin: EasyXPlugin, context: PluginC
   const cam: LiveCam = { id: item.externalId, username: item.identityKey ?? item.title ?? "live", title: item.title, pageUrl };
   try {
     const stream = await plugin.resolveLiveStream(context, cam);
-    return ffmpegLiveCaptureCommand(stream, { referer: liveReferer(pageUrl), output: "{outputDir}/capture.ts", filename: item.filename ?? `${item.externalId}.mp4` });
+    const proxied = rewrite?.(stream);
+    // A proxied stream needs no identity of its own: the proxy attaches the provider's headers
+    // and referer upstream, so sending them here too would only confuse the hop.
+    const referer = proxied ? undefined : liveReferer(pageUrl);
+    return ffmpegLiveCaptureCommand(proxied ? { url: proxied } : stream, { referer, output: "{outputDir}/capture.ts", filename: item.filename ?? `${item.externalId}.mp4` });
   } catch (error) {
     context.log("warn", "Live stream capture resolution failed; falling back to the plugin download path", error instanceof Error ? error.message : String(error));
     return undefined;

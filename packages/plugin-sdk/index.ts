@@ -175,6 +175,15 @@ export type LiveStream = {
   audioUrl?: string;
   headers?: Record<string, string>;
   contentType?: string;
+  /**
+   * Anti-leech playlists. Some CDNs (Tencent `MC_VCLOUD_LIVE`, which fronts the doppiocdn hosts
+   * behind Stripchat and its white labels) write a decoy address on every segment URI line and
+   * carry the real, encrypted address on a sibling `#EXT-X-MOUFLON:URI:` hint. Setting this to
+   * the key the CDN's own player uses makes the server's live proxy decrypt those addresses
+   * while it rewrites the playlist, which is what lets ffmpeg and hls.js follow it at all.
+   * See `packages/hls-mouflon.ts`.
+   */
+  playlistDecodeKey?: string;
 };
 
 export interface EasyXPlugin {

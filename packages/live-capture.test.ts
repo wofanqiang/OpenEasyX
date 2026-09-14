@@ -58,6 +58,27 @@ describe("live capture request", () => {
     expect(request!.args).toEqual(expect.arrayContaining(["-f", "mpegts", "{outputDir}/capture.ts"]));
   });
 
+  it("records through the rewrite hook when a provider cannot be played directly", async () => {
+    // An obfuscated playlist is parsed by ffmpeg exactly as written, so it fetches decoys and
+    // records an advert. The server's HLS proxy de-obfuscates it, and this hook is what points
+    // ffmpeg at the proxy instead of at the CDN.
+    const resolveLiveStream = vi.fn(async () => ({ url: "https://cdn.test/a.m3u8", headers: { Referer: "https://site.test/" }, playlistDecodeKey: "secret" }));
+    const rewrite = vi.fn((stream: { url: string }) => (stream.url.startsWith("https://cdn.test/") ? "http://127.0.0.1:3210/api/live-cams/proxy/token.m3u8" : undefined));
+    const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem, rewrite);
+    expect(rewrite).toHaveBeenCalledOnce();
+    expect(request!.args).toEqual(expect.arrayContaining(["-i", "http://127.0.0.1:3210/api/live-cams/proxy/token.m3u8"]));
+    // The proxy replays the provider's headers itself, so none are forwarded alongside it.
+    expect(request!.args).not.toEqual(expect.arrayContaining(["-headers"]));
+  });
+
+  it("keeps the raw stream and its headers when no rewrite hook applies", async () => {
+    // Existing providers must be untouched: only a plugin that sets playlistDecodeKey opts in.
+    const resolveLiveStream = vi.fn(async () => ({ url: "https://cdn.test/a.m3u8" }));
+    const rewrite = vi.fn((stream: { playlistDecodeKey?: string }) => stream.playlistDecodeKey ? "http://127.0.0.1:3210/proxied.m3u8" : undefined);
+    const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem, rewrite);
+    expect(request!.args).toEqual(expect.arrayContaining(["-i", "https://cdn.test/a.m3u8"]));
+  });
+
   it("leaves non-live items to the plugin", async () => {
     const resolveLiveStream = vi.fn();
     expect(await liveRecordingRequest(plugin(resolveLiveStream), context, { ...liveItem, metadata: { live: false } })).toBeUndefined();
