@@ -9,6 +9,7 @@ import { PluginManager } from "./plugin-manager.js";
 import { DownloadQueue, concurrentLimit, postProcessDeadlineMs, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
+import { safeSegment } from "./utils.js";
 
 const dirs: string[] = [];
 // Windows keeps a temp tree locked for a moment after SQLite handles and spawned children go
@@ -262,7 +263,7 @@ it("runs a recording and a download side by side, one slot per pool", async () =
   db.setPluginState("test.pools", { installed: true, enabled: true });
   // One slot per pool. While both pools shared a single counter, the second item here
   // stayed queued until the first finished, which is exactly the starvation this fixes.
-  db.updateSettings({ maxConcurrentDownloads: 1, maxConcurrentRecordings: 1 });
+  db.updateSettings({ maxConcurrentDownloads: 1, maxConcurrentRecordings: 1, autoRecordMinBytes: 0 });
   const person = db.upsertPerformer({ externalId: "person", name: "Pool Performer" }, "test.pools");
   const source = db.addSource(person.id, "test.pools", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
   db.ingestItems(source, [
@@ -283,6 +284,42 @@ it("runs a recording and a download side by side, one slot per pool", async () =
     await waitFor(() => db.getItem(recording.id)?.status === "completed" && db.getItem(download.id)?.status === "completed");
     expect(fs.readFileSync(path.join(mediaDir, "Pool Performer", "example.test", "live-asset.mp4"), "utf8")).toBe("firstlive!");
     expect(fs.readFileSync(path.join(mediaDir, "Pool Performer", "example.test", "plain-asset.mp4"), "utf8")).toBe("firstlast!");
+  } finally { queue.stop(); server.close(); }
+});
+
+it("moves a tiny auto-ended live recording to recovery as a fragment (C3)", async () => {
+  const dataDir = temp("easyx-fragment-data"); const mediaDir = temp("easyx-fragment-media"); const pluginDir = temp("easyx-fragment-plugins");
+  const releases: Array<() => void> = [];
+  const server = http.createServer((request, response) => {
+    response.setHeader("content-length", "10");
+    response.write("first");
+    releases.push(() => response.end(request.url?.includes("live") ? "live!" : "last!"));
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("Missing test server address");
+  const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+  fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.frag", name: "Frag", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveDownload(_context, item) { return { url: item.metadata.url, filename: item.filename }; } };`);
+  const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+  db.setPluginState("test.frag", { installed: true, enabled: true });
+  // A small threshold so the tiny test capture is treated as a fragment rather than a real clip.
+  db.updateSettings({ maxConcurrentRecordings: 1, autoRecordMinBytes: 100 });
+  const person = db.upsertPerformer({ externalId: "person", name: "Frag Performer" }, "test.frag");
+  const source = db.addSource(person.id, "test.frag", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+  db.ingestItems(source, [{ externalId: "live-asset", mediaType: "video", filename: "live-asset.mp4", metadata: { url: `http://127.0.0.1:${address.port}/live.mp4`, live: true } }]);
+  const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+  const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+  const recovery = path.join(mediaDir, ".recording-recovery", safeSegment(item.id), "recovered.mp4");
+  const staged = path.join(mediaDir, ".downloads", item.id, "live-asset.mp4");
+  try {
+    // Let the request reach the server first, then let the response finish.
+    await waitFor(() => fs.existsSync(staged));
+    for (const release of releases) release();
+    // The capture ended on its own below the size floor: flagged as a fragment and moved to
+    // recovery, never cataloged as a finished download.
+    await waitFor(() => db.getItem(item.id)?.metadata.fragment === true);
+    expect(db.getItem(item.id)?.status).toBe("failed");
+    expect(fs.existsSync(recovery)).toBe(true);
+    expect(fs.existsSync(path.join(mediaDir, "Frag Performer", "example.test", "live-asset.mp4"))).toBe(false);
   } finally { queue.stop(); server.close(); }
 });
 

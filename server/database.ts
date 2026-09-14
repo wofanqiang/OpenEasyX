@@ -137,6 +137,8 @@ export class Database {
     this.setDefault("defaultScrapeIntervalMinutes", 360);
     this.setDefault("defaultLiveIntervalSeconds", 10);
     this.setDefault("autoRecordCheckSeconds", 60);
+    this.setDefault("autoRecordCooldownSeconds", 120);
+    this.setDefault("autoRecordMinBytes", 5 * 1024 * 1024);
     this.setDefault("admin_password_hash", "");
     for (const [key, value] of Object.entries(outputDefaults)) this.setDefault(key, value);
   }
@@ -531,6 +533,15 @@ export class Database {
       updated_at=? WHERE id=?`)
       .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, values.duplicateOf ?? null,
         status, status, status, status, stamp, status, status, stamp, stamp, itemId);
+    return this.getItem(itemId);
+  }
+
+  setItemMetadata(itemId: string, patch: Record<string, unknown>) {
+    const item = this.getItem(itemId);
+    if (!item) return undefined;
+    const next = { ...item.metadata, ...patch };
+    this.sqlite.prepare("UPDATE items SET metadata_json=?,updated_at=? WHERE id=?")
+      .run(JSON.stringify(next), now(), itemId);
     return this.getItem(itemId);
   }
 

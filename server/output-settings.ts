@@ -15,6 +15,8 @@ export const settingsSchema = z.object({
   autoQueueDiscovered: z.boolean().optional(), legalAccepted: z.boolean().optional(),
   defaultScrapeIntervalMinutes: z.number().int().min(5).max(525600).optional(), defaultLiveIntervalSeconds: z.number().int().min(5).max(3600).optional(),
   autoRecordCheckSeconds: z.number().int().min(30).max(3600).optional(),
+  autoRecordCooldownSeconds: z.number().int().min(0).max(3600).optional(),
+  autoRecordMinBytes: z.number().int().min(0).max(2_000_000_000).optional(),
   outputPathTemplate: template("path").optional(), outputFilenameTemplate: template("filename").optional(),
   recordingPreset: z.enum(["source", "h264-high", "h264-small", "h265"]).optional(),
 });

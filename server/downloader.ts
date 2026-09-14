@@ -16,7 +16,7 @@ import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
 import type { LogLevel } from "./log-store.js";
 import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
 
-type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean };
+type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean };
 
 // Concurrency lives in two independent pools. Downloads keep their historical range so the
 // setting keeps meaning what it always meant; recordings get their own, larger one because a
@@ -182,6 +182,7 @@ export class DownloadQueue {
       return this.db.setItemStatus(itemId, action === "delete" ? "deleted" : "cancelled");
     }
     control.action = action; control.paused = false;
+    if (action === "stop") control.manualStop = true;
     this.signal(control, "SIGCONT"); this.signal(control, action === "stop" ? "SIGINT" : "SIGTERM"); control.abort?.abort();
     return this.db.setItemStatus(itemId, action === "stop" ? "stopping" : "cancelling");
   }
@@ -371,6 +372,34 @@ export class DownloadQueue {
         fs.unlinkSync(temporary); temporary = encoded;
         checksum = await this.hashFile(temporary);
       }
+      // C3: a live recording that ended on its own with an almost-empty file is a fragment
+      // (the stream blipped or the capture opened to nothing), not a real clip. It is moved
+      // to recovery so the user can inspect it, and must NOT be cataloged as a finished
+      // download. A manual stop is intentional, so it is never treated as a fragment.
+      if (item.metadata.live === true && !control.manualStop) {
+        const minBytes = Number(this.db.getSettings().autoRecordMinBytes ?? 5 * 1024 * 1024);
+        const size = fs.existsSync(temporary) ? fs.statSync(temporary).size : 0;
+        if (minBytes > 0 && size > 0 && size < minBytes) {
+          this.db.setItemMetadata(item.id, { fragment: true });
+          const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
+          this.prepareOutputDirectory(recoveryDirectory);
+          const target = this.availableDestination(path.join(recoveryDirectory, "recovered.mp4"), item.id);
+          fs.renameSync(temporary, target); temporary = "";
+          const relative = path.relative(this.mediaRoot, target);
+          const sidecar = {
+            itemId: item.id, title: item.title ?? item.id,
+            performer: item.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
+            source: item.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
+            duration: 0, width: 0, height: 0, size, recoveredAt: new Date().toISOString(), avsyncDelta: 0, fragment: true,
+          };
+          fs.writeFileSync(path.join(recoveryDirectory, "recovered.json"), JSON.stringify(sidecar, null, 2));
+          this.db.setItemStatus(item.id, "failed", { error: `Fragment recording (${size} bytes) moved to recovery`, checksum });
+          this.writeLog?.("info", "download", "Live recording flagged as fragment and moved to recovery", { itemId: item.id, size });
+          void Promise.resolve(this.onCompleted?.()).catch((error) => this.writeLog?.("warn", "library", "Library refresh after download failed", { error }));
+          return;
+        }
+      }
+
       await this.withFinalizeLock("output", async () => {
         const visual = await this.visualFingerprint(temporary, item.mediaType);
         const qualityScore = Math.max(item.qualityScore, visual?.qualityScore ?? 0);

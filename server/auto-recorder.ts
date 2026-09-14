@@ -8,7 +8,13 @@ import { freeBytes, recordingDiskGuard, type FreeSpaceProbe } from "./disk-space
 const ACTIVE_STATUSES = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
 // After a recording ends, wait before auto-starting another one for the same cam so a
 // flapping online/offline edge (or a stale cached snapshot) cannot trigger a loop.
-const COOLDOWN_MS = 10 * 60_000;
+// The base cooldown is configurable (autoRecordCooldownSeconds); the remaining constants
+// are graded escalations used when a recording ends abnormally or the cam flaps offline/online.
+const COOLDOWN_FALLBACK_MS = 120_000;
+const ABNORMAL_COOLDOWN_MS = 30_000;
+const FLAP_WINDOW_MS = 5 * 60_000;
+const FLAP_THRESHOLD = 3;
+const FLAP_COOLDOWN_MS = 10 * 60_000;
 // Settings bounds for the status-check interval (seconds).
 const INTERVAL = { min: 30, max: 3600, fallback: 60 };
 const LIVE_ITEM = /^(?:auto|manual)-live:([^:]+):/;
@@ -38,7 +44,10 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
   // goes offline so the next session is recorded again.
   const suppressed = new Set<string>();
   let running = false;
+  let stopped = false;
   let timer: NodeJS.Timeout | undefined;
+  // Timestamps of recent failed recordings per cam, used to detect flapping and escalate.
+  const quickFails = new Map<string, number[]>();
   // Tracks the disk guard so the log gets one line per transition, not one per tick.
   let diskPaused = false;
 
@@ -48,6 +57,14 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
     const raw = Number(db.getSettings().autoRecordCheckSeconds);
     if (!Number.isFinite(raw)) return INTERVAL.fallback;
     return Math.min(INTERVAL.max, Math.max(INTERVAL.min, raw));
+  };
+
+  // Configurable base cooldown between auto-recordings of the same cam. Falls back to
+  // COOLDOWN_FALLBACK_MS when unset, and is clamped so a huge value cannot stall the watcher.
+  const cooldownMs = (): number => {
+    const raw = Number(db.getSettings().autoRecordCooldownSeconds);
+    if (!Number.isFinite(raw) || raw < 0) return COOLDOWN_FALLBACK_MS;
+    return Math.min(3600_000, raw * 1000);
   };
 
   // Reconcile the in-memory active set with the DB on every tick: recordings that were
@@ -74,6 +91,7 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
       if (room) liveKeys.set(`${item.pluginId}:${room}`, item.id);
     }
     for (const [key, itemId] of liveKeys) if (!active.has(key)) active.set(key, { itemId });
+    const now = Date.now();
     for (const [key, entry] of [...active]) {
       if (liveKeys.has(key)) continue;
       active.delete(key);
@@ -83,10 +101,33 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
         log?.(`auto-record: recording ${entry.itemId} stopped by hand; ${key} stays paused until the room goes offline`);
         continue;
       }
-      cooldowns.set(key, Date.now() + COOLDOWN_MS);
-      log?.(`auto-record: recording ${entry.itemId} finished; ${key} enters cooldown`);
+      // Grade the cooldown by how the recording ended. A failed run is "abnormal": the
+      // stream likely blipped, so a short cooldown lets a quick recovery retry soon without
+      // hammering a cam that is genuinely offline. Repeated failures inside the flap window
+      // mean the room is flapping, so back off hard instead of churning restarts.
+      const ended = db.getItem(entry.itemId)?.status;
+      const failed = ended === "failed";
+      let until: number;
+      if (failed) {
+        const history = (quickFails.get(key) ?? []).filter((at) => now - at < FLAP_WINDOW_MS);
+        history.push(now);
+        quickFails.set(key, history);
+        if (history.length >= FLAP_THRESHOLD) {
+          until = now + FLAP_COOLDOWN_MS;
+          quickFails.delete(key);
+          log?.(`auto-record: ${key} failed ${history.length} times in ${FLAP_WINDOW_MS / 1000}s; backing off ${FLAP_COOLDOWN_MS / 1000}s`);
+        } else {
+          until = now + Math.min(cooldownMs(), ABNORMAL_COOLDOWN_MS);
+          log?.(`auto-record: recording ${entry.itemId} failed; ${key} enters a short cooldown`);
+        }
+      } else {
+        quickFails.delete(key);
+        until = now + cooldownMs();
+        log?.(`auto-record: recording ${entry.itemId} finished; ${key} enters cooldown`);
+      }
+      cooldowns.set(key, until);
     }
-    for (const [key, until] of cooldowns) if (until < Date.now() - COOLDOWN_MS) cooldowns.delete(key);
+    for (const [key, until] of cooldowns) if (until < now) cooldowns.delete(key);
   };
 
   const tick = async () => {
@@ -168,9 +209,10 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
   };
 
   const schedule = () => {
+    if (stopped) return;
     timer = setTimeout(async () => {
       await tick();
-      schedule();
+      if (!stopped) schedule();
     }, intervalSeconds() * 1000);
     timer.unref();
   };
@@ -190,7 +232,7 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
 
   schedule();
   return {
-    stop: () => { if (timer) clearTimeout(timer); },
+    stop: () => { stopped = true; if (timer) clearTimeout(timer); timer = undefined; },
     tick,
     suppress,
     clearSuppression,
