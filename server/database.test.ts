@@ -20,6 +20,15 @@ describe("Database", () => {
     expect(db.listLiveCamFavorites()).toEqual([]);
   });
 
+  it("truncates the write-ahead log without disturbing stored rows", () => {
+    const db = createDb();
+    db.setLiveCamFavorite("test.live", { camId: "alice-id", username: "Alice", pageUrl: "https://live.test/Alice" }, true);
+    expect(db.checkpoint()).toMatchObject({ busy: 0, log: expect.any(Number), checkpointed: expect.any(Number) });
+    // Truncating an already trimmed log is a no-op rather than an error.
+    expect(db.checkpoint()).toMatchObject({ busy: 0 });
+    expect(db.listLiveCamFavorites()).toMatchObject([{ username: "Alice" }]);
+  });
+
   it("defaults favorites to auto-record off and persists the toggle", () => {
     const db = createDb();
     db.setLiveCamFavorite("test.live", { camId: "alice-id", username: "Alice", pageUrl: "https://live.test/Alice" }, true);

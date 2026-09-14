@@ -790,6 +790,14 @@ const runRetention = () => {
 const retentionTimer = setInterval(runRetention, 60 * 60_000); retentionTimer.unref();
 setTimeout(runRetention, 60_000).unref();
 
+// P2: both SQLite files run in WAL mode, and a long-lived reader (an open SSE stream or a library
+// scan) stops SQLite from checkpointing on its own - which is why a 139KB database sat next to a
+// 4MB -wal sidecar. Truncate hourly so the sidecars stay bounded.
+const checkpointTimer = setInterval(() => {
+  const results = [["easyx.sqlite", db.checkpoint()], ["open-easyx-library.sqlite", libraryDb.checkpoint()]] as const;
+  for (const [name, result] of results) if (result?.busy) app.log.info({ database: name, ...result }, "SQLite WAL checkpoint deferred; the database stayed busy");
+}, 60 * 60_000); checkpointTimer.unref();
+
 const webRoot = path.resolve("dist/web");
 if (fs.existsSync(webRoot)) {
   await app.register(fastifyStatic, { root: webRoot });
@@ -812,7 +820,7 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; await queue.stop(); systemStats.stop(); autoRecorder.stop(); clearInterval(retentionTimer); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  shuttingDown = true; await queue.stop(); systemStats.stop(); autoRecorder.stop(); clearInterval(retentionTimer); clearInterval(checkpointTimer); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);

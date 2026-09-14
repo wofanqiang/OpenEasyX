@@ -148,6 +148,12 @@ export class LibraryDatabase {
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS playback_history_idx ON playback(last_viewed_at DESC)");
   }
 
+  // See Database#checkpoint: the library WAL grows the same way and needs the same trim.
+  checkpoint(): { busy: number; log: number; checkpointed: number } | undefined {
+    try { return this.sqlite.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number; log: number; checkpointed: number }; }
+    catch { return undefined; }
+  }
+
   close() {
     this.sqlite.close();
   }

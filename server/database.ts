@@ -57,6 +57,14 @@ export class Database {
     this.migrate();
   }
 
+  // WAL sidecars grow while any reader holds a snapshot open (streaming responses, library
+  // scans), so the file stopped shrinking and could dwarf the database itself. A TRUNCATE
+  // checkpoint in a quiet moment trims it; a busy database simply tries again next hour.
+  checkpoint(): { busy: number; log: number; checkpointed: number } | undefined {
+    try { return this.sqlite.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number; log: number; checkpointed: number }; }
+    catch { return undefined; }
+  }
+
   close() { this.sqlite.close(); }
 
   private migrate() {

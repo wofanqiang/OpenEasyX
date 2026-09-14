@@ -43,7 +43,9 @@ function useLiveOperation(endpoint: string) {
       } catch { /* The action itself reports API errors to the page. */ }
       finally { polling = false; }
     };
-    void poll(); const interval = window.setInterval(() => void poll(), 300);
+    // 300ms polling put roughly seven requests per second on the server for a progress bar that
+    // only ever moves in whole percent steps. One second is imperceptible and much quieter.
+    void poll(); const interval = window.setInterval(() => void poll(), 1000);
     return () => {
       disposed = true; window.clearInterval(interval);
       if (completionTimer.current !== undefined) window.clearTimeout(completionTimer.current);
