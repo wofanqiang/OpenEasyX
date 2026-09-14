@@ -13,8 +13,10 @@ import { outputSettings } from "../packages/output-settings.js";
 import { liveRecordingRequest } from "../packages/live-capture.js";
 import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
 import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
+import type { LogLevel } from "./log-store.js";
+import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
 
-type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean };
+type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean };
 
 // Concurrency lives in two independent pools. Downloads keep their historical range so the
 // setting keeps meaning what it always meant; recordings get their own, larger one because a
@@ -88,15 +90,40 @@ export class DownloadQueue {
     fs.mkdirSync(this.mediaRoot, { recursive: true });
     fs.mkdirSync(this.downloadsRoot, { recursive: true, mode: 0o700 });
     this.db.requeueInterruptedDownloads();
-    this.cleanupStaleDownloads();
+    const mode = reapModeFromEnv();
+    const protectedDirs = mode === "off"
+      ? new Set<string>()
+      : reapOrphans({
+          mode,
+          log: (level, scope, message, meta) => this.writeLog?.(level as LogLevel, scope, message, meta),
+        });
+    this.cleanupStaleDownloads(protectedDirs);
     this.timer = setInterval(() => void this.tick(), 1000);
     this.timer.unref();
     void this.tick();
   }
 
-  stop() {
-    if (this.timer) clearInterval(this.timer);
-    for (const control of this.active.values()) { this.signal(control, "SIGTERM"); control.abort?.abort(); }
+  stop(timeoutMs = Number(process.env.EASYX_STOP_REAP_MS ?? 25_000)) {
+    if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+    const controls = [...this.active.values()];
+    for (const control of controls) { this.signal(control, "SIGTERM"); control.abort?.abort(); }
+    const deadline = Date.now() + timeoutMs;
+    return Promise.all(controls.map((control) => this.waitForExit(control, deadline))).then(() => undefined);
+  }
+
+  /** Wait for a child to exit, escalating SIGTERM -> SIGKILL if it outlives the grace window.
+   *  Detached ffmpeg reparents to init when node dies, so we MUST confirm exit before the
+   *  process leaves or the capture keeps running (and writing to a deleted dir) forever. */
+  private async waitForExit(control: ActiveDownload, deadline: number): Promise<void> {
+    const exit = control.closed;
+    if (!exit) return;
+    const remaining = Math.max(0, deadline - Date.now());
+    await Promise.race([exit, new Promise<void>((resolve) => setTimeout(resolve, remaining))]);
+    const child = control.child;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      this.signal(control, "SIGKILL");
+      await exit.catch(() => {});
+    }
   }
 
   pause(itemId: string) {
@@ -453,14 +480,16 @@ export class DownloadQueue {
     }
   }
 
-  private cleanupStaleDownloads() {
+  private cleanupStaleDownloads(protectedDirs: Set<string> = new Set()) {
     try {
       const root = this.downloadsRoot;
       if (!fs.existsSync(root)) return;
       for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
         if (!entry.isDirectory()) continue;
         if (this.active.has(entry.name)) continue;
-        fs.rmSync(path.join(root, entry.name), { recursive: true, force: true });
+        const full = path.resolve(root, entry.name);
+        if (protectedDirs.has(full)) continue;
+        fs.rmSync(full, { recursive: true, force: true });
       }
     } catch { /* Best-effort startup cleanup; never blocks startup. */ }
   }
@@ -509,6 +538,7 @@ export class DownloadQueue {
         : args;
       const child = spawn(command, effectiveArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
+      control.closed = new Promise<void>((resolve) => child.once("close", resolve));
       if (control.paused) this.signal(control, "SIGSTOP");
       if (control.action) this.signal(control, control.action === "stop" ? "SIGINT" : "SIGTERM");
       let output = ""; let progressOutput = ""; let settled = false;

@@ -21,6 +21,8 @@ services:
     # NOTE: no `pull_policy: always` — it would re-pull a remote tag and
     # silently discard the locally built image on every `up`.
     container_name: open-easyx
+    # Give the shutdown handler time to SIGTERM->SIGKILL detached ffmpeg before Docker SIGKILLs the container.
+    stop_grace_period: 60s
     restart: unless-stopped
     ports:
       - "3210:3210"
