@@ -118,9 +118,46 @@ describe("public live-cam discovery paging", () => {
         runCommand: async () => available ? { exitCode: 0, stdout: html, stderr: "" } : { exitCode: 1, stdout: "", stderr: "temporary timeout" },
       };
       await expect(listDiscoveredLiveCams(context, "cam4", { page: 1, pageSize: 24 })).resolves.toMatchObject({ total: 1 });
-      available = false; vi.advanceTimersByTime(91_000);
+      available = false; vi.advanceTimersByTime(181_000); // Past the 180s catalogue TTL.
       await expect(listDiscoveredLiveCams(context, "cam4", { page: 1, pageSize: 24 })).resolves.toMatchObject({ total: 1, cams: [{ username: "alice" }] });
       expect(context.log).toHaveBeenCalledWith("warn", expect.stringContaining("last successful snapshot"), "temporary timeout");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("pages the Stripchat rooms already collected instead of failing when a later batch breaks", async () => {
+    const models = Array.from({ length: 125 }, (_, index) => ({ id: index + 1, username: `partial-${index + 1}`, status: "public", viewersCount: 2, broadcastGender: "male" }));
+    let calls = 0;
+    const fetch = vi.fn(async () => {
+      calls += 1;
+      if (calls > 1) throw new Error("socket hang up");
+      return new Response(JSON.stringify({ models: models.slice(0, 60) }), { status: 200 });
+    });
+    const context = { config: {}, fetch, log: vi.fn(), runCommand: vi.fn() };
+    const page = await listDiscoveredLiveCams(context, "stripchat", { page: 1, pageSize: 24, gender: "male" });
+    expect(page).toMatchObject({ total: 60, pages: 3 });
+    expect(page.cams).toHaveLength(24);
+    expect(context.log).toHaveBeenCalledWith("warn", expect.stringContaining("partial snapshot"), "socket hang up");
+  });
+
+  it("serves the previous Stripchat snapshot while a slow catalogue sweep refreshes in the background", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const models = Array.from({ length: 30 }, (_, index) => ({ id: index + 1, username: `warm-${index + 1}`, status: "public", viewersCount: 1, broadcastGender: "couple" }));
+      const cold = { config: {}, fetch: vi.fn(async () => new Response(JSON.stringify({ models }), { status: 200 })), log: vi.fn(), runCommand: vi.fn() };
+      await expect(listDiscoveredLiveCams(cold, "stripchat", { page: 1, pageSize: 24, gender: "couple" })).resolves.toMatchObject({ total: 30 });
+      expect(cold.fetch).toHaveBeenCalledTimes(1);
+      // Five minutes later the snapshot is stale but still inside the grace window: the cached
+      // rooms must come back without waiting for the sweep, however slow that sweep is.
+      vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
+      const sweep = vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        return new Response(JSON.stringify({ models: models.slice(0, 1) }), { status: 200 });
+      });
+      const warm = { config: {}, fetch: sweep, log: vi.fn(), runCommand: vi.fn() };
+      await expect(listDiscoveredLiveCams(warm, "stripchat", { page: 1, pageSize: 24, gender: "couple" })).resolves.toMatchObject({ total: 30 });
+      expect(sweep).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5_001);
     } finally { vi.useRealTimers(); }
   });
 });

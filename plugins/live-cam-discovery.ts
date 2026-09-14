@@ -7,6 +7,20 @@ const cache = new Map<string, { expiresAt: number; cams: LiveCam[] }>();
 const stripchatLoads = new Map<string, Promise<LiveCam[]>>();
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36";
 
+// Stripchat has no bulk live endpoint: its catalogue is walked 60 rooms at a time through an
+// exclusion cursor, so a complete sweep costs up to 100 sequential requests. On a slow host that
+// is tens of seconds, which used to block the Live Cam page behind its own deadlock guard. Cap a
+// sweep, page whatever arrived, and serve the previous snapshot instantly while a refresh runs.
+const STRIPCHAT_BATCH_SIZE = 60;
+const STRIPCHAT_BATCH_LIMIT = 100;
+const STRIPCHAT_REQUEST_TIMEOUT_MS = 20_000;
+const STRIPCHAT_CRAWL_BUDGET_MS = 20_000;
+const CATALOGUE_TTL_MS = 180_000;
+// A snapshot keeps being served instantly for this long past its freshness window, so a slow or
+// failing refresh never blocks a render. Past the grace period we wait instead of showing a
+// catalogue that could be hours old.
+const CATALOGUE_STALE_GRACE_MS = 300_000;
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -265,17 +279,33 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
   const load = async () => {
     const url = "https://stripchat.com/api/front/v2/models/get-list";
     const models = new Map<string, Record<string, unknown>>();
-    const batchSize = 60;
-    for (let batch = 0; batch < 100; batch += 1) {
-      const response = await context.fetch(url, {
-        method: "POST",
-        headers: { accept: "application/json", "content-type": "application/json", origin: "https://stripchat.com", referer: `https://stripchat.com/${primaryTag}`, "user-agent": USER_AGENT },
-        body: JSON.stringify({ primaryTag, limit: batchSize, topLimit: batchSize, blockId: "topStreamsModels", blockUrl: "", excludeModelIds: [...models.values()].map((item) => item.id) }),
-        signal: context.signal ?? AbortSignal.timeout(20_000),
-      });
-      if (!response.ok) throw new Error(`Stripchat live rooms returned HTTP ${response.status}`);
-      const payload = record(await response.json());
-      const pageModels = Array.isArray(payload?.models) ? payload.models.map(record).filter((item): item is Record<string, unknown> => Boolean(item)) : [];
+    const deadline = Date.now() + STRIPCHAT_CRAWL_BUDGET_MS;
+    for (let batch = 0; batch < STRIPCHAT_BATCH_LIMIT; batch += 1) {
+      const remaining = deadline - Date.now();
+      // Page the rooms collected so far rather than letting one slow sweep stall the caller for a
+      // minute. The caller merges this with the previous snapshot, so a short page is harmless.
+      if (batch > 0 && remaining <= 0) {
+        context.log("warn", `Stripchat live catalogue stopped at its ${STRIPCHAT_CRAWL_BUDGET_MS}ms budget with ${models.size} rooms loaded`);
+        break;
+      }
+      let pageModels: Record<string, unknown>[];
+      try {
+        const response = await context.fetch(url, {
+          method: "POST",
+          headers: { accept: "application/json", "content-type": "application/json", origin: "https://stripchat.com", referer: `https://stripchat.com/${primaryTag}`, "user-agent": USER_AGENT },
+          body: JSON.stringify({ primaryTag, limit: STRIPCHAT_BATCH_SIZE, topLimit: STRIPCHAT_BATCH_SIZE, blockId: "topStreamsModels", blockUrl: "", excludeModelIds: [...models.values()].map((item) => item.id) }),
+          // Never wait longer than the time left in the budget, so the sweep cannot overrun it.
+          signal: context.signal ?? AbortSignal.timeout(Math.max(1_000, Math.min(STRIPCHAT_REQUEST_TIMEOUT_MS, remaining > 0 ? remaining : STRIPCHAT_REQUEST_TIMEOUT_MS))),
+        });
+        if (!response.ok) throw new Error(`Stripchat live rooms returned HTTP ${response.status}`);
+        const payload = record(await response.json());
+        pageModels = Array.isArray(payload?.models) ? payload.models.map(record).filter((item): item is Record<string, unknown> => Boolean(item)) : [];
+      } catch (error) {
+        // A partial catalogue beats an error page: keep the batches that already arrived.
+        if (!models.size) throw error;
+        context.log("warn", `Stripchat live catalogue request failed after ${models.size} rooms; serving a partial snapshot`, error instanceof Error ? error.message : String(error));
+        break;
+      }
       let added = 0;
       for (const item of pageModels) {
         const username = text(item.username ?? item.login); const modelId = whole(item.id);
@@ -283,7 +313,7 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
         const key = String(modelId);
         if (!models.has(key)) { models.set(key, item); added += 1; }
       }
-      if (!added || pageModels.length < batchSize) break;
+      if (!added || pageModels.length < STRIPCHAT_BATCH_SIZE) break;
     }
     return stripchatLiveCams({ models: [...models.values()] });
   };
@@ -295,16 +325,25 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
   // Stripchat's initial multi-block endpoint exposes only a few featured rows.
   // Its own infinite catalogue uses get-list with an exclusion cursor. Its
   // totalCount is capped at 2,000 even when thousands more live rooms remain,
-  // so continue until the provider returns a short or empty batch. Loading the
-  // complete snapshot before paging it locally also keeps viewer
+  // so continue until the provider returns a short or empty batch - capped by
+  // STRIPCHAT_CRAWL_BUDGET_MS so one slow sweep cannot block a page render.
+  // Loading the snapshot before paging it locally also keeps viewer
   // reordering from moving rooms between pages while somebody navigates.
   const cacheKey = `stripchat:${primaryTag}`; const cached = cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return filteredPage(cached.cams, query);
-  try {
+  const refresh = () => {
     const operation = stripchatLoads.get(cacheKey) ?? load().finally(() => stripchatLoads.delete(cacheKey));
     stripchatLoads.set(cacheKey, operation);
-    const cams = await operation; cache.set(cacheKey, { cams, expiresAt: Date.now() + 90_000 });
-    return filteredPage(cams, query);
+    return operation.then((cams) => { cache.set(cacheKey, { cams, expiresAt: Date.now() + CATALOGUE_TTL_MS }); return cams; });
+  };
+  if (cached && cached.expiresAt > Date.now()) return filteredPage(cached.cams, query);
+  // Serve the previous snapshot immediately and refresh it in the background: a catalogue sweep is
+  // far slower than the page's own refresh interval, so waiting on it would stall every render.
+  if (cached?.cams.length && Date.now() < cached.expiresAt + CATALOGUE_STALE_GRACE_MS) {
+    void refresh().catch((error) => context.log("warn", "Stripchat live catalogue background refresh failed", error instanceof Error ? error.message : String(error)));
+    return filteredPage(cached.cams, query);
+  }
+  try {
+    return filteredPage(await refresh(), query);
   } catch (error) {
     if (cached?.cams.length) {
       context.log("warn", "Stripchat live catalogue refresh failed; serving the last successful snapshot", error instanceof Error ? error.message : String(error));
@@ -341,7 +380,7 @@ async function loadProvider(context: PluginContext, provider: Exclude<LiveCamDis
     else if (provider === "livejasmin") cams = livejasminLiveCams(await browserHtml(context, "https://www.livejasmin.com/en/girls"));
     else if (provider === "twitch") cams = twitchLiveCams(await renderedBrowserHtml(context, "https://www.twitch.tv/directory/all"));
     else cams = xcamsLiveCams(await browserHtml(context, "https://www.xcams.com/"));
-    cache.set(provider, { cams, expiresAt: Date.now() + 90_000 }); return cams;
+    cache.set(provider, { cams, expiresAt: Date.now() + CATALOGUE_TTL_MS }); return cams;
   } catch (error) {
     if (cached?.cams.length) {
       context.log("warn", `${provider} live catalogue refresh failed; serving the last successful snapshot`, error instanceof Error ? error.message : String(error));
