@@ -285,7 +285,7 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
       // Page the rooms collected so far rather than letting one slow sweep stall the caller for a
       // minute. The caller merges this with the previous snapshot, so a short page is harmless.
       if (batch > 0 && remaining <= 0) {
-        context.log("warn", `Stripchat live catalogue stopped at its ${STRIPCHAT_CRAWL_BUDGET_MS}ms budget with ${models.size} rooms loaded`);
+        context.log("info", `Stripchat live catalogue stopped at its ${STRIPCHAT_CRAWL_BUDGET_MS}ms budget with ${models.size} rooms loaded`);
         break;
       }
       let pageModels: Record<string, unknown>[];
