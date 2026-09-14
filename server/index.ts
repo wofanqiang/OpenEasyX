@@ -793,10 +793,14 @@ setTimeout(runRetention, 60_000).unref();
 // P2: both SQLite files run in WAL mode, and a long-lived reader (an open SSE stream or a library
 // scan) stops SQLite from checkpointing on its own - which is why a 139KB database sat next to a
 // 4MB -wal sidecar. Truncate hourly so the sidecars stay bounded.
-const checkpointTimer = setInterval(() => {
+const runCheckpoint = () => {
   const results = [["easyx.sqlite", db.checkpoint()], ["open-easyx-library.sqlite", libraryDb.checkpoint()]] as const;
   for (const [name, result] of results) if (result?.busy) app.log.info({ database: name, ...result }, "SQLite WAL checkpoint deferred; the database stayed busy");
-}, 60 * 60_000); checkpointTimer.unref();
+};
+const checkpointTimer = setInterval(runCheckpoint, 60 * 60_000); checkpointTimer.unref();
+// Also run shortly after boot: a container that is redeployed more often than hourly would
+// otherwise never checkpoint, which is how a 139KB database kept a 4MB -wal sidecar around.
+setTimeout(runCheckpoint, 5 * 60_000).unref();
 
 const webRoot = path.resolve("dist/web");
 if (fs.existsSync(webRoot)) {
