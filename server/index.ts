@@ -17,7 +17,7 @@ import { BrowserLoginManager } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
 import { LiveCamImages } from "./live-cam-images.js";
 import { LiveCamService } from "./live-cams.js";
-import { HlsProxy } from "./hls-proxy.js";
+import { HlsProxy, isLiveProxyPath } from "./hls-proxy.js";
 import { SystemStatsService } from "./system-stats.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
 import { LibraryDatabase } from "./library-database.js";
@@ -120,6 +120,9 @@ app.addHook("onRequest", (request, reply, done) => {
   const path = new URL(request.url, "http://localhost").pathname;
   // Endpoints that must work without a session.
   if (path === "/api/auth/login" || path === "/api/auth/me" || path === "/api/health" || path === "/api/version") return done();
+  // Live streams are recorded by ffmpeg inside this process, which has no cookie, so the
+  // proxy route is reached by capability URL instead of by session. See `isLiveProxyPath`.
+  if (isLiveProxyPath(path)) return done();
   // Static assets and the internal browser proxy are served without authentication so the SPA shell can render.
   if (!path.startsWith("/api/")) return done();
   if (!auth.verifySession(sessionCookie(request))) return reply.status(401).send({ error: "unauthorized" });

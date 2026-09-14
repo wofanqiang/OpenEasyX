@@ -25,6 +25,22 @@ type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>
 
 const ENTRY_TTL_MS = 15 * 60_000;
 const PLAYLIST_MIME = "application/vnd.apple.mpegurl";
+/**
+ * Route prefix the proxy lives behind. Recorded here rather than only in the router because
+ * the recorder has to reach it *without* a login session — see `isLiveProxyPath`.
+ */
+export const LIVE_PROXY_PREFIX = "/api/live-cams/proxy/";
+/**
+ * True for the proxy route, which is deliberately reachable without a session.
+ *
+ * ffmpeg runs inside the server process and has no cookie, so a gate here would make every
+ * proxied recording fail with a 401. That is safe because the token in the path is a 192-bit
+ * random value that only ever reaches a client who already resolved the stream, and entries
+ * expire: possession of the URL *is* the authorisation, exactly as it is for the player.
+ */
+export function isLiveProxyPath(path: string): boolean {
+  return path.startsWith(LIVE_PROXY_PREFIX);
+}
 // Low-latency HLS clients ask for a specific media sequence/part; forward them or the
 // upstream answers with an older window than the client asked for.
 const FORWARDED_QUERY = ["_HLS_msn", "_HLS_part", "_HLS_skip"];
@@ -59,7 +75,7 @@ export class HlsProxy {
   body(content: string, suffix: string): string {
     const token = randomBytes(24).toString("base64url");
     this.entries.set(token, { body: content, headers: {}, expiresAt: Date.now() + ENTRY_TTL_MS });
-    return `/api/live-cams/proxy/${token}${suffix}`;
+    return `${LIVE_PROXY_PREFIX}${token}${suffix}`;
   }
 
   /**
@@ -73,12 +89,12 @@ export class HlsProxy {
     const existing = existingToken ? this.entries.get(existingToken) : undefined;
     if (existing && existing.expiresAt > Date.now()) {
       existing.expiresAt = Date.now() + ENTRY_TTL_MS;
-      return `/api/live-cams/proxy/${existingToken}${suffix}`;
+      return `${LIVE_PROXY_PREFIX}${existingToken}${suffix}`;
     }
     const token = randomBytes(24).toString("base64url");
     this.entries.set(token, { url: target, headers, decodeKey, expiresAt: Date.now() + ENTRY_TTL_MS });
     this.reverse.set(key, token);
-    return `/api/live-cams/proxy/${token}${suffix}`;
+    return `${LIVE_PROXY_PREFIX}${token}${suffix}`;
   }
 
   async serve(tokenPath: string, reply: FastifyReply, query: Record<string, unknown> = {}, range?: string) {
