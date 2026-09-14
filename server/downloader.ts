@@ -25,6 +25,13 @@ const DEFAULT_MAX_DOWNLOADS = 2;
 const MAX_DOWNLOADS = 8;
 const DEFAULT_MAX_RECORDINGS = 8;
 const MAX_RECORDINGS = 32;
+// A stale staging directory that still holds media is worth rescuing (A10); anything else
+// in .downloads is scaffolding (sidecars, empty dirs) and is simply removed.
+const MEDIA_EXTENSIONS = new Set([".ts", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".mp3", ".m4a", ".jpg", ".jpeg", ".png", ".webp"]);
+// The recovery area must not grow without bound (P3): cap it by entries and bytes and evict
+// the oldest directories first when a move would exceed either.
+const RECOVERY_MAX_ENTRIES = 50;
+const RECOVERY_MAX_BYTES = 20 * 1024 ** 3;
 
 /** Clamp a configured concurrency value into the range the pool can serve. */
 export function concurrentLimit(value: unknown, fallback: number, max: number): number {
@@ -518,9 +525,59 @@ export class DownloadQueue {
         if (this.active.has(entry.name)) continue;
         const full = path.resolve(root, entry.name);
         if (protectedDirs.has(full)) continue;
-        fs.rmSync(full, { recursive: true, force: true });
+        // Deletion used to be unconditional (A10), which threw away recordings a restart
+        // had interrupted mid-write. Directories that actually hold media are moved to the
+        // recovery area instead; scaffolding without media is still just removed.
+        if (this.containsMedia(full)) this.moveToRecovery(full, entry.name);
+        else fs.rmSync(full, { recursive: true, force: true });
       }
     } catch { /* Best-effort startup cleanup; never blocks startup. */ }
+  }
+
+  private containsMedia(directory: string): boolean {
+    try {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        if (!MEDIA_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+        try { if (fs.statSync(path.join(directory, entry.name)).size > 0) return true; } catch { /* vanished mid-scan */ }
+      }
+    } catch { /* unreadable: treat as no media */ }
+    return false;
+  }
+
+  private moveToRecovery(source: string, name: string) {
+    const target = path.join(this.recoveryRoot, `${name}-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+    try {
+      this.prepareOutputDirectory(this.recoveryRoot);
+      fs.renameSync(source, target);
+      this.writeLog?.("warn", "download", "Moved a stale recording from the staging area to recovery", { directory: name });
+      this.enforceRecoveryCap();
+    } catch (error) {
+      // Same mount, so rename should not fail; leave the directory in place rather than
+      // deleting data the move could have saved.
+      this.writeLog?.("warn", "download", "Could not move a stale recording to recovery; left in place", { directory: name, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private enforceRecoveryCap() {
+    try {
+      const entries = fs.readdirSync(this.recoveryRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => {
+          const full = path.join(this.recoveryRoot, entry.name);
+          return { full, mtime: fs.statSync(full).mtimeMs, bytes: this.directoryBytes(full) };
+        });
+      let bytes = entries.reduce((total, entry) => total + entry.bytes, 0);
+      entries.sort((left, right) => left.mtime - right.mtime);
+      while (entries.length > RECOVERY_MAX_ENTRIES || (bytes > RECOVERY_MAX_BYTES && entries.length > 0)) {
+        const oldest = entries.shift()!;
+        try {
+          fs.rmSync(oldest.full, { recursive: true, force: true });
+          bytes -= oldest.bytes;
+          this.writeLog?.("warn", "download", "Recovery area is over its cap; evicted the oldest rescued directory", { directory: path.basename(oldest.full) });
+        } catch { break; }
+      }
+    } catch { /* best-effort */ }
   }
 
   private get downloadsRoot() { return path.join(this.mediaRoot, ".downloads"); }
@@ -582,10 +639,12 @@ export class DownloadQueue {
         if (Number.isFinite(downloadedBytes) && downloadedBytes > 0) reportProgress(expectedBytes > 0 ? downloadedBytes / expectedBytes : undefined, downloadedBytes);
       };
       child.stdout.on("data", remember); child.stderr.on("data", remember);
+      // Command extractors report progress on stdout; this poll is only a fallback for
+      // silent ones, so a 1.5s cadence is plenty and keeps the directory scan cheap (A2).
       const poll = setInterval(() => {
         const downloadedBytes = this.directoryBytes(outputDirectory);
         if (downloadedBytes > 0) reportProgress(expectedBytes ? downloadedBytes / expectedBytes : undefined, downloadedBytes);
-      }, 250); poll.unref();
+      }, 1500); poll.unref();
       const finish = (error?: Error) => { if (settled) return; settled = true; clearInterval(poll); error ? reject(error) : resolve(); };
       child.once("error", (error) => finish(error));
       child.once("close", (code) => {
@@ -596,11 +655,12 @@ export class DownloadQueue {
     });
   }
 
+  // Size of a staging directory, one level deep: command extractors write flat into their
+  // output directory, so the fallback poll never needs a recursive walk (A2).
   private directoryBytes(directory: string): number {
     try {
       return fs.readdirSync(directory, { withFileTypes: true }).reduce((total, entry) => {
         const target = path.join(directory, entry.name);
-        if (entry.isDirectory()) return total + this.directoryBytes(target);
         if (!entry.isFile()) return total;
         try { return total + fs.statSync(target).size; } catch { return total; }
       }, 0);
