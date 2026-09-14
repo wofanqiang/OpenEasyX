@@ -24,6 +24,7 @@ import { Catalog } from "./catalog.js";
 import { registerLibraryRoutes, parseMediaRange } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
+import { retentionPlan } from "./retention.js";
 import { isLiveCandidate } from "../packages/live-capture.js";
 import { AuthService } from "./auth.js";
 import type { FastifyRequest, FastifyReply } from "fastify";
@@ -768,6 +769,27 @@ setInterval(() => {
   }
 }, 1000).unref();
 
+// C1 retention pass, hourly. With the default dry-run it only logs what has outlived the
+// configured retention window; EASYX_RETENTION_DRY_RUN=false turns it into real deletions.
+const retentionDryRun = process.env.EASYX_RETENTION_DRY_RUN !== "false";
+const runRetention = () => {
+  try {
+    const report = retentionPlan({ db, mediaRoot: mediaDir, dryRun: retentionDryRun });
+    if (report.retentionDays < 1) return;
+    for (const candidate of report.candidates) {
+      app.log.info({ itemId: candidate.itemId, path: candidate.relativePath, ageDays: candidate.ageDays, bytes: candidate.bytes },
+        `retention ${report.dryRun ? "dry-run would delete" : "deleting"} ${candidate.relativePath} (${report.retentionDays}d limit)`);
+    }
+    for (const entry of report.skipped) app.log.warn({ itemId: entry.itemId, path: entry.relativePath, reason: entry.reason }, "retention skipped an entry");
+    for (const entry of report.failed) app.log.error({ path: entry.candidate.relativePath, error: entry.error }, "retention failed to delete a file");
+    if (report.deleted.length) void catalog.scan().catch((error) => app.log.error(error, "Library scan after retention cleanup failed"));
+  } catch (error) {
+    app.log.error(error, "Retention pass failed");
+  }
+};
+const retentionTimer = setInterval(runRetention, 60 * 60_000); retentionTimer.unref();
+setTimeout(runRetention, 60_000).unref();
+
 const webRoot = path.resolve("dist/web");
 if (fs.existsSync(webRoot)) {
   await app.register(fastifyStatic, { root: webRoot });
@@ -790,7 +812,7 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; await queue.stop(); systemStats.stop(); autoRecorder.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  shuttingDown = true; await queue.stop(); systemStats.stop(); autoRecorder.stop(); clearInterval(retentionTimer); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);
