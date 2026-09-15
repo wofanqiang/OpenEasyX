@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import type HlsInstance from "hls.js";
-import { AlertTriangle, ArrowLeft, Download, Eye, LoaderCircle, Maximize, Minimize, Pause, Play, Radio, RefreshCw, Search, Server, Star, UserPlus, Users, Volume2, VolumeX } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Check, Download, Eye, LoaderCircle, Maximize, Minimize, Pause, Play, Radio, RefreshCw, Search, Server, Star, UserPlus, Users, Volume2, VolumeX } from "lucide-react";
 import { api } from "./api";
 import { loadPlayerAudio, savePlayerAudio } from "./player-audio";
 import { monitorVideoStalls } from "./video-stall-recovery";
@@ -11,7 +11,7 @@ import "./live-player.css";
 
 export type LiveCam = {
   id: string; username: string; title?: string; pageUrl: string; thumbnailUrl?: string; viewers?: number; age?: number; gender?: string; tags?: string[];
-  providerId: string; providerName: string; favorite?: boolean; online?: boolean; performerId?: string; statusUnavailable?: boolean;
+  providerId: string; providerName: string; favorite?: boolean; online?: boolean; performerId?: string; autoRecord?: boolean; statusUnavailable?: boolean;
 };
 type LiveCamFavorite = Pick<LiveCam, "providerId" | "id" | "username" | "title" | "pageUrl" | "thumbnailUrl">;
 type Provider = { id: string; name: string; ok: boolean; count: number; pending?: boolean; error?: string; warning?: string };
@@ -211,22 +211,49 @@ export function LiveCamFavoriteButton({ cam }: { cam: LiveCam }) {
   return <>{<button className={`quiet live-favorite-button${favorite ? " active" : ""}`} onClick={() => void toggle()} disabled={saving} aria-pressed={favorite}><Star fill={favorite ? "currentColor" : "none"}/>{saving ? "Saving…" : favorite ? "Favorited" : "Favorite creator"}</button>}{favoriteError && <p className="row-error" role="alert">{favoriteError}</p>}</>;
 }
 
-export function LiveCamPerformerButton({ cam }: { cam: LiveCam }) {
-  const [saving, setSaving] = useState(false); const [performerId, setPerformerId] = useState(cam.performerId ?? ""); const [performerError, setPerformerError] = useState("");
-  useEffect(() => setPerformerId(cam.performerId ?? ""), [cam.performerId]);
+export function LiveCamPerformerButton({ cam, performerId, onPerformer }: { cam: LiveCam; performerId?: string; onPerformer?: (performerId: string) => void }) {
+  const [localId, setLocalId] = useState(cam.performerId ?? "");
+  useEffect(() => setLocalId(cam.performerId ?? ""), [cam.performerId]);
+  // The watch page owns the identity so a performer created by the auto-record switch is
+  // reflected here too, without either action having to reload the cam.
+  const linked = performerId ?? localId;
+  const [saving, setSaving] = useState(false); const [performerError, setPerformerError] = useState("");
   const create = async () => {
-    if (saving || performerId) return;
+    if (saving || linked) return;
     setSaving(true); setPerformerError("");
     try {
       const result = await api<{ performer: { id: string } }>("/api/live-cams/performer", { method: "POST", body: JSON.stringify({ providerId: cam.providerId, cam }) });
-      setPerformerId(result.performer.id);
+      setLocalId(result.performer.id); onPerformer?.(result.performer.id);
     } catch (reason) { setPerformerError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setSaving(false); }
   };
-  return <>{performerId
-    ? <a className="quiet" href={`/performers?performer=${encodeURIComponent(performerId)}`}><UserPlus/>Manage performer</a>
+  return <>{linked
+    ? <a className="quiet" href={`/performers?performer=${encodeURIComponent(linked)}`}><UserPlus/>Manage performer</a>
     : <button className="quiet" onClick={() => void create()} disabled={saving}><UserPlus/>{saving ? "Creating…" : "Add performer"}</button>}
     {performerError && <p className="row-error">{performerError}</p>}</>;
+}
+
+// Auto-record is a performer setting, so this switch never asks for a favorite. Turning it on for
+// a creator that is not in the directory yet adds them as a performer first: being added is what
+// makes someone recordable, and the live-cam favorite stays an optional convenience.
+export function LiveCamAutoRecordButton({ cam, performerId, onPerformer }: { cam: LiveCam; performerId?: string; onPerformer?: (performerId: string) => void }) {
+  const [armed, setArmed] = useState(Boolean(cam.autoRecord)); const [saving, setSaving] = useState(false); const [autoRecordError, setAutoRecordError] = useState("");
+  useEffect(() => setArmed(Boolean(cam.autoRecord)), [cam.autoRecord, cam.id]);
+  const toggle = async () => {
+    if (saving) return;
+    const next = !armed; setSaving(true); setAutoRecordError("");
+    try {
+      let id = performerId ?? cam.performerId ?? "";
+      if (!id) {
+        const created = await api<{ performer: { id: string } }>("/api/live-cams/performer", { method: "POST", body: JSON.stringify({ providerId: cam.providerId, cam }) });
+        id = created.performer.id; onPerformer?.(id);
+      }
+      await api(`/api/performers/${id}/auto-record`, { method: "PATCH", body: JSON.stringify({ autoRecord: next }) });
+      setArmed(next);
+    } catch (reason) { setAutoRecordError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setSaving(false); }
+  };
+  return <>{<button className={`quiet live-auto-record-button${armed ? " active" : ""}`} onClick={() => void toggle()} disabled={saving} aria-pressed={armed} title="Record every live session for this creator"><Check size={14}/>{saving ? "Saving…" : armed ? "Auto-record on" : "Auto-record"}</button>}{autoRecordError && <p className="row-error" role="alert">{autoRecordError}</p>}</>;
 }
 
 export function LiveCamCard({ cam, open }: { cam: LiveCam; open: (cam: LiveCam) => void }) {
@@ -244,6 +271,10 @@ export function LiveCamCard({ cam, open }: { cam: LiveCam; open: (cam: LiveCam) 
 
 export function LiveCamViewer({ providerId, camId, close }: { providerId: string; camId: string; close: () => void }) {
   const [cam, setCam] = useState<LiveCam | null>(null); const [error, setError] = useState("");
+  // Shared by the performer and auto-record actions so creating a performer through either one
+  // updates both, and so a reloaded cam restores the identity from the server.
+  const [performerId, setPerformerId] = useState("");
+  useEffect(() => { setPerformerId(cam?.performerId ?? ""); }, [cam?.performerId]);
   useEffect(() => {
     const controller = new AbortController(); setCam(null); setError("");
     void api<LiveCam>(`/api/live-cams/${encodeURIComponent(providerId)}/${encodeURIComponent(camId)}`, { signal: controller.signal })
@@ -256,7 +287,7 @@ export function LiveCamViewer({ providerId, camId, close }: { providerId: string
   return <article className="watch-page live-watch-page">
     <section className="theater-stage"><LivePlayer cam={cam} close={close}/></section>
     <section className="watch-info">
-      <div className="watch-heading"><div><span className="watch-eyebrow">LIVE · {cam.providerName}</span><h1>{cam.username}</h1><p>{cam.title && cam.title !== cam.username ? cam.title : "Public live broadcast"}</p></div><div className="watch-actions"><LiveCamPerformerButton cam={cam}/><LiveCamFavoriteButton cam={cam}/><LiveCamRecordButton cam={cam}/><button className="quiet" onClick={close}><ArrowLeft/>Back to Live Cam</button></div></div>
+      <div className="watch-heading"><div><span className="watch-eyebrow">LIVE · {cam.providerName}</span><h1>{cam.username}</h1><p>{cam.title && cam.title !== cam.username ? cam.title : "Public live broadcast"}</p></div><div className="watch-actions"><LiveCamPerformerButton cam={cam} performerId={performerId} onPerformer={setPerformerId}/><LiveCamAutoRecordButton cam={cam} performerId={performerId} onPerformer={setPerformerId}/><LiveCamFavoriteButton cam={cam}/><LiveCamRecordButton cam={cam}/><button className="quiet" onClick={close}><ArrowLeft/>Back to Live Cam</button></div></div>
       <div className="watch-meta"><span className="live-meta-on-air"><Radio/>ON AIR</span><span><Eye/>{Number(cam.viewers ?? 0).toLocaleString()} viewers</span><span><Radio/>{cam.providerName}</span>{cam.age ? <span>{cam.age} years old</span> : null}</div>
       {cam.tags?.length ? <div className="live-watch-tags">{cam.tags.slice(0, 12).map((tag) => <span key={tag}>#{tag}</span>)}</div> : null}
     </section>

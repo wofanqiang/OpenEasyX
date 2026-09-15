@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LiveCamCard, LiveCamFavoriteButton, LiveCamPerformerButton, LiveCamRecordButton, LiveCamUnavailable, LivePlayer, liveCamListUrl, liveCamPresetFromSearch, liveCamUrl, markLiveCamInterrupted, mergeLiveCamRefresh, shouldRecoverNativeLiveMediaError } from "./LiveCamPage";
+import { LiveCamAutoRecordButton, LiveCamCard, LiveCamFavoriteButton, LiveCamPerformerButton, LiveCamRecordButton, LiveCamUnavailable, LivePlayer, liveCamListUrl, liveCamPresetFromSearch, liveCamUrl, markLiveCamInterrupted, mergeLiveCamRefresh, shouldRecoverNativeLiveMediaError } from "./LiveCamPage";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -53,6 +53,14 @@ describe("Live Cam availability", () => {
     expect(html).toContain("Manage performer");
     expect(html).toContain("/performers?performer=person-alice");
     expect(html).not.toContain("Add performer");
+  });
+
+  it("offers a performer-level auto-record switch outside the favorite flow", () => {
+    const base = { id: "alice", username: "alice", pageUrl: "https://live.test/alice", providerId: "test.live", providerName: "Test Live" };
+    const off = renderToStaticMarkup(<LiveCamAutoRecordButton cam={base}/>);
+    expect(off).toContain("Auto-record"); expect(off).toContain('aria-pressed="false"');
+    const on = renderToStaticMarkup(<LiveCamAutoRecordButton cam={{ ...base, autoRecord: true }}/>);
+    expect(on).toContain("Auto-record on"); expect(on).toContain('aria-pressed="true"');
   });
 
   it("offers a persistent creator favorite action", () => {

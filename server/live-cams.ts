@@ -103,7 +103,9 @@ export class LiveCamService {
     const { performerId: _previousPerformerId, ...unlinkedCam } = cam;
     const performer = this.findPerformer(cam.providerId, cam, performers);
     if (performer) this.saveImage?.(cam.providerId, cam, performer);
-    return { ...unlinkedCam, ...(performer ? { performerId: performer.id } : {}) };
+    // Auto-record belongs to the performer, so a linked cam reports the switch the user actually
+    // flips instead of the legacy favorite flag the provider list seeds it with.
+    return { ...unlinkedCam, autoRecord: performer ? performer.autoRecord : cam.autoRecord, ...(performer ? { performerId: performer.id } : {}) };
   }
 
   private livePlugins(providerId?: string) {
@@ -380,8 +382,16 @@ export class LiveCamService {
     return this.db.listLiveCamFavorites();
   }
 
+  // Auto-record used to live on the favorite. It belongs to the performer now, so this legacy
+  // entry point also arms whoever owns that favorite; the favorite column stays in sync for the
+  // boot-time adoption pass, and a favorite with no owner is left for it to report.
   setFavoriteAutoRecord(providerId: string, username: string, autoRecord: boolean): LiveCamFavorite | undefined {
-    return this.db.setLiveCamFavoriteAutoRecord(providerId, username, autoRecord);
+    const key = `${providerId}:${username.trim().toLowerCase()}`;
+    const owner = this.db.listPerformers().find((performer) => this.performerFavoriteMatches(performer)
+      .some((favorite) => `${favorite.providerId}:${favorite.username.trim().toLowerCase()}` === key));
+    const item = this.db.setLiveCamFavoriteAutoRecord(providerId, username, autoRecord);
+    if (item && owner) this.db.setPerformerAutoRecord(owner.id, autoRecord);
+    return item;
   }
 
   // Auto-record is stored per live-cam favorite, but the Performers UI toggles it per
@@ -396,15 +406,16 @@ export class LiveCamService {
     });
   }
 
-  // Auto-record is now a first-class performer flag. We still honor a favorite that was
-  // toggled directly so existing data keeps working until it is re-saved at the performer level.
+  // Auto-record is a performer setting, full stop: being in the performer directory is what makes
+  // someone recordable, and a live-cam favorite is never a precondition. Favorites that were
+  // armed under the old rule are promoted once at boot by adoptLegacyFavoriteAutoRecord().
   performerAutoRecord(performer: Performer): boolean {
-    return performer.autoRecord || this.performerFavoriteMatches(performer).some((favorite) => favorite.autoRecord);
+    return performer.autoRecord;
   }
 
   // Auto-record is a performer-level intent. We persist it on the performer and also mirror it
-  // onto any matched live-cam favorites so the watcher (which polls favorites) picks it up.
-  // No live-cam favorite is required: a performer can be armed even before a favorite exists.
+  // onto any matched live-cam favorites, which only keeps the favorites view consistent -- the
+  // watcher no longer consults that flag for anything.
   setPerformerAutoRecord(performerId: string, autoRecord: boolean): { performer: Performer; matched: number; favorites: LiveCamFavorite[] } {
     const performer = this.db.getPerformer(performerId);
     if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
@@ -417,9 +428,10 @@ export class LiveCamService {
     return { performer: { ...performer, autoRecord }, matched: favorites.length, favorites };
   }
 
-  // The live-cam rooms the watcher should poll for auto-record: every favorite armed directly,
-  // plus every armed performer resolved through its live-cam identity (external refs + sources).
-  // A performer therefore no longer needs a saved favorite to be recorded once it is armed.
+  // The live-cam rooms the watcher should poll for auto-record, built from armed performers only.
+  // Every way a performer can express a live identity is consulted -- external refs, profile URLs
+  // and matched favorites -- but a saved favorite is never required, and a favorite is never an
+  // arming source of its own.
   autoRecordTargets(): Array<{ providerId: string; username: string; pageUrl: string }> {
     const targets = new Map<string, { providerId: string; username: string; pageUrl: string }>();
     const providers = new Set(this.livePlugins().map((entry) => entry.manifest.id));
@@ -429,9 +441,6 @@ export class LiveCamService {
       if (!name || !pageUrl) return;
       targets.set(`${providerId}:${name.toLowerCase()}`, { providerId, username: name, pageUrl });
     };
-    for (const favorite of this.db.listLiveCamFavorites()) {
-      if (favorite.autoRecord) push(favorite.providerId, favorite.username, favorite.pageUrl);
-    }
     const sources = this.db.listSources();
     for (const performer of this.db.listPerformers()) {
       if (!performer.autoRecord) continue;
@@ -456,6 +465,32 @@ export class LiveCamService {
       for (const favorite of this.performerFavoriteMatches(performer)) push(favorite.providerId, favorite.username, favorite.pageUrl);
     }
     return [...targets.values()];
+  }
+
+  // Bridge from the old favorite-level flag to the performer-level one, run once at boot. Adding
+  // a favorite also creates its performer, so an armed favorite is promoted to its owner, and the
+  // favorite column is cleared afterwards: the performer switch is the only truth left, and a
+  // later performer-level disable can never be undone by a stale favorite flag. Favorites whose
+  // provider plugin is gone have no performer; they are reported instead of silently recording.
+  adoptLegacyFavoriteAutoRecord(): { adopted: number; performers: string[]; orphaned: string[] } {
+    const armed = this.db.listLiveCamFavorites().filter((favorite) => favorite.autoRecord);
+    if (!armed.length) return { adopted: 0, performers: [], orphaned: [] };
+    const owners = new Map<string, Performer>();
+    for (const performer of this.db.listPerformers()) {
+      for (const favorite of this.performerFavoriteMatches(performer)) {
+        owners.set(`${favorite.providerId}:${favorite.username.trim().toLowerCase()}`, performer);
+      }
+    }
+    const performers: string[] = [];
+    const orphaned: string[] = [];
+    for (const favorite of armed) {
+      const key = `${favorite.providerId}:${favorite.username.trim().toLowerCase()}`;
+      const owner = owners.get(key);
+      if (!owner) { orphaned.push(key); continue; }
+      if (!owner.autoRecord && this.db.setPerformerAutoRecord(owner.id, true)) performers.push(owner.name);
+      this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, false);
+    }
+    return { adopted: performers.length, performers, orphaned };
   }
 
   // Resolve live status for the auto-record targets of one provider. Favorites reuse the

@@ -77,6 +77,60 @@ describe("Open EasyX live cams", () => {
     expect(service.autoRecordTargets()).toHaveLength(0);
   });
 
+  // Auto-record belongs to the performer: adding someone to the directory is enough, and the
+  // watcher must never need a saved live-cam favorite before it will poll a room.
+  it("watches an armed performer that has no favorite at all", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    const { performer } = service.createPerformer("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" });
+    expect(database.listLiveCamFavorites()).toHaveLength(0);
+    expect(service.autoRecordTargets()).toHaveLength(0);
+    expect(service.setPerformerAutoRecord(performer.id, true).matched).toBe(0);
+    expect(service.autoRecordTargets()).toMatchObject([
+      { providerId: "test.live", username: "alice", pageUrl: "https://live.test/alice" },
+    ]);
+  });
+
+  // Favoriting is optional now, so the favorite switch itself must reach the performer that owns
+  // it instead of quietly arming a flag nothing reads any more.
+  it("arms the owning performer through the favorite switch", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    await service.setFavorite("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+    expect(service.setFavoriteAutoRecord("test.live", "alice", true)).toMatchObject({ autoRecord: true });
+    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(true);
+    expect(service.autoRecordTargets()).toMatchObject([{ providerId: "test.live", username: "alice" }]);
+    service.setFavoriteAutoRecord("test.live", "alice", false);
+    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(false);
+    expect(service.autoRecordTargets()).toHaveLength(0);
+    expect(service.setFavoriteAutoRecord("test.live", "nobody", true)).toBeUndefined();
+  });
+
+  it("adopts a favorite that was armed before auto-record moved to the performer", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    await service.setFavorite("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+    database.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+    // A favorite on its own no longer arms anything: the performer switch is the only source.
+    expect(service.autoRecordTargets()).toHaveLength(0);
+    expect(service.adoptLegacyFavoriteAutoRecord()).toMatchObject({ adopted: 1, orphaned: [] });
+    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(true);
+    expect(service.autoRecordTargets()).toMatchObject([{ providerId: "test.live", username: "alice" }]);
+    // The legacy flag is cleared so a later performer-level disable sticks, and a second boot has
+    // nothing left to adopt.
+    expect(database.listLiveCamFavorites()).toEqual([expect.objectContaining({ username: "alice", autoRecord: false })]);
+    service.setPerformerAutoRecord(database.getPerformerByName("alice")!.id, false);
+    expect(service.adoptLegacyFavoriteAutoRecord()).toMatchObject({ adopted: 0, orphaned: [] });
+    expect(service.autoRecordTargets()).toHaveLength(0);
+  });
+
+  // A favorite whose provider plugin is gone has no performer to own the flag. That has to be
+  // reported at boot instead of looking armed forever while nothing is ever recorded.
+  it("reports an armed favorite that has no performer", async () => {
+    const { database, plugins, service } = await fixture();
+    database.setLiveCamFavorite("test.live", { camId: "ghost", username: "ghost", pageUrl: "https://live.test/ghost" }, true);
+    database.setLiveCamFavoriteAutoRecord("test.live", "ghost", true);
+    expect(service.adoptLegacyFavoriteAutoRecord()).toMatchObject({ adopted: 0, orphaned: ["test.live:ghost"] });
+    expect(service.autoRecordTargets()).toHaveLength(0);
+  });
+
   it("uses the reconnected account immediately instead of its cached login failure", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
     const followed = vi.fn().mockResolvedValueOnce({ authoritative: false, cams: [], skippedReason: "Session expired" })

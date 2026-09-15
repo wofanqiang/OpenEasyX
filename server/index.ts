@@ -82,6 +82,11 @@ systemStats.start();
 const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });
 const discoveryStatus = { running: false, completed: 0, total: 0, progress: 0, query: "", error: "" };
 const performerRefreshStatus = { running: false, completed: 0, total: 0, progress: 0, error: "" };
+// Auto-record is a performer setting now. Promote anything that was armed under the old
+// favorite-level rule exactly once, so this upgrade cannot silently stop an existing schedule.
+const adoptedAutoRecord = liveCams.adoptLegacyFavoriteAutoRecord();
+if (adoptedAutoRecord.adopted) app.log.info({ scope: "auto-record", adopted: adoptedAutoRecord.adopted, performers: adoptedAutoRecord.performers }, `Adopted ${adoptedAutoRecord.adopted} performer(s) that were armed at the favorite level`);
+if (adoptedAutoRecord.orphaned.length) app.log.warn({ scope: "auto-record", orphaned: adoptedAutoRecord.orphaned }, "Auto-record was armed for favorites with no performer; add them as performers to keep recording");
 const autoRecorder = startAutoRecorder({ db, liveCams, mediaRoot: mediaDir, log: (message) => app.log.info({ scope: "auto-record" }, message) });
 
 function ensureBrowserLoginEnabled() {
@@ -372,6 +377,7 @@ app.patch<{ Body: unknown }>("/api/live-cams/favorites/auto-record", async (requ
   const item = liveCams.setFavoriteAutoRecord(body.providerId, body.username, body.autoRecord);
   if (!item) throw Object.assign(new Error("Favorite not found"), { statusCode: 404 });
   if (body.autoRecord) autoRecorder.clearSuppression(body.providerId, body.username);
+  app.log.info({ scope: "auto-record", providerId: body.providerId, username: body.username }, body.autoRecord ? "Favorite auto-record enabled" : "Favorite auto-record disabled");
   return item;
 });
 app.post<{ Body: unknown }>("/api/live-cams/performer", async (request) => {

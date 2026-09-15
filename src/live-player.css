@@ -86,6 +86,12 @@
   background: rgba(250, 64, 88, .1);
 }
 
+.live-auto-record-button.active {
+  border-color: rgba(66, 211, 146, .34);
+  color: #64dea8;
+  background: rgba(66, 211, 146, .1);
+}
+
 .watch-page .live-unavailable.compact {
   min-height: calc(100dvh - 90px);
   border: 0;
