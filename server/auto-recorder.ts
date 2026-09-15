@@ -8,13 +8,20 @@ import { freeBytes, recordingDiskGuard, type FreeSpaceProbe } from "./disk-space
 const ACTIVE_STATUSES = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
 // After a recording ends, wait before auto-starting another one for the same cam so a
 // flapping online/offline edge (or a stale cached snapshot) cannot trigger a loop.
-// The base cooldown is configurable (autoRecordCooldownSeconds); the remaining constants
-// are graded escalations used when a recording ends abnormally or the cam flaps offline/online.
+// The base cooldown is configurable (autoRecordCooldownSeconds); a failed capture starts on a
+// short abnormal cooldown and then doubles for each consecutive failure.
+// The escalation has to key off a failure *count*, not a short sliding window: a room that reports
+// "live" but never yields a recordable stream burns minutes per attempt (the download retries with
+// exponential backoff before failing), so a 3-failures-in-5-minutes rule can never fire and the
+// watcher would restart such a room forever on the flat cooldown.
 const COOLDOWN_FALLBACK_MS = 120_000;
 const ABNORMAL_COOLDOWN_MS = 30_000;
-const FLAP_WINDOW_MS = 5 * 60_000;
-const FLAP_THRESHOLD = 3;
-const FLAP_COOLDOWN_MS = 10 * 60_000;
+// A failure this long after the previous one starts a fresh streak. It has to comfortably exceed the
+// cooldown cap above plus one capture attempt (minutes of download retries) so a streak is not
+// wiped by its own backoff; a cam that has been quiet for hours still starts fresh.
+const FAIL_STREAK_RESET_MS = 3 * 60 * 60_000;
+// Ceiling for the failure backoff: a persistently broken room is retried at most hourly.
+const FAIL_COOLDOWN_CAP_MS = 60 * 60_000;
 // Settings bounds for the status-check interval (seconds).
 const INTERVAL = { min: 30, max: 3600, fallback: 60 };
 const LIVE_ITEM = /^(?:auto|manual)-live:([^:]+):/;
@@ -46,8 +53,9 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
   let running = false;
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
-  // Timestamps of recent failed recordings per cam, used to detect flapping and escalate.
-  const quickFails = new Map<string, number[]>();
+  // Consecutive failed captures per cam, used to escalate the cooldown instead of restarting a
+  // broken room on the flat abnormal cooldown forever.
+  const failStreak = new Map<string, { count: number; at: number }>();
   // Tracks the disk guard so the log gets one line per transition, not one per tick.
   let diskPaused = false;
 
@@ -103,31 +111,34 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
       }
       // Grade the cooldown by how the recording ended. A failed run is "abnormal": the
       // stream likely blipped, so a short cooldown lets a quick recovery retry soon without
-      // hammering a cam that is genuinely offline. Repeated failures inside the flap window
-      // mean the room is flapping, so back off hard instead of churning restarts.
+      // hammering a cam that is genuinely offline. Each additional failure in a row doubles the
+      // wait (capped), because a room that keeps reporting "live" without ever yielding a
+      // recordable capture would otherwise churn the queue at the flat cooldown forever.
       const ended = db.getItem(entry.itemId)?.status;
       const failed = ended === "failed";
       let until: number;
       if (failed) {
-        const history = (quickFails.get(key) ?? []).filter((at) => now - at < FLAP_WINDOW_MS);
-        history.push(now);
-        quickFails.set(key, history);
-        if (history.length >= FLAP_THRESHOLD) {
-          until = now + FLAP_COOLDOWN_MS;
-          quickFails.delete(key);
-          log?.(`auto-record: ${key} failed ${history.length} times in ${FLAP_WINDOW_MS / 1000}s; backing off ${FLAP_COOLDOWN_MS / 1000}s`);
-        } else {
+        const previous = failStreak.get(key);
+        const streak = previous && now - previous.at <= FAIL_STREAK_RESET_MS ? previous.count + 1 : 1;
+        failStreak.set(key, { count: streak, at: now });
+        if (streak === 1) {
           until = now + Math.min(cooldownMs(), ABNORMAL_COOLDOWN_MS);
           log?.(`auto-record: recording ${entry.itemId} failed; ${key} enters a short cooldown`);
+        } else {
+          until = now + Math.min(ABNORMAL_COOLDOWN_MS * 2 ** (streak - 1), FAIL_COOLDOWN_CAP_MS);
+          log?.(`auto-record: ${key} has failed ${streak} captures in a row; backing off ${Math.round((until - now) / 1000)}s`);
         }
       } else {
-        quickFails.delete(key);
+        failStreak.delete(key);
         until = now + cooldownMs();
         log?.(`auto-record: recording ${entry.itemId} finished; ${key} enters cooldown`);
       }
       cooldowns.set(key, until);
     }
     for (const [key, until] of cooldowns) if (until < now) cooldowns.delete(key);
+    // Drop streaks that have gone quiet so the map cannot grow unbounded across many cams, and so a
+    // cam that fails only rarely always restarts from the short first-failure cooldown.
+    for (const [key, entry] of failStreak) if (now - entry.at > FAIL_STREAK_RESET_MS) failStreak.delete(key);
   };
 
   const tick = async () => {

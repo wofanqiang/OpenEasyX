@@ -303,4 +303,75 @@ describe("auto recorder", () => {
       expect(Math.min(3600, Math.max(30, raw))).toBe(30);
     } finally { env.cleanup(); }
   });
+
+  it("backs off further for each consecutive failure instead of restarting forever", async () => {
+    // Only Date is faked: the recorder reads Date.now() for its cooldowns, and leaving the real
+    // timers in place keeps the recorder's unref'd setTimeout untouched.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      // The room reports "live" but its capture always fails (e.g. no public stream).
+      env.cams.push(makeCam());
+
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+
+      // The first failure keeps the short cooldown, so a one-off blip still recovers quickly.
+      env.items.set("item-0", { status: "failed" });
+      await env.recorder.tick();
+      expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1); // held by the cooldown
+
+      vi.setSystemTime(new Date(Date.now() + 31_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(2); // cooldown expired: retried
+
+      // A second failure in a row doubles the wait instead of restarting on the flat cooldown.
+      env.items.set("item-1", { status: "failed" });
+      await env.recorder.tick();
+      expect(env.logs.some((line) => line.includes("failed 2 captures in a row"))).toBe(true);
+
+      // 31s later the old flat 30s cooldown would already have fired; the escalated one has not.
+      vi.setSystemTime(new Date(Date.now() + 31_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(2);
+
+      vi.setSystemTime(new Date(Date.now() + 30_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(3); // past the 60s escalated wait
+    } finally { env.cleanup(); vi.useRealTimers(); }
+  });
+
+  it("resets the failure backoff after a successful capture", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+
+      await env.recorder.tick();
+      env.items.set("item-0", { status: "failed" });
+      await env.recorder.tick();
+
+      vi.setSystemTime(new Date(Date.now() + 31_000));
+      await env.recorder.tick();
+      env.items.set("item-1", { status: "completed" }); // a capture that actually recorded
+      await env.recorder.tick();
+      expect(env.logs.some((line) => line.includes("enters cooldown"))).toBe(true);
+
+      // The next failure is graded as the first of a fresh streak, not the third in a row.
+      vi.setSystemTime(new Date(Date.now() + 121_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(3);
+      env.items.set("item-2", { status: "failed" });
+      await env.recorder.tick();
+      expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
+    } finally { env.cleanup(); vi.useRealTimers(); }
+  });
 });
