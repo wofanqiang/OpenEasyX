@@ -18,8 +18,15 @@ describe("isLiveCaptureCmdline", () => {
     expect(isLiveCaptureCmdline("yt-dlp --no-part rtmp://host/live -o /media/.downloads/abc/capture.ts")).toBe(true);
   });
 
+  it("matches a segmented (A10) capture writing capture_partNNN.ts", () => {
+    const cmdline = "ffmpeg -reconnect 1 -i https://host/stream.m3u8 -f segment -segment_start_number 2 /media/.downloads/abc/capture_part002.ts";
+    expect(isLiveCaptureCmdline(cmdline)).toBe(true);
+    expect(captureStagingDir(cmdline)).toBe(path.dirname(path.resolve("/media/.downloads/abc/capture_part002.ts")));
+  });
+
   it("does NOT match a remux (reads capture.ts from disk, no network input)", () => {
     expect(isLiveCaptureCmdline("ffmpeg -i /media/.downloads/abc/capture.ts -c copy /media/out.mp4")).toBe(false);
+    expect(isLiveCaptureCmdline("ffmpeg -f concat -i /media/.downloads/abc/capture.concat.txt -c copy /media/.downloads/abc/capture.ts")).toBe(false);
   });
 
   it("does NOT match a thumbnail probe or unrelated ffmpeg", () => {

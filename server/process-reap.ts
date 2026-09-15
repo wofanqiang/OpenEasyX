@@ -10,22 +10,25 @@ export interface OrphanProcess {
 
 const NETWORK_INPUT = /(?:https?|rtmp|rtsp|mms):\/\/|\.m3u8\b/i;
 const OUR_BINARY = /\b(?:ffmpeg|yt[-_]?dlp)\b/i;
+// A10 segmented captures write capture_part000.ts... instead of one capture.ts.
+const SEGMENT_OUTPUT = /capture_part\d+\.ts/i;
 
 /**
- * True only for a *live capture* we started: it writes `capture.ts` while reading from a
- * network source. Remux/thumbnail ffmpeg also touch `capture.ts` but read it from disk (no
- * network input), so they are excluded — killing one of those would orphan a half-written mp4.
+ * True only for a *live capture* we started: it writes `capture.ts` (or its rolling
+ * `capture_partNNN.ts` segments) while reading from a network source. Remux/thumbnail
+ * ffmpeg also touch `capture.ts` but read it from disk (no network input), so they are
+ * excluded — killing one of those would orphan a half-written mp4.
  */
 export function isLiveCaptureCmdline(cmdline: string): boolean {
   const lower = cmdline.toLowerCase();
   if (!OUR_BINARY.test(lower)) return false;
-  if (!lower.includes("capture.ts")) return false;
+  if (!lower.includes("capture.ts") && !SEGMENT_OUTPUT.test(lower)) return false;
   return NETWORK_INPUT.test(cmdline);
 }
 
-/** Extract the staging directory that owns a `capture.ts` from a command line, or undefined. */
+/** Extract the staging directory that owns a `capture.ts` (or capture_partNNN.ts) from a command line, or undefined. */
 export function captureStagingDir(cmdline: string): string | undefined {
-  const match = cmdline.match(/(\S*capture\.ts)/i);
+  const match = cmdline.match(/(\S*capture(?:\.ts|_part\d+\.ts))/i);
   if (!match) return undefined;
   const file = match[1];
   if (!path.isAbsolute(file)) return undefined;

@@ -123,6 +123,44 @@ export function retryDisposition(message: string, attempts: number): "permanent"
   return "retry";
 }
 
+/** File name pattern of one rolling MPEG-TS capture segment (A10 segmented live capture). */
+const CAPTURE_SEGMENT_PATTERN = /^capture_part(\d+)\.ts$/;
+
+/**
+ * Segmented live captures land as capture_part000.ts, capture_part001.ts, ... Sorted by
+ * their numeric index. With skipEmpty, zero-byte parts are dropped: an aborted capture can
+ * leave an empty tail part that must neither be concatenated nor block a later salvage.
+ */
+export function captureSegmentFiles(directory: string, options: { skipEmpty?: boolean } = {}): string[] {
+  try {
+    return fs.readdirSync(directory)
+      .map((name) => ({ name, index: Number(CAPTURE_SEGMENT_PATTERN.exec(name)?.[1] ?? NaN) }))
+      .filter((entry) => Number.isInteger(entry.index))
+      .sort((a, b) => a.index - b.index)
+      .map((entry) => path.join(directory, entry.name))
+      .filter((file) => !options.skipEmpty || fs.statSync(file).size > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** The segment number a NEW capture attempt must start at, so a resumed recording never overwrites an earlier part. */
+export function nextSegmentStart(directory: string): number {
+  let max = -1;
+  try {
+    for (const name of fs.readdirSync(directory)) {
+      const index = Number(CAPTURE_SEGMENT_PATTERN.exec(name)?.[1] ?? NaN);
+      if (Number.isInteger(index) && index > max) max = index;
+    }
+  } catch { /* no directory yet: start fresh */ }
+  return max + 1;
+}
+
+/** ffmpeg arguments that concatenate capture parts into one TS via the concat demuxer. */
+export function concatCaptureArgs(listPath: string, output: string): string[] {
+  return ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", output];
+}
+
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
   private finalizers = new Map<string, Promise<void>>();
@@ -356,13 +394,19 @@ export class DownloadQueue {
       const destination = path.join(this.mediaRoot, downloadOutputPath(settings, item, performer.name, source.domain, filename));
       this.prepareOutputDirectory(path.dirname(destination));
       temporaryDirectory = path.join(this.downloadsRoot, safeSegment(item.id, "download"));
-      // A9 resume: a retry keeps the staging directory so the partial file can be continued
-      // (fetch via Range, yt-dlp via its .part files). Only the very first attempt starts
-      // from an empty directory, and a live capture never resumes -- a broadcast cannot be
-      // re-joined where it died, so its staging always starts clean.
+      // Resume rules: a retry keeps the staging directory so the partial file can be
+      // continued (fetch via Range, yt-dlp via its .part files). A live capture resumes too
+      // when segmented parts survived (A10): the new attempt appends at the next segment
+      // number instead of discarding the recorded minutes. Anything else -- a first
+      // attempt, or a live capture with no salvageable parts (a broadcast cannot be
+      // re-joined where it died) -- starts from a clean directory.
       const isLiveItem = (item.metadata as Record<string, unknown> | undefined)?.live === true;
-      if ((item.attempts ?? 0) > 0 && !isLiveItem && fs.existsSync(temporaryDirectory)) {
-        this.writeLog?.("info", "download", "Retry resumes the partial staging files", { itemId: item.id, attempts: item.attempts });
+      const segmentStart = isLiveItem && fs.existsSync(temporaryDirectory) ? nextSegmentStart(temporaryDirectory) : 0;
+      const keepStaging = segmentStart > 0 || ((item.attempts ?? 0) > 0 && !isLiveItem && fs.existsSync(temporaryDirectory));
+      if (keepStaging) {
+        this.writeLog?.("info", "download", segmentStart > 0
+          ? `Retry continues the segmented capture at part ${segmentStart}`
+          : "Retry resumes the partial staging files", { itemId: item.id, attempts: item.attempts, segmentStart });
       } else {
         fs.rmSync(temporaryDirectory, { recursive: true, force: true });
       }
@@ -382,6 +426,8 @@ export class DownloadQueue {
           "{output}": temporary,
           "{outputDir}": path.dirname(temporary),
           "{outputName}": path.basename(temporary),
+          // A10: a resumed segmented capture starts after the parts already on disk.
+          "{segmentStart}": String(segmentStart),
         };
         await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
@@ -392,6 +438,31 @@ export class DownloadQueue {
         // Gated on the TS file actually existing so non-TS captures are untouched.
         if ((item.metadata as Record<string, unknown> | undefined)?.live === true) {
           const tsPath = path.join(temporaryDirectory, "capture.ts");
+          // A10: a segmented capture lands as capture_partNNN.ts files. Fold them into the
+          // single capture.ts the remux step expects: one part is renamed outright, several
+          // are concatenated losslessly (-c copy through the concat demuxer). ffmpeg's
+          // segment muxer only cuts on TS packet boundaries, so the join adds no A/V gap.
+          const parts = captureSegmentFiles(temporaryDirectory, { skipEmpty: true });
+          if (parts.length && !fs.existsSync(tsPath)) {
+            // Same reasoning as the remux below: the capture already ended, so clear any
+            // pending action before spawning ffmpeg and let `encoding` shield the fold-in
+            // from a late stop/cancel.
+            control.action = undefined;
+            control.encoding = true;
+            recordingFinalize = true;
+            this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
+            const partBytes = parts.reduce((total, part) => total + fs.statSync(part).size, 0);
+            if (parts.length === 1) {
+              fs.renameSync(parts[0], tsPath);
+            } else {
+              this.writeLog?.("info", "download", `Concatenating ${parts.length} segmented capture parts`, { itemId: item.id, partBytes });
+              const listPath = path.join(temporaryDirectory, "capture.concat.txt");
+              fs.writeFileSync(listPath, parts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
+              await this.withPostProcessDeadline(control, partBytes, "Concat",
+                () => this.runCommandDownload("ffmpeg", concatCaptureArgs(listPath, tsPath), temporaryDirectory, undefined, () => {}, control));
+              if (!fs.existsSync(tsPath) || fs.statSync(tsPath).size === 0) throw new Error("Concatenation completed without producing a media file");
+            }
+          }
           if (fs.existsSync(tsPath) && fs.statSync(tsPath).size > 0) {
             const mp4Staging = path.join(temporaryDirectory, "encoded.mp4");
             // A live capture ends either because the user pressed stop or because the
@@ -575,12 +646,37 @@ export class DownloadQueue {
       // fallback existed a failed remux deleted the entire recording, because the
       // staging file is capture.ts while `temporary` points at the not-yet-written MP4.
       const capturePath = temporaryDirectory ? path.join(temporaryDirectory, "capture.ts") : "";
-      const recoverySource = temporary && fs.existsSync(temporary)
+      let recoverySource = temporary && fs.existsSync(temporary)
         ? temporary
         : (capturePath && fs.existsSync(capturePath) && fs.statSync(capturePath).size > 0 ? capturePath : "");
+      const isLiveRecording = (item.metadata as Record<string, unknown> | undefined)?.live === true;
+      // A10: a segmented capture that died before finalize has no capture.ts yet, only
+      // parts. Salvage them: folding the parts into one TS keeps the existing single-file
+      // recovery flow working; if even that fold fails, the raw parts are moved below so
+      // no recorded minute is ever thrown away.
+      let strayParts: string[] = [];
+      if (!recoverySource && isLiveRecording && !control.action && !control.paused && temporaryDirectory) {
+        strayParts = captureSegmentFiles(temporaryDirectory, { skipEmpty: true });
+        if (strayParts.length && !control.encoding) {
+          try {
+            const partBytes = strayParts.reduce((total, part) => total + fs.statSync(part).size, 0);
+            if (strayParts.length === 1) {
+              fs.renameSync(strayParts[0], capturePath);
+            } else {
+              const listPath = path.join(temporaryDirectory, "capture.concat.txt");
+              fs.writeFileSync(listPath, strayParts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
+              await this.withPostProcessDeadline(control, partBytes, "Concat",
+                () => this.runCommandDownload("ffmpeg", concatCaptureArgs(listPath, capturePath), temporaryDirectory, undefined, () => {}, control));
+            }
+            if (fs.existsSync(capturePath) && fs.statSync(capturePath).size > 0) {
+              recoverySource = capturePath;
+              strayParts = [];
+            }
+          } catch { /* the raw-parts fallback below still salvages the bytes */ }
+        }
+      }
       if (!control.action && !control.paused && recoverySource) {
         const partialBytes = fs.statSync(recoverySource).size;
-        const isLiveRecording = (item.metadata as Record<string, unknown> | undefined)?.live === true;
         if (control.encoding || (isLiveRecording && partialBytes > 0)) {
           try {
             const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
@@ -592,6 +688,27 @@ export class DownloadQueue {
             preserveTemporary = true;
             message += ` Recording preserved in staging at ${path.relative(this.mediaRoot, recoverySource)}; recover it before retrying.`;
           }
+        }
+      }
+      if (!control.action && !control.paused && !recoverySource && strayParts.length) {
+        // Last-resort salvage: the parts cannot be folded into one file (ffmpeg itself is
+        // failing), so move them to recovery as-is for manual inspection instead of
+        // deleting hours of footage with the staging directory.
+        try {
+          const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
+          this.prepareOutputDirectory(recoveryDirectory);
+          const saved: string[] = [];
+          for (const part of strayParts) {
+            const target = this.availableDestination(path.join(recoveryDirectory, path.basename(part)), item.id);
+            fs.renameSync(part, target);
+            saved.push(path.basename(target));
+          }
+          temporary = "";
+          fs.writeFileSync(path.join(recoveryDirectory, "recovered.parts.json"), JSON.stringify({ itemId: item.id, title: item.title ?? item.id, parts: saved }, null, 2));
+          message += ` ${saved.length} raw capture part(s) preserved for recovery.`;
+        } catch {
+          preserveTemporary = true;
+          message += " Raw capture parts preserved in staging; recover them before retrying.";
         }
       }
       if (control.action) {
@@ -610,11 +727,11 @@ export class DownloadQueue {
         // (the real ffmpeg/yt-dlp error is the only clue to what went wrong).
         if (control.stalled) message = `Download timed out (no progress received within the configured stall timeout). Underlying output: ${message.slice(0, 800)}`;
         const disposition = this.handleFailure(item.id, message, control);
-        // A9: a scheduled retry must find the staging directory with the partial file still
-        // in it -- that file is the resume point (fetch Range / yt-dlp .part). Live captures
-        // are excluded: a broadcast cannot be re-joined where it died, so keeping their
-        // staging would only risk a stale capture.ts mixing into a fresh recording.
-        if (disposition === "retry" && (item.metadata as Record<string, unknown> | undefined)?.live !== true) preserveTemporary = true;
+        // A9/A10: a scheduled retry must find its resume point in staging -- the partial
+        // fetch file / yt-dlp .part for downloads, the recorded capture segments for a
+        // live capture (the next attempt appends at the next segment number). A retry
+        // that finds nothing to resume simply starts from a clean directory.
+        if (disposition === "retry") preserveTemporary = true;
       }
     } finally {
       if (stallTimer) clearInterval(stallTimer);

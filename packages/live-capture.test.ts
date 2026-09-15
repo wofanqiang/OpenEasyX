@@ -26,7 +26,12 @@ describe("live capture request", () => {
     );
     expect(request.command).toBe("ffmpeg");
     expect(request.filename).toBe("a.mp4");
-    expect(request.args).toEqual(expect.arrayContaining(["-reconnect_delay_max", "10", "-c", "copy", "-f", "mpegts", "{outputDir}/capture.ts"]));
+    expect(request.args).toEqual(expect.arrayContaining(["-reconnect_delay_max", "10", "-c", "copy"]));
+    // A10: rolling TS segments on packet boundaries; the downloader injects the resume point.
+    expect(request.args).toEqual(expect.arrayContaining([
+      "-f", "segment", "-segment_format", "mpegts", "-reset_timestamps", "1",
+      "-segment_start_number", "{segmentStart}", "{outputDir}/capture_part%03d.ts",
+    ]));
     expect(request.args).not.toContain("-reconnect_delay_total_max");
     // For HLS, -reconnect_at_eof loops forever instead of progressing; never emit it.
     expect(request.args).not.toContain("-reconnect_at_eof");
@@ -55,7 +60,7 @@ describe("live capture request", () => {
     const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem);
     expect(resolveLiveStream).toHaveBeenCalledOnce();
     expect(request).toMatchObject({ kind: "command", command: "ffmpeg", filename: "alice-1.mp4" });
-    expect(request!.args).toEqual(expect.arrayContaining(["-f", "mpegts", "{outputDir}/capture.ts"]));
+    expect(request!.args).toEqual(expect.arrayContaining(["-f", "segment", "{outputDir}/capture_part%03d.ts"]));
   });
 
   it("records through the rewrite hook when a provider cannot be played directly", async () => {

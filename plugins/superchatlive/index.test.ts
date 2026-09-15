@@ -323,7 +323,7 @@ describe("SuperChat stream resolution", () => {
       kind: "command", command: "ffmpeg", filename: "oshun-live.mp4",
       args: expect.arrayContaining([
         "-i", "https://media-hls.doppiocdn.media/b-hls-21/156104630/156104630.m3u8?playlistType=standard&psch=v2&pkey=1Dzcc6OjP73LKbtI",
-        "-c", "copy", "-f", "mpegts", "{outputDir}/capture.ts",
+        "-c", "copy", "-f", "segment", "-segment_format", "mpegts", "{outputDir}/capture_part%03d.ts",
       ]),
     });
   });

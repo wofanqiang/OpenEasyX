@@ -3,10 +3,11 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, concurrentLimit, httpStatusFromError, postProcessDeadlineMs, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -21,8 +22,24 @@ afterEach(() => {
   }
 });
 const temp = (name: string) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), `${name}-`)); dirs.push(dir); return dir; };
-async function waitFor(check: () => boolean) {
-  const deadline = Date.now() + 4000;
+// One tiny real MPEG-TS (video+audio, encoded once) reused as the content of every capture
+// segment in the A10 tests, so the concat demuxer sees identical streams across parts.
+let segmentTemplate: Buffer | undefined;
+function segmentTemplateBytes(): Buffer {
+  if (!segmentTemplate) {
+    const file = path.join(temp("easyx-seg-template"), "template.ts");
+    execFileSync("ffmpeg", [
+      "-f", "lavfi", "-i", "testsrc=duration=0.5:size=64x64:rate=10",
+      "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.5",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac",
+      "-shortest", "-f", "mpegts", file,
+    ], { stdio: "ignore" });
+    segmentTemplate = fs.readFileSync(file);
+  }
+  return segmentTemplate;
+}
+async function waitFor(check: () => boolean, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
   while (!check()) { if (Date.now() > deadline) throw new Error("Timed out"); await new Promise((resolve) => setTimeout(resolve, 25)); }
 }
 
@@ -158,6 +175,36 @@ describe("DownloadQueue", () => {
     expect(db.getItem(item.id)?.status).toBe("failed");
     expect(db.getItem(item.id)?.error ?? "").toContain("cannot be filled");
   });
+
+  it("resumes a segmented live capture and folds the parts into one recording (A10)", async () => {
+    const dataDir = temp("easyx-seg-data"); const mediaDir = temp("easyx-seg-media"); const pluginDir = temp("easyx-seg-plugins");
+    const templatePath = path.join(temp("easyx-seg-tpl"), "template.ts");
+    fs.writeFileSync(templatePath, segmentTemplateBytes());
+    // The fake capture "ffmpeg" copies the template to capture_partNNN.ts, with N taken
+    // from the {segmentStart} placeholder the downloader must inject for a resumed capture.
+    const script = 'const fs=require("fs"),path=require("path");const dir=process.argv.at(-3);const n=Number(process.argv.at(-2));fs.writeFileSync(path.join(dir,"capture_part"+String(n).padStart(3,"0")+".ts"),fs.readFileSync(process.argv.at(-1)));';
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.segment", name: "Segment", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveDownload(_context, item) { return { kind: "command", command: process.execPath, args: ["-e", ${JSON.stringify(script)}, "{outputDir}", "{segmentStart}", ${JSON.stringify(templatePath)}], filename: item.filename }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.segment", { installed: true, enabled: true });
+    db.updateSettings({ autoRecordMinBytes: 0 });
+    const person = db.upsertPerformer({ externalId: "person", name: "Segment Performer" }, "test.segment");
+    const source = db.addSource(person.id, "test.segment", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", filename: "live.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0];
+    // A previous attempt died after two segments; scheduleRetry keeps them for resume.
+    const staged = path.join(mediaDir, ".downloads", item.id);
+    fs.mkdirSync(staged, { recursive: true });
+    fs.writeFileSync(path.join(staged, "capture_part000.ts"), segmentTemplateBytes());
+    fs.writeFileSync(path.join(staged, "capture_part001.ts"), segmentTemplateBytes());
+    db.scheduleRetry(item.id, "capture died", 1, new Date(Date.now() - 1000).toISOString());
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    await waitFor(() => db.getItem(item.id)?.status === "completed", 20000); queue.stop();
+    // Three parts (two resumed + one fresh at segment_start_number 2) folded losslessly
+    // into the single MP4 the library stores, staging cleaned up behind it.
+    expect(fs.existsSync(path.join(mediaDir, "Segment Performer", "example.test", "live.mp4"))).toBe(true);
+    expect(fs.existsSync(staged)).toBe(false);
+  }, 30000);
 
   it("stores by performer/domain and removes byte-identical duplicates", async () => {
     const dataDir = temp("easyx-data"); const mediaDir = temp("easyx-media"); const pluginDir = temp("easyx-plugins");
@@ -476,5 +523,30 @@ describe("slotPlan", () => {
 
   it("offers nothing once both pools are full", () => {
     expect(slotPlan({ recordings: 32, downloads: 8 }, { recordings: 32, downloads: 8 })).toEqual([]);
+  });
+});
+
+describe("capture segments (A10)", () => {
+  it("lists segments numerically and can skip empty tails", () => {
+    const dir = temp("easyx-seg-list");
+    for (const [name, size] of [["capture_part0.ts", 10], ["capture_part2.ts", 0], ["capture_part10.ts", 5], ["other.mp4", 7]] as Array<[string, number]>) {
+      fs.writeFileSync(path.join(dir, name), Buffer.alloc(size));
+    }
+    expect(captureSegmentFiles(dir).map((file) => path.basename(file))).toEqual(["capture_part0.ts", "capture_part2.ts", "capture_part10.ts"]);
+    expect(captureSegmentFiles(dir, { skipEmpty: true }).map((file) => path.basename(file))).toEqual(["capture_part0.ts", "capture_part10.ts"]);
+    expect(nextSegmentStart(dir)).toBe(11);
+  });
+
+  it("starts at segment 0 in a fresh directory", () => {
+    expect(nextSegmentStart(temp("easyx-seg-fresh"))).toBe(0);
+    expect(captureSegmentFiles(temp("easyx-seg-missing"))).toEqual([]);
+  });
+
+  it("builds concat-demuxer arguments with -safe 0 and stream copy", () => {
+    expect(concatCaptureArgs("/media/staging/capture.concat.txt", "/media/staging/capture.ts")).toEqual([
+      "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "concat", "-safe", "0", "-i", "/media/staging/capture.concat.txt",
+      "-c", "copy", "/media/staging/capture.ts",
+    ]);
   });
 });

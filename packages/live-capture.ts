@@ -41,7 +41,24 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
   // demuxers room stops them blocking each other on a shared video+audio capture.
   args.push("-thread_queue_size", "512", "-i", stream.url);
   if (stream.audioUrl) args.push("-thread_queue_size", "512", "-i", stream.audioUrl, "-map", "0", "-map", "1:a:0?");
-  args.push("-c", "copy", "-f", "mpegts", options.output);
+  args.push("-c", "copy");
+  // A10 segmented capture: write rolling MPEG-TS parts instead of one long capture.ts. A
+  // crash or OOM then leaves every completed segment intact (the downloader concatenates
+  // them at finalize, or salvages them into recovery), and a retried capture resumes at
+  // the next segment number instead of starting over. ffmpeg's segment muxer only ever
+  // cuts on TS packet boundaries, so no bytes are lost between parts. `EASYX_SEGMENTED_
+  // CAPTURE=0` reverts to the legacy single capture.ts (kill switch for a gray rollout).
+  if (process.env.EASYX_SEGMENTED_CAPTURE === "0") {
+    args.push("-f", "mpegts", options.output);
+  } else {
+    const segmentSeconds = Math.max(60, Math.floor(Number(process.env.EASYX_SEGMENT_SECONDS ?? 600)));
+    args.push(
+      "-f", "segment", "-segment_time", String(segmentSeconds),
+      "-segment_format", "mpegts", "-reset_timestamps", "1",
+      "-segment_start_number", "{segmentStart}",
+      options.output.replace(/capture\.ts$/, "capture_part%03d.ts"),
+    );
+  }
   return { kind: "command", command: "ffmpeg", args, filename: options.filename };
 }
 

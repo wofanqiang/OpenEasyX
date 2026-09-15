@@ -38,7 +38,7 @@ describe("live recording output", () => {
     expect(request.args).toContain("--continue");
   });
 
-  it("captures a live stream to MPEG-TS with ffmpeg and self-reconnect flags", () => {
+  it("captures a live stream to segmented MPEG-TS parts with ffmpeg and self-reconnect flags", () => {
     const stream = { url: "https://cdn.test/live.m3u8?token=fresh", audioUrl: "https://cdn.test/audio.m3u8", headers: { Referer: "https://live.test/", "User-Agent": "yt-dlp" } };
     const request = ffmpegLiveCaptureCommand(stream, { referer: "https://live.test/", output: "{outputDir}/capture.ts", filename: "alice.mp4" });
     expect(request.command).toBe("ffmpeg");
@@ -47,13 +47,30 @@ describe("live recording output", () => {
     expect(request.args).toContain("-reconnect");
     expect(request.args).toContain("-reconnect_on_http_error");
     expect(request.args).toContain("5xx");
-    // straight to MPEG-TS so the downloader can remux + delete afterwards
-    expect(request.args).toEqual(expect.arrayContaining(["-f", "mpegts", "{outputDir}/capture.ts"]));
+    // A10 segmented capture: rolling parts on TS packet boundaries; the downloader fills
+    // {segmentStart} so a resumed capture appends instead of overwriting earlier parts.
+    expect(request.args).toEqual(expect.arrayContaining([
+      "-f", "segment", "-segment_format", "mpegts", "-reset_timestamps", "1",
+      "-segment_start_number", "{segmentStart}", "{outputDir}/capture_part%03d.ts",
+    ]));
+    expect(request.args).not.toContain("{outputDir}/capture.ts");
     // per-stream headers are forwarded (minus User-Agent, which ffmpeg emits itself)
     const headerArg = request.args[request.args.indexOf("-headers") + 1];
     expect(headerArg).toContain("Referer: https://live.test/");
     expect(headerArg).not.toContain("User-Agent:");
     // audio is mapped in when a separate audio track exists
     expect(request.args).toEqual(expect.arrayContaining(["-i", "https://cdn.test/audio.m3u8", "-map", "0", "-map", "1:a:0?"]));
+  });
+
+  it("falls back to a single capture.ts when segmentation is switched off", () => {
+    process.env.EASYX_SEGMENTED_CAPTURE = "0";
+    try {
+      const stream = { url: "https://cdn.test/live.m3u8?token=fresh" };
+      const request = ffmpegLiveCaptureCommand(stream, { output: "{outputDir}/capture.ts", filename: "alice.mp4" });
+      expect(request.args).toEqual(expect.arrayContaining(["-f", "mpegts", "{outputDir}/capture.ts"]));
+      expect(request.args).not.toContain("segment");
+    } finally {
+      delete process.env.EASYX_SEGMENTED_CAPTURE;
+    }
   });
 });
