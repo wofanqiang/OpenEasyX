@@ -22,14 +22,12 @@ describe("Chaturbate shared request cooldown", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it("cools down network failures and releases queued requests", async () => {
-    vi.useFakeTimers();
+  it("retries immediately after a network failure instead of cooling down", async () => {
     const fetch = vi.fn().mockRejectedValueOnce(new TypeError("fetch failed")).mockResolvedValue(new Response("{}"));
     const context = { fetch } as unknown as PluginContext;
     await expect(chaturbateRequest(context, "https://chaturbate.com/followed", {})).rejects.toThrow("fetch failed");
-    await expect(chaturbateRequest(context, "https://chaturbate.com/public", {})).rejects.toThrow("Automatic retry");
-    expect(fetch).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(60_001);
+    // Only explicit 429/503 responses earn the shared cooldown; a network failure is per-request.
     await expect(chaturbateRequest(context, "https://chaturbate.com/public", {})).resolves.toHaveProperty("status", 200);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

@@ -15,12 +15,9 @@ export async function chaturbateRequest(context: PluginContext, url: string, ini
   try {
     init.signal?.throwIfAborted();
     if (Date.now() < state.retryAt) throw new Error(`Chaturbate is temporarily limiting requests (HTTP 429 or network timeout). Automatic retry in ${Math.ceil((state.retryAt - Date.now()) / 1000)} seconds. Your favorites are saved.`);
-    let response: Response;
-    try { response = await context.fetch(url, init); }
-    catch (error) {
-      if (!context.signal?.aborted) state.retryAt = Date.now() + 60_000;
-      throw error;
-    }
+    // A network timeout is per-request: only an explicit 429/503 response earns the shared
+    // cooldown, so one slow fetch under load no longer blanks the provider for a minute.
+    const response = await context.fetch(url, init);
     if (response.status === 429 || response.status === 503) {
       const retryAfter = response.headers.get("retry-after");
       const seconds = retryAfter && /^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter) : retryAfter ? (Date.parse(retryAfter) - Date.now()) / 1000 : 120;

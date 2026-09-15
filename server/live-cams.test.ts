@@ -246,11 +246,17 @@ describe("Open EasyX live cams", () => {
     try {
       const query = { page: 1, pageSize: 24, providerId: "test.live" };
       expect((await service.list(query)).items).toHaveLength(1);
-      plugins.get("test.live").listLiveCams = async () => { throw new Error("HTTP 429. Automatic retry shortly."); };
+      plugins.get("test.live").listLiveCams = vi.fn(async () => { throw new Error("HTTP 429. Automatic retry shortly."); });
+      // Let the 30s success cache expire so the refresh actually runs and fails.
       await vi.advanceTimersByTimeAsync(30_001);
       const result = await service.list(query);
       expect(result.items).toMatchObject([{ username: "alice", statusUnavailable: true }]);
       expect(result.providers).toMatchObject([{ warning: "HTTP 429. Automatic retry shortly." }]);
+      // Failure results share the 30s cache window: a later list retries the provider
+      // instead of serving the failed snapshot for minutes.
+      await vi.advanceTimersByTimeAsync(30_001);
+      await service.list(query);
+      expect(plugins.get("test.live").listLiveCams).toHaveBeenCalledTimes(2);
     } finally { vi.useRealTimers(); }
   });
 

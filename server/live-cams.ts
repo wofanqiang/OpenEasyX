@@ -153,7 +153,9 @@ export class LiveCamService {
         ...cached.result, items: cached.result.items.map((cam) => ({ ...cam, statusUnavailable: true })),
         status: { ...cached.result.status, warning: result.status.error },
       };
-      if (epoch === this.favoriteEpoch.get(entry.manifest.id)) this.providerResults.set(key, { result, expiresAt: Math.min(Date.now() + (result.status.ok ? 30_000 : 120_000), favoritesOnly ? this.favoriteSnapshots.get(entry.manifest.id)?.expiresAt ?? Infinity : Infinity) });
+      // Failed provider results are cached briefly (30s, same as successes): a longer
+      // window kept a single timeout on the UI as "unavailable" for minutes.
+      if (epoch === this.favoriteEpoch.get(entry.manifest.id)) this.providerResults.set(key, { result, expiresAt: Math.min(Date.now() + 30_000, favoritesOnly ? this.favoriteSnapshots.get(entry.manifest.id)?.expiresAt ?? Infinity : Infinity) });
       // Keep search/filter caches bounded in long-running installations.
       if (this.providerResults.size > 200) this.providerResults.delete(this.providerResults.keys().next().value!);
       return result;
