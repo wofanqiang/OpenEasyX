@@ -10,6 +10,7 @@ import {
   isLivePlaylist, isMasterPlaylist, isMouflonObfuscated, mouflonSegmentUrls, parseMouflonChallenge,
   playlistUrls, superchatStreamConfig,
 } from "./streams.js";
+import { MOUFLON_KEYMAP } from "../../packages/hls-mouflon.js";
 
 beforeEach(() => resetSuperchatCaches());
 
@@ -29,8 +30,13 @@ function room(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function cam(username: string, viewers: number) {
-  return { id: username.toLowerCase(), username, pageUrl: roomUrl(username), viewers };
+/**
+ * Catalogue samples default to the VR tag, because `superchatPage` serves a VR-only catalogue
+ * now — a room without it never reaches a page. Pass an explicit list to model a room the API
+ * does not mark as VR.
+ */
+function cam(username: string, viewers: number, tags: string[] = ["vr"]) {
+  return { id: username.toLowerCase(), username, pageUrl: roomUrl(username), viewers, tags };
 }
 
 const ADVERT = "#EXTM3U\n#EXT-X-MOUFLON-ADVERT\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-ENDLIST\n";
@@ -98,6 +104,15 @@ describe("SuperChat gender vocabulary", () => {
 });
 
 describe("SuperChat catalogue paging", () => {
+  it("serves a VR-only catalogue and drops rooms without the tag", () => {
+    const cams = [cam("oshun_", 10), cam("plain_room", 90, []), { ...cam("hd_only", 50), tags: ["hd"] }];
+    const page = superchatPage(cams, { page: 1, pageSize: 10 });
+    expect(page.cams.map((item) => item.username)).toEqual(["oshun_"]);
+    expect(page.total).toBe(1);
+    // `oshun_` carries no "vr" in its name, so a hit here can only come from its tag.
+    expect(superchatPage(cams, { page: 1, pageSize: 10, search: "vr" }).cams.map((item) => item.username)).toEqual(["oshun_"]);
+  });
+
   it("ranks by viewers and slices pages locally", () => {
     const cams = [cam("a", 10), cam("b", 300), cam("c", 50)];
     const first = superchatPage(cams, { page: 1, pageSize: 2 });
@@ -109,11 +124,11 @@ describe("SuperChat catalogue paging", () => {
 
   it("filters a snapshot by gender and search term", () => {
     const cams = [
-      { ...cam("alice", 5), gender: "female", tags: ["vr"] },
+      { ...cam("alice", 5), gender: "female" },
       { ...cam("bob", 9), gender: "male" },
     ];
     expect(superchatPage(cams, { page: 1, pageSize: 10, gender: "male" }).cams.map((item) => item.username)).toEqual(["bob"]);
-    expect(superchatPage(cams, { page: 1, pageSize: 10, search: "vr" }).cams.map((item) => item.username)).toEqual(["alice"]);
+    expect(superchatPage(cams, { page: 1, pageSize: 10, search: "alice" }).cams.map((item) => item.username)).toEqual(["alice"]);
   });
 
   it("collapses a room that appears twice, keeping the busier copy", () => {
@@ -310,6 +325,41 @@ describe("SuperChat stream resolution", () => {
         "-c", "copy", "-f", "mpegts", "{outputDir}/capture.ts",
       ]),
     });
+  });
+
+  it("resolves the room from the page URL when the caller holds only a display title", async () => {
+    // A recorder item can arrive with the room's display title in its username field. The page URL
+    // is built from the room name by `roomUrl()`, so of the two it is the one worth trusting.
+    const fetch = playerFetch();
+    await resolveSuperchatStream(context(fetch), {
+      id: "52358393", username: "Anais Bloom ( Anna)", pageUrl: roomUrl("Anais_Bloom"),
+    });
+    const lookup = fetch.mock.calls.map(([url]) => String(url)).find((url) => url.includes("/users/user-ids/"));
+    expect(lookup).toContain("/Anais_Bloom");
+    expect(lookup).not.toContain("Anais%20Bloom");
+  });
+
+  it("still refuses a name that is neither a room nor recoverable from the URL", async () => {
+    const fetch = playerFetch();
+    await expect(resolveSuperchatStream(context(fetch), {
+      id: "x", username: "Anais Bloom ( Anna)", pageUrl: "https://vr.superchat.live/",
+    })).rejects.toThrow("invalid room name");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses to record a playlist that only the server proxy can decrypt", async () => {
+    // A keymapped challenge is what yields a decryption key, so these addresses can only be
+    // unwrapped while the server rewrites the playlist. Handed the raw playlist instead, ffmpeg
+    // fetches the decoys it literally names and the capture dies on the stall timeout.
+    const master = [
+      "#EXTM3U", `#EXT-X-MOUFLON:PSCH:v2:${Object.keys(MOUFLON_KEYMAP)[0]}`,
+      "#EXT-X-STREAM-INF:BANDWIDTH=4566425,RESOLUTION=1920x1080,NAME=\"source\"",
+      "https://media-hls.doppiocdn.media/b-hls-21/156104630/156104630.m3u8?playlistType=standard",
+    ].join("\n");
+    await expect(resolveSuperchatDownload(context(playerFetch({ master })), {
+      externalId: "superchat:oshun_:live", pageUrl: roomUrl("OSHUN_"), mediaType: "video",
+      filename: "oshun-live.mp4", metadata: { live: true },
+    })).rejects.toThrow("live capture path");
   });
 });
 

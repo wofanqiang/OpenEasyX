@@ -32,14 +32,31 @@ const PRIMARY_TAG: Record<NonNullable<LiveCamQuery["gender"]>, string> = {
   female: "girls", male: "men", couple: "couples", trans: "trans",
 };
 
+/**
+ * The tag a VR-capable room carries, and the catalogue's only VR filter.
+ *
+ * This white-label front end brands itself as VR, but its room pool is the whole public
+ * Stripchat catalogue: a full sweep on 2026-09-15 found 3519 public rooms of which only 40
+ * carried `isVr` (1.14%). The VR label describes the player rather than the content, so a
+ * room without this tag is dropped when a page is built rather than merely tagged.
+ *
+ * The filter sits in `superchatPage` — the single funnel both `listLiveCams` paths pass
+ * through — so favourites, `getLiveCam` and recording are untouched: a non-VR favourite
+ * still resolves, plays and records.
+ */
+const VR_TAG = "vr";
+
 // The catalogue is walked with an exclusion cursor. 60 is what the endpoint serves per
 // call — asking for more does not return more, it just ends the sweep early, because the
 // "short batch" below then reads as exhausted.
 const BATCH_SIZE = 60;
 const BATCH_LIMIT = 150;
 const REQUEST_TIMEOUT_MS = 20_000;
-// Cap one sweep so a slow catalogue can never block a page render behind it.
-const CRAWL_BUDGET_MS = 20_000;
+// Cap one sweep so a slow catalogue can never block a page render behind it. 30s is the ceiling
+// the outer bounds leave room for: the server aborts a provider after 45s
+// (`AbortSignal.timeout(45_000)` in server/live-cams.ts) and the page holds a 60s REST fallback
+// plus a 90s SSE guard, so a wider sweep still lands inside every one of them.
+const CRAWL_BUDGET_MS = 30_000;
 const CATALOGUE_TTL_MS = 180_000;
 // Past its freshness window a snapshot is still served instantly for this long while a
 // refresh runs in the background; past the grace period we wait instead of showing a
@@ -119,8 +136,28 @@ function dedupe(cams: LiveCam[]): LiveCam[] {
   return [...result.values()];
 }
 
+/**
+ * True for a room the API marks as VR. `superchatLiveCam` is the only place that sets the tag,
+ * so this is the one definition the catalogue filter reads.
+ */
+export function isVrRoom(cam: LiveCam): boolean {
+  return (cam.tags ?? []).some((tag) => tag.toLowerCase() === VR_TAG);
+}
+
 function requestSignal(context: PluginContext): AbortSignal {
   const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  return context.signal ? AbortSignal.any([context.signal, timeout]) : timeout;
+}
+
+/**
+ * A per-batch signal clamped to whatever is left of the crawl budget.
+ *
+ * Composing rather than picking matters: `context.signal` alone would let one hung batch run to
+ * the caller's own envelope (45s) even after the deadline passed, which is exactly the overrun the
+ * deadline exists to prevent.
+ */
+function budgetSignal(context: PluginContext, remainingMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(Math.max(1_000, Math.min(REQUEST_TIMEOUT_MS, remainingMs > 0 ? remainingMs : REQUEST_TIMEOUT_MS)));
   return context.signal ? AbortSignal.any([context.signal, timeout]) : timeout;
 }
 
@@ -150,6 +187,13 @@ async function apiJson(context: PluginContext, url: URL, init: RequestInit = {})
 
 // ---------------------------------------------------------------- room mapping
 
+/**
+ * The shape of a room name here. A room answers to `[a-z0-9_.-]` only, which is what makes a
+ * display title such as "Anais Bloom ( Anna)" recognisable as *not* a room name: the API returns
+ * titles carrying spaces, parentheses and accents, and a lookup built from one is rejected.
+ */
+const ROOM_NAME = /^[a-z0-9_.-]{1,64}$/i;
+
 export function roomUrl(username: string): string {
   return `${SUPERCHAT_ORIGIN}/cam/${encodeURIComponent(username)}`;
 }
@@ -167,6 +211,21 @@ export function usernameFromRoomUrl(value: string | undefined): string | undefin
 }
 
 /**
+ * The room name to look up, taken from whichever field can actually hold one.
+ *
+ * Callers do not always know the room name: a recording item may carry only a display title, and
+ * `resolveSuperchatStream` used to reject the broadcast outright when it was handed one. The page
+ * URL is built from the room name by `roomUrl()`, so it is the more trustworthy of the two and is
+ * consulted second rather than not at all.
+ */
+function superchatRoomName(cam: LiveCam): string | undefined {
+  for (const candidate of [text(cam.username), usernameFromRoomUrl(cam.pageUrl)]) {
+    if (candidate && ROOM_NAME.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
  * Map one API room record onto a LiveCam. Returns undefined unless the room is live and
  * public — a private or group show is out of scope rather than merely offline.
  */
@@ -174,7 +233,7 @@ export function superchatLiveCam(room: unknown): LiveCam | undefined {
   const value = record(room);
   if (!value) return undefined;
   const username = text(value.username);
-  if (!username || !/^[a-z0-9_.-]{1,64}$/i.test(username)) return undefined;
+  if (!username || !ROOM_NAME.test(username)) return undefined;
   if ((text(value.status) ?? "public").toLowerCase() !== "public") return undefined;
   const age = whole(value.age);
   return {
@@ -190,7 +249,7 @@ export function superchatLiveCam(room: unknown): LiveCam | undefined {
       value.broadcastGender ?? value.gender,
       text(value.country)?.toUpperCase(),
       value.isHd === true ? "hd" : undefined,
-      value.isVr === true ? "vr" : undefined,
+      value.isVr === true ? VR_TAG : undefined,
     ]),
   };
 }
@@ -200,7 +259,7 @@ export function superchatFavoriteCam(room: unknown): (LiveCam & { online: boolea
   const value = record(room);
   if (!value) return undefined;
   const username = text(value.username);
-  if (!username || !/^[a-z0-9_.-]{1,64}$/i.test(username)) return undefined;
+  if (!username || !ROOM_NAME.test(username)) return undefined;
   const online = (text(value.status) ?? "").toLowerCase() === "public" && value.isLive !== false;
   const age = whole(value.age);
   return {
@@ -216,7 +275,7 @@ export function superchatFavoriteCam(room: unknown): (LiveCam & { online: boolea
       value.broadcastGender ?? value.gender,
       text(value.country)?.toUpperCase(),
       value.isHd === true ? "hd" : undefined,
-      value.isVr === true ? "vr" : undefined,
+      value.isVr === true ? VR_TAG : undefined,
     ]),
     online,
   };
@@ -227,6 +286,9 @@ export function superchatPage(cams: LiveCam[], query: LiveCamQuery): LiveCamPage
   const needle = query.search?.trim().toLowerCase();
   const matching = dedupe(cams)
     .filter((cam) => {
+      // VR-only catalogue: the room pool is the whole Stripchat back end, so without this the
+      // list is ~99% 2D rooms. Favourites and single-room lookups bypass this funnel.
+      if (!isVrRoom(cam)) return false;
       if (query.gender && normalizedGender(cam.gender) !== query.gender) return false;
       return !needle || `${cam.username} ${cam.title ?? ""} ${(cam.tags ?? []).join(" ")}`.toLowerCase().includes(needle);
     })
@@ -267,7 +329,7 @@ async function loadCatalogue(context: PluginContext, primaryTag: string): Promis
           blockId: "topStreamsModels", blockUrl: "", excludeModelIds: [...seen.keys()],
         }),
         // Never wait past the end of the budget, so the sweep cannot overrun it.
-        signal: context.signal ?? AbortSignal.timeout(Math.max(1_000, Math.min(REQUEST_TIMEOUT_MS, remaining > 0 ? remaining : REQUEST_TIMEOUT_MS))),
+        signal: budgetSignal(context, remaining),
       });
       if (!response.ok) throw new Error(`SuperChat live rooms returned HTTP ${response.status}`);
       const payload = record(await response.json());
@@ -404,8 +466,8 @@ export async function superchatRoomState(context: PluginContext, username: strin
  * recorder would fetch the decoy and get a 404 body.
  */
 export async function resolveSuperchatStream(context: PluginContext, cam: LiveCam): Promise<LiveStream> {
-  const username = text(cam.username) ?? usernameFromRoomUrl(cam.pageUrl);
-  if (!username || !/^[a-z0-9_.-]{1,64}$/i.test(username)) throw new Error("SuperChat received an invalid room name");
+  const username = superchatRoomName(cam);
+  if (!username) throw new Error("SuperChat received an invalid room name");
   const state = await superchatRoomState(context, username);
   if (!state.online) throw new Error(`${username} is not broadcasting a public show`);
 
@@ -499,6 +561,13 @@ export async function resolveSuperchatDownload(context: PluginContext, item: Med
   const username = usernameFromRoomUrl(pageUrl) ?? item.identityKey;
   if (!username || !pageUrl) throw new Error("SuperChat recording is missing its public room URL");
   const stream = await resolveSuperchatStream(context, { id: item.externalId, username, title: item.title, pageUrl });
+  // ffmpeg follows a playlist exactly as written, so this platform's encrypted segment addresses
+  // have to be rewritten by the server's HLS proxy on the way through: a direct command fetches the
+  // decoys the playlist names instead, and the capture dies a stall timeout later with a message
+  // that says nothing about the real cause. Handing ffmpeg a proxied address is something only the
+  // central live capture path can do, so a stream that needs a key reaching here means that path
+  // was skipped and the recording cannot be made - say so now instead of recording nothing.
+  if (stream.playlistDecodeKey) throw new Error("SuperChat live streams can only be recorded through the live capture path; their playlist addresses are encrypted and must be rewritten by the server's HLS proxy");
   return ffmpegLiveCaptureCommand(stream, {
     referer: `${SUPERCHAT_ORIGIN}/`, output: "{outputDir}/capture.ts",
     filename: item.filename ?? `${item.externalId}.mp4`,
@@ -585,8 +654,8 @@ export async function superchatFollowedSnapshot(context: PluginContext): Promise
 export async function setSuperchatFavorite(context: PluginContext, cam: LiveCam, favorite: boolean): Promise<{ synchronized: boolean }> {
   const account = await superchatAccount(context);
   if (!account) return { synchronized: false };
-  const username = text(cam.username) ?? usernameFromRoomUrl(cam.pageUrl);
-  if (!username || !/^[a-z0-9_.-]{1,64}$/i.test(username)) throw new Error("SuperChat received an invalid room name");
+  const username = superchatRoomName(cam);
+  if (!username) throw new Error("SuperChat received an invalid room name");
   const modelId = await superchatModelId(context, username);
   await superchatApi(context, account, favorite ? "PUT" : "DELETE", `/v2/users/${account.userId}/favorites/${modelId}`);
   // Read back rather than trusting the write: the API is undocumented and a silent no-op
@@ -647,7 +716,7 @@ export default definePlugin({
     return superchatPage(await catalogue(context, primaryTag), query);
   },
   async getLiveCam(context, cam) {
-    const username = text(cam.username) ?? usernameFromRoomUrl(cam.pageUrl);
+    const username = superchatRoomName(cam);
     if (!username) throw new Error("SuperChat received an invalid room name");
     const state = await superchatRoomState(context, username);
     return {

@@ -96,6 +96,25 @@ describe("live capture request", () => {
     expect(log).toHaveBeenCalledWith("warn", expect.stringContaining("falling back"), "room is offline");
   });
 
+  it("hands the plugin a room name instead of the display title", async () => {
+    // A capture item carries no identity key; `liveRoom` names the room instead. Titled rooms are
+    // the norm ("Anais Bloom ( Anna)"), and a plugin that keys its lookup on this field refuses to
+    // resolve the broadcast when it is handed one — the recording then drops to a path that cannot
+    // record that provider at all.
+    const resolveLiveStream = vi.fn(async (_context: unknown, cam: { username?: string; pageUrl?: string }) => ({ url: "https://cdn.test/a.m3u8" }));
+    await liveRecordingRequest(plugin(resolveLiveStream), context, {
+      ...liveItem, identityKey: undefined, title: "Anais Bloom ( Anna)",
+      metadata: { live: true, liveRoom: "anais_bloom" },
+    });
+    expect(resolveLiveStream.mock.calls[0]![1]).toMatchObject({ username: "anais_bloom", pageUrl: "https://chaturbate.com/alice" });
+  });
+
+  it("still prefers an identity key to the room key", async () => {
+    const resolveLiveStream = vi.fn(async (_context: unknown, cam: { username?: string }) => ({ url: "https://cdn.test/a.m3u8" }));
+    await liveRecordingRequest(plugin(resolveLiveStream), context, { ...liveItem, metadata: { live: true, liveRoom: "someone_else" } });
+    expect(resolveLiveStream.mock.calls[0]![1]).toMatchObject({ username: "chaturbate:alice:1" });
+  });
+
   it("recognises a live broadcast so the sync path can refuse to queue it", () => {
     expect(isLiveCandidate(liveItem)).toBe(true);
     expect(isLiveCandidate({ externalId: "clip", mediaType: "video", metadata: {} })).toBe(false);
