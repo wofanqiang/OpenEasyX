@@ -94,29 +94,35 @@ describe("Open EasyX live cams", () => {
   // it instead of quietly arming a flag nothing reads any more.
   it("arms the owning performer through the favorite switch", async () => {
     const { database, plugins, service } = await fixture(); plugins.install("test.live");
-    await service.setFavorite("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice" };
+    // A favorite is a bookmark and never creates a performer, so the performer must exist first.
+    const { performer } = service.createPerformer("test.live", cam);
+    await service.setFavorite("test.live", cam, true);
     expect(service.setFavoriteAutoRecord("test.live", "alice", true)).toMatchObject({ autoRecord: true });
-    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(true);
+    expect(service.performerAutoRecord(database.getPerformer(performer.id)!)).toBe(true);
     expect(service.autoRecordTargets()).toMatchObject([{ providerId: "test.live", username: "alice" }]);
     service.setFavoriteAutoRecord("test.live", "alice", false);
-    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(false);
+    expect(service.performerAutoRecord(database.getPerformer(performer.id)!)).toBe(false);
     expect(service.autoRecordTargets()).toHaveLength(0);
     expect(service.setFavoriteAutoRecord("test.live", "nobody", true)).toBeUndefined();
   });
 
   it("adopts a favorite that was armed before auto-record moved to the performer", async () => {
     const { database, plugins, service } = await fixture(); plugins.install("test.live");
-    await service.setFavorite("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice" };
+    // Legacy state: a bookmark favorite plus the performer it used to create under the old rule.
+    const { performer } = service.createPerformer("test.live", cam);
+    await service.setFavorite("test.live", cam, true);
     database.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
     // A favorite on its own no longer arms anything: the performer switch is the only source.
     expect(service.autoRecordTargets()).toHaveLength(0);
     expect(service.adoptLegacyFavoriteAutoRecord()).toMatchObject({ adopted: 1, orphaned: [] });
-    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(true);
+    expect(service.performerAutoRecord(database.getPerformer(performer.id)!)).toBe(true);
     expect(service.autoRecordTargets()).toMatchObject([{ providerId: "test.live", username: "alice" }]);
     // The legacy flag is cleared so a later performer-level disable sticks, and a second boot has
     // nothing left to adopt.
     expect(database.listLiveCamFavorites()).toEqual([expect.objectContaining({ username: "alice", autoRecord: false })]);
-    service.setPerformerAutoRecord(database.getPerformerByName("alice")!.id, false);
+    service.setPerformerAutoRecord(performer.id, false);
     expect(service.adoptLegacyFavoriteAutoRecord()).toMatchObject({ adopted: 0, orphaned: [] });
     expect(service.autoRecordTargets()).toHaveLength(0);
   });
@@ -248,15 +254,20 @@ describe("Open EasyX live cams", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("creates and repairs performer profiles when a creator is favorited", async () => {
+  it("saves a favorite as a pure bookmark without creating a performer", async () => {
     const { database, plugins } = await fixture(); plugins.install("test.live");
     const saveImage = vi.fn(); const service = new LiveCamService(database, plugins, fetch, saveImage);
     const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice", thumbnailUrl: "https://live.test/alice.jpg" };
     await service.setFavorite("test.live", cam, true);
-    expect(database.listPerformers()).toMatchObject([{ name: "alice", imageUrl: cam.thumbnailUrl }]);
-    expect(saveImage).toHaveBeenCalledTimes(1);
+    // Favoriting is a bookmark only: no performer, no source and no local image are created.
+    expect(database.listPerformers()).toHaveLength(0);
+    expect(database.listSources()).toHaveLength(0);
+    expect(saveImage).not.toHaveBeenCalled();
+    expect(database.isLiveCamFavorite("test.live", "alice")).toBe(true);
+    // Re-favoriting the same room stays idempotent.
     await service.setFavorite("test.live", cam, true);
-    expect(database.listPerformers()).toHaveLength(1);
+    expect(database.listPerformers()).toHaveLength(0);
+    expect(database.isLiveCamFavorite("test.live", "alice")).toBe(true);
   });
 
   it("aggregates every installed live provider without a Viewer bridge", async () => {
@@ -583,8 +594,10 @@ describe("Open EasyX live cams", () => {
 
   it("toggles auto-record at the performer level across its live-cam favorites", async () => {
     const { database, plugins, service } = await fixture(); plugins.install("test.live");
-    await service.setFavorite("test.live", { id: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-    const performer = database.listPerformers().find((entry) => entry.externalRefs["test.live"] === "alice")!;
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice" };
+    await service.setFavorite("test.live", cam, true);
+    // Favoriting is a bookmark and does not create a performer, so add one explicitly to own the flag.
+    const { performer } = service.createPerformer("test.live", cam);
     expect(service.performerAutoRecord(performer)).toBe(false);
     // A performer can arm auto-record even with no saved live-cam favorite: the watcher now
     // polls every performer that has auto-record on, so the flag no longer requires a favorite.

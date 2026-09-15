@@ -468,9 +468,10 @@ export class LiveCamService {
     return [...targets.values()];
   }
 
-  // Bridge from the old favorite-level flag to the performer-level one, run once at boot. Adding
-  // a favorite also creates its performer, so an armed favorite is promoted to its owner, and the
-  // favorite column is cleared afterwards: the performer switch is the only truth left, and a
+  // Bridge from the old favorite-level flag to the performer-level one, run once at boot. Favorites
+  // used to also create their performer, and an armed favorite was the old way to request recording;
+  // now a favorite is a pure bookmark that owns no performer, so this only migrates legacy data
+  // where a favorite was armed under the old rule. The favorite column is cleared afterwards and a
   // later performer-level disable can never be undone by a stale favorite flag. Favorites whose
   // provider plugin is gone have no performer; they are reported instead of silently recording.
   adoptLegacyFavoriteAutoRecord(): { adopted: number; performers: string[]; orphaned: string[] } {
@@ -562,7 +563,8 @@ export class LiveCamService {
     const item = plugin.setLiveCamFavorite ? this.db.saveLiveCamFavoriteChange(providerId, input, favorite) : this.db.setLiveCamFavorite(providerId, input, favorite);
     const key = `${providerId}:${cam.id.toLowerCase()}`; const cached = this.recentCams.get(key);
     if (cached) cached.cam.favorite = favorite;
-    if (favorite) this.createPerformer(providerId, cam);
+    // A favorite is a pure bookmark: it records nothing and owns no performer. Recording is a
+    // separate intent, expressed by adding the performer (or arming auto-record), not by favoriting.
     if (plugin.setLiveCamFavorite) void this.flushFavoriteChanges(providerId);
     return { favorite, ...(item ? { item } : {}), ...(plugin.setLiveCamFavorite ? { synchronization: "pending" } : {}) };
   }
@@ -632,7 +634,6 @@ export class LiveCamService {
     for (const cam of cams) {
       if (removed.has(cam.username.toLowerCase()) || !cam.username.trim() || !cam.id.trim() || !pluginMatchesSource(entry.manifest, cam.pageUrl)) continue;
       this.db.setLiveCamFavorite(providerId, { ...cam, camId: cam.id }, true);
-      this.createPerformer(providerId, cam);
     }
   }
 
@@ -661,7 +662,6 @@ export class LiveCamService {
       this.db.setLiveCamFavorite(providerId, {
         camId: cam.id, username: cam.username, title: cam.title, pageUrl: cam.pageUrl, thumbnailUrl: cam.thumbnailUrl,
       }, true);
-      this.createPerformer(providerId, cam);
       previousKeys.delete(key);
     }
     for (const favorite of previous) {
