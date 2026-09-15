@@ -93,6 +93,15 @@
 .system-cores span[data-level=warn]{background:#f0b429}
 .system-cores span[data-level=high]{background:var(--red)}
 .system-stats-foot{margin:14px 0 0;color:#5c5c66;font-size:8px}
+/* Diagnostics (one-click self-check panel on the statistics page) */
+.diagnostics-panel{margin:14px 0 0}
+.diagnostics-intro{margin:0 0 12px;color:#666671;font-size:11px;line-height:1.5}
+.diagnostics-checks{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:8px}
+.diagnostics-checks li{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:1px solid #28282e;border-radius:8px;border-left:3px solid #2fa36b;background:var(--panel)}
+.diagnostics-checks li[data-ok="false"]{border-left-color:#d9534f;background:rgba(217,83,79,.06)}
+.diagnostics-checks li b{font-size:11px}
+.diagnostics-checks li span{color:#666671;font-size:10px;line-height:1.45;word-break:break-word}
+@media(max-width:800px){.diagnostics-checks li b{font-size:12px}}
 @media(max-width:1150px){.system-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.system-details{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:800px){.system-gauges{grid-template-columns:1fr}.system-metrics{grid-template-columns:1fr}.system-details{grid-template-columns:1fr}}
 /* Residual TS recovery (Recovery page under COLLECT) */

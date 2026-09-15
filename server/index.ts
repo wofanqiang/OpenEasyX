@@ -26,6 +26,7 @@ import { registerLibraryRoutes, parseMediaRange } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
 import { retentionPlan } from "./retention.js";
+import { runDiagnostics } from "./diagnostics.js";
 import { isLiveCandidate } from "../packages/live-capture.js";
 import { AuthService } from "./auth.js";
 import type { FastifyRequest, FastifyReply } from "fastify";
@@ -159,6 +160,7 @@ app.get("/api/version", async () => ({ version: appVersion }));
 // Host and container resource snapshot. Sampling happens on a background timer
 // inside SystemStatsService; this handler only reads the cached snapshot.
 app.get("/api/system/stats", async () => systemStats.snapshotNow());
+app.get("/api/system/diagnostics", async () => runDiagnostics({ db, plugins, mediaRoot: mediaDir, activePids: () => queue.activePids() }));
 
 app.post("/api/auth/login", async (request, reply) => {
   const limit = auth.checkRateLimit(request.ip);

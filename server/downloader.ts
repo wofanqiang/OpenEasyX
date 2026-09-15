@@ -174,6 +174,15 @@ export class DownloadQueue {
     return Promise.all(controls.map((control) => this.waitForExit(control, deadline))).then(() => undefined);
   }
 
+  /** Process ids of the children this queue is running right now. The diagnostics orphan scan
+   *  needs them: a healthy live capture matches the "stray ffmpeg" pattern just as well as a
+   *  crash leftover does, and only ownership tells the two apart. */
+  activePids(): number[] {
+    return [...this.active.values()]
+      .map((control) => control.child?.pid)
+      .filter((pid): pid is number => typeof pid === "number");
+  }
+
   /** Wait for a child to exit, escalating SIGTERM -> SIGKILL if it outlives the grace window.
    *  Detached ffmpeg reparents to init when node dies, so we MUST confirm exit before the
    *  process leaves or the capture keeps running (and writing to a deleted dir) forever. */
