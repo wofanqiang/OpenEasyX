@@ -33,6 +33,11 @@ describe("live recording output", () => {
     expect(request.args).toEqual(expect.arrayContaining(["--merge-output-format", "mp4", "--remux-video", "mp4"]));
   });
 
+  it("pins .part resumption so a retry continues instead of restarting", () => {
+    const request = ytDlpDownload({ externalId: "v:1", mediaType: "video", pageUrl: "https://video.test/1" }, {});
+    expect(request.args).toContain("--continue");
+  });
+
   it("captures a live stream to MPEG-TS with ffmpeg and self-reconnect flags", () => {
     const stream = { url: "https://cdn.test/live.m3u8?token=fresh", audioUrl: "https://cdn.test/audio.m3u8", headers: { Referer: "https://live.test/", "User-Agent": "yt-dlp" } };
     const request = ffmpegLiveCaptureCommand(stream, { referer: "https://live.test/", output: "{outputDir}/capture.ts", filename: "alice.mp4" });

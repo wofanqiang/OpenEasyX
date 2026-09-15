@@ -133,6 +133,10 @@ export function ytDlpDownload(item: MediaCandidate, config: Record<string, unkno
     : "bestvideo*[vcodec!=none]+bestaudio[acodec!=none]/best[acodec!=none]/best";
   const args = [
     "--progress", "--newline", "--progress-delta", "0.5", "--progress-template", "download:easyx-progress:%(progress._percent_str)s", "--no-playlist", "--retries", "5", "--fragment-retries", "5",
+    // A9: resume a .part file left by a failed attempt (the downloader keeps the staging
+    // directory across retries). yt-dlp does this by default, but pin it so an upstream
+    // default change or a stray --no-continue can never silently break resumption.
+    "--continue",
     "--concurrent-fragments", "1", ...configuredArgs(config),
   ];
   if (options.impersonate) args.push("--impersonate", options.impersonate);

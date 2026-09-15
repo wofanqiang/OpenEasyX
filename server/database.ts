@@ -542,7 +542,9 @@ export class Database {
   }
 
   scheduleRetry(itemId: string, error: string, attempts: number, nextRetryAt: string) {
-    this.sqlite.prepare("UPDATE items SET status='queued',progress=0,downloaded_bytes=0,error=?,attempts=?,next_retry_at=?,download_started_at=NULL,download_finished_at=NULL,updated_at=? WHERE id=?")
+    // A9: downloaded_bytes is deliberately kept -- the staging partial file survives the
+    // retry, and the downloader re-derives the true value from the file on disk anyway.
+    this.sqlite.prepare("UPDATE items SET status='queued',progress=0,error=?,attempts=?,next_retry_at=?,download_started_at=NULL,download_finished_at=NULL,updated_at=? WHERE id=?")
       .run(error, attempts, nextRetryAt, now(), itemId);
   }
 

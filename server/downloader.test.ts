@@ -77,6 +77,88 @@ describe("DownloadQueue", () => {
     expect(fs.existsSync(staleDirectory)).toBe(false);
   });
 
+  // A9 scaffolding: a plugin that serves the item from a scripted local HTTP server, with a
+  // fast retry base so a scheduled retry lands inside the waitFor window.
+  async function resumeFixture(serverHandler: (request: http.IncomingMessage, response: http.ServerResponse, attempt: number) => void) {
+    const dataDir = temp("easyx-resume-data"); const mediaDir = temp("easyx-resume-media"); const pluginDir = temp("easyx-resume-plugins");
+    let attempt = 0;
+    const server = http.createServer((request, response) => { attempt += 1; serverHandler(request, response, attempt); });
+    server.listen(0, "127.0.0.1"); await once(server, "listening");
+    const address = server.address(); if (!address || typeof address === "string") throw new Error("Missing test server address");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.resume", name: "Resume", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveDownload(_context, item) { return { url: item.metadata.url, filename: item.filename }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.resume", { installed: true, enabled: true });
+    db.updateSettings({ downloadRetryBaseSeconds: 1 });
+    const person = db.upsertPerformer({ externalId: "person", name: "Resume Performer" }, "test.resume");
+    const source = db.addSource(person.id, "test.resume", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "asset", mediaType: "video", filename: "asset.mp4", metadata: { url: `http://127.0.0.1:${address.port}/asset.mp4` } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    return { db, queue, server, item, mediaDir, address };
+  }
+
+  it("resumes an interrupted download with a Range request instead of starting over", async () => {
+    const ranges: Array<string | undefined> = [];
+    const { db, queue, server, item, mediaDir } = await resumeFixture((request, response, attempt) => {
+      ranges.push(request.headers.range);
+      if (attempt === 1) {
+        // Die mid-body: 5 of 10 bytes delivered, then the connection drops.
+        response.setHeader("content-length", "10");
+        response.write("first");
+        setTimeout(() => response.destroy(), 30);
+      } else {
+        response.writeHead(206, { "content-length": "5", "content-range": "bytes 5-10/10" });
+        response.end("last!");
+      }
+    });
+    await waitFor(() => db.getItem(item.id)?.status === "completed"); queue.stop(); server.close();
+    // First attempt carried no Range, the retry continued from the 5 staged bytes, and the
+    // final file is byte-identical to the full resource.
+    expect(ranges[0]).toBeUndefined();
+    expect(ranges[1]).toBe("bytes=5-");
+    expect(fs.readFileSync(path.join(mediaDir, "Resume Performer", "example.test", "asset.mp4"), "utf8")).toBe("firstlast!");
+    expect(fs.existsSync(path.join(mediaDir, ".downloads", item.id))).toBe(false);
+  });
+
+  it("falls back to a full download when the server ignores the Range header", async () => {
+    const { db, queue, server, item, mediaDir } = await resumeFixture((request, response, attempt) => {
+      void request.headers.range; // sent, but the server answers 200 with the whole body
+      if (attempt === 1) {
+        response.setHeader("content-length", "10");
+        response.write("first");
+        setTimeout(() => response.destroy(), 30);
+      } else {
+        response.writeHead(200, { "content-length": String("fresh media!".length) });
+        response.end("fresh media!");
+      }
+    });
+    await waitFor(() => db.getItem(item.id)?.status === "completed"); queue.stop(); server.close();
+    // The 200 truncated the partial file and replaced it wholesale -- no stitched bytes.
+    expect(fs.readFileSync(path.join(mediaDir, "Resume Performer", "example.test", "asset.mp4"), "utf8")).toBe("fresh media!");
+  });
+
+  it("refuses a 206 that starts beyond the staged bytes instead of writing a gapped file", async () => {
+    const { db, queue, server, item } = await resumeFixture((request, response, attempt) => {
+      if (attempt === 1) {
+        response.setHeader("content-length", "10");
+        response.write("first");
+        setTimeout(() => response.destroy(), 30);
+      } else {
+        // The server claims to resume from byte 7 while staging holds 5: appending would
+        // leave a hole. The queue must fail the item rather than corrupt the media.
+        response.writeHead(206, { "content-length": "3", "content-range": "bytes 7-10/10" });
+        response.end("st!");
+      }
+    });
+    // Two attempts: the first stages 5 bytes and dies, the second gets the unusable 206.
+    db.updateSettings({ downloadRetryAttempts: 2 });
+    await waitFor(() => (db.getItem(item.id)?.error ?? "").includes("cannot be filled"));
+    queue.stop(); server.close();
+    expect(db.getItem(item.id)?.status).toBe("failed");
+    expect(db.getItem(item.id)?.error ?? "").toContain("cannot be filled");
+  });
+
   it("stores by performer/domain and removes byte-identical duplicates", async () => {
     const dataDir = temp("easyx-data"); const mediaDir = temp("easyx-media"); const pluginDir = temp("easyx-plugins");
     const server = http.createServer((_request, response) => { response.setHeader("content-length", "11"); response.end("hello media"); });

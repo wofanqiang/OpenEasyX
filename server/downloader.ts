@@ -356,7 +356,16 @@ export class DownloadQueue {
       const destination = path.join(this.mediaRoot, downloadOutputPath(settings, item, performer.name, source.domain, filename));
       this.prepareOutputDirectory(path.dirname(destination));
       temporaryDirectory = path.join(this.downloadsRoot, safeSegment(item.id, "download"));
-      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+      // A9 resume: a retry keeps the staging directory so the partial file can be continued
+      // (fetch via Range, yt-dlp via its .part files). Only the very first attempt starts
+      // from an empty directory, and a live capture never resumes -- a broadcast cannot be
+      // re-joined where it died, so its staging always starts clean.
+      const isLiveItem = (item.metadata as Record<string, unknown> | undefined)?.live === true;
+      if ((item.attempts ?? 0) > 0 && !isLiveItem && fs.existsSync(temporaryDirectory)) {
+        this.writeLog?.("info", "download", "Retry resumes the partial staging files", { itemId: item.id, attempts: item.attempts });
+      } else {
+        fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+      }
       fs.mkdirSync(temporaryDirectory, { recursive: true, mode: 0o700 });
       temporary = path.join(temporaryDirectory, filename);
       let checksum: string;
@@ -421,18 +430,59 @@ export class DownloadQueue {
         checksum = await this.hashFile(temporary);
       } else {
         const controller = new AbortController(); control.abort = controller;
-        const response = await fetch(request.url, { method: request.method ?? "GET", headers: request.headers, body: request.body, redirect: "follow", signal: controller.signal });
+        // A9 resume: when a retry finds a partial file, ask the server to continue from the
+        // bytes already on disk. Only a 206 whose Content-Range starts at (or before) the
+        // staging size may be appended; a 200 means the server ignored the Range, so the
+        // write truncates and the body is taken as the complete file.
+        const stagingBytes = fs.existsSync(temporary) ? fs.statSync(temporary).size : 0;
+        const mayResume = stagingBytes > 0 && (item.attempts ?? 0) > 0;
+        const resumeFetch = (range: boolean) => fetch(request.url, {
+          method: request.method ?? "GET",
+          headers: range ? { ...request.headers, Range: `bytes=${stagingBytes}-` } : request.headers,
+          body: request.body, redirect: "follow", signal: controller.signal,
+        });
+        let response = await resumeFetch(mayResume);
+        if (response.status === 416 && mayResume) {
+          // The staging file already holds everything: the previous attempt died after the
+          // last byte landed (during hashing or the move into place). Take the whole body.
+          response = await resumeFetch(false);
+        }
         if (!response.ok || !response.body) throw new Error(`Download returned HTTP ${response.status}`);
-        const contentLength = Number(response.headers.get("content-length") ?? item.expectedBytes ?? 0);
+        const contentRange = response.status === 206 ? response.headers.get("content-range") ?? "" : "";
+        const resumeStart = /^bytes (\d+)-/i.exec(contentRange)?.[1];
+        const totalFromRange = /\/(\d+)\s*$/.exec(contentRange)?.[1];
+        if (response.status === 206 && resumeStart === undefined) {
+          void response.body.cancel().catch(() => {});
+          throw new Error("Server answered the Range request with 206 but no Content-Range header");
+        }
+        const resumeOffset = Number(resumeStart ?? 0);
+        if (response.status === 206 && resumeOffset > stagingBytes) {
+          // A 206 starting beyond what we hold would leave a gap in the file: unusable.
+          // Fail so the normal retry path takes over instead of writing corrupt media.
+          void response.body.cancel().catch(() => {});
+          throw new Error(`Server resumed from byte ${resumeOffset} but staging holds ${stagingBytes}; the missing range cannot be filled`);
+        }
+        if (response.status === 206 && resumeOffset < stagingBytes) {
+          // The server is continuing from a lower offset than we hold: truncate to its
+          // offset so the bytes it is about to send stay contiguous with the file.
+          fs.truncateSync(temporary, resumeOffset);
+        }
+        const append = response.status === 206;
+        const contentLength = Number(response.headers.get("content-length") ?? 0);
+        const totalSize = append ? (Number(totalFromRange) || resumeOffset + contentLength) : (contentLength || item.expectedBytes || 0);
+        const baseBytes = append ? resumeOffset : 0;
         const hash = createHash("sha256"); let received = 0;
         const readable = Readable.fromWeb(response.body as any);
         readable.on("data", (chunk: Buffer) => {
           hash.update(chunk); received += chunk.length;
-          reportProgress(contentLength ? received / contentLength : undefined, received);
+          const done = baseBytes + received;
+          reportProgress(totalSize ? done / totalSize : undefined, done);
         });
-        await pipeline(readable, fs.createWriteStream(temporary, { mode: 0o600 }));
-        reportProgress(contentLength ? received / contentLength : undefined, received, true);
-        checksum = hash.digest("hex");
+        await pipeline(readable, fs.createWriteStream(temporary, { mode: 0o600, flags: append ? "a" : "w" }));
+        reportProgress(totalSize ? (baseBytes + received) / totalSize : undefined, baseBytes + received, true);
+        // An appended file's checksum must cover the bytes from earlier attempts too, so on
+        // the resume path the digest is computed over the finished file, not the chunks.
+        checksum = append ? await this.hashFile(temporary) : hash.digest("hex");
       }
       if (control.action === "cancel" || control.action === "delete") throw new Error("Download cancelled");
       if (item.mediaType === "video" && item.metadata.live === true && settings.recordingPreset && settings.recordingPreset !== "source") {
@@ -559,7 +609,12 @@ export class DownloadQueue {
         // Keep the underlying command output: without it a stall is undiagnosable
         // (the real ffmpeg/yt-dlp error is the only clue to what went wrong).
         if (control.stalled) message = `Download timed out (no progress received within the configured stall timeout). Underlying output: ${message.slice(0, 800)}`;
-        this.handleFailure(item.id, message, control);
+        const disposition = this.handleFailure(item.id, message, control);
+        // A9: a scheduled retry must find the staging directory with the partial file still
+        // in it -- that file is the resume point (fetch Range / yt-dlp .part). Live captures
+        // are excluded: a broadcast cannot be re-joined where it died, so keeping their
+        // staging would only risk a stale capture.ts mixing into a fresh recording.
+        if (disposition === "retry" && (item.metadata as Record<string, unknown> | undefined)?.live !== true) preserveTemporary = true;
       }
     } finally {
       if (stallTimer) clearInterval(stallTimer);
@@ -605,6 +660,10 @@ export class DownloadQueue {
       for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
         if (!entry.isDirectory()) continue;
         if (this.active.has(entry.name)) continue;
+        // A9: a queued item with a staging directory is a scheduled retry waiting for its
+        // slot; the directory holds the partial file that retry will resume from.
+        const staged = this.db.getItem(entry.name);
+        if (staged?.status === "queued") continue;
         const full = path.resolve(root, entry.name);
         if (protectedDirs.has(full)) continue;
         // Deletion used to be unconditional (A10), which threw away recordings a restart
