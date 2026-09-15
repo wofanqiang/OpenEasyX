@@ -132,6 +132,19 @@ export class Database {
     if (!itemColumns.has("downloaded_bytes")) this.sqlite.exec("ALTER TABLE items ADD COLUMN downloaded_bytes INTEGER NOT NULL DEFAULT 0");
     if (!itemColumns.has("attempts")) this.sqlite.exec("ALTER TABLE items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
     if (!itemColumns.has("next_retry_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN next_retry_at TEXT");
+    // A plain column maintained by the write paths, not a generated one: the queue queries used
+    // to derive "is this a live capture" with json_extract(...) on metadata_json, which no index
+    // can serve, so every scheduler tick (1s x slot) scanned the whole table. Backfill once so
+    // databases written before this column existed keep the same pool split.
+    if (!itemColumns.has("is_live")) {
+      this.sqlite.exec("ALTER TABLE items ADD COLUMN is_live INTEGER NOT NULL DEFAULT 0");
+      this.sqlite.exec("UPDATE items SET is_live=1 WHERE json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')=1");
+    }
+    // (status, is_live, created_at) rather than also carrying next_retry_at: the OR in the
+    // queue predicate would sever the ordering, forcing a temp b-tree sort per tick, while
+    // this shape lets SQLite walk straight to the oldest eligible row and stop at LIMIT 1.
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_queue_pool_idx ON items(status,is_live,created_at)");
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_source_live_idx ON items(source_id,is_live,status)");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_visual_hash_idx ON items(performer_id,media_type,visual_hash)");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_storage_path_idx ON items(storage_path)");
     this.migrateNitterToPublicX();
@@ -420,15 +433,16 @@ export class Database {
         }
       }
       const stamp = now();
-      this.sqlite.prepare(`INSERT INTO items(id,performer_id,source_id,plugin_id,external_id,identity_key,title,page_url,media_type,filename,quality_score,expected_bytes,published_at,metadata_json,status,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      const liveMetadata = (candidate.metadata as Record<string, unknown> | undefined)?.live === true;
+      this.sqlite.prepare(`INSERT INTO items(id,performer_id,source_id,plugin_id,external_id,identity_key,title,page_url,media_type,filename,quality_score,expected_bytes,published_at,metadata_json,is_live,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(id("item"), source.performerId, source.id, source.scraperPluginId ?? source.pluginId, candidate.externalId, candidate.identityKey ?? null,
           candidate.title ?? null, candidate.pageUrl ?? null, candidate.mediaType, candidate.filename ?? null, candidate.qualityScore ?? 0,
-          candidate.expectedBytes ?? null, canonicalDate ?? null, JSON.stringify(candidate.metadata ?? {}),
+          candidate.expectedBytes ?? null, canonicalDate ?? null, JSON.stringify(candidate.metadata ?? {}), liveMetadata ? 1 : 0,
           // A live stream is not a stored file. The global "queue discovered media" switch must
           // not turn a broadcast into a recording on its own, so live candidates only queue when
           // this very source opted in (the recorder sets its own item to queued explicitly).
-          (source.autoDownload || (autoGlobal && (candidate.metadata as Record<string, unknown> | undefined)?.live !== true)) ? "queued" : "available", stamp, stamp);
+          (source.autoDownload || (autoGlobal && !liveMetadata)) ? "queued" : "available", stamp, stamp);
       added++;
     }
     return { added, upgraded, skipped };
@@ -495,11 +509,10 @@ export class Database {
   }
 
   // `live` picks the pool: true = live recordings, false = ordinary downloads,
-  // undefined = whatever is oldest. CASE guards json_extract so a row with malformed
-  // metadata (or none at all) reads as "not live" instead of failing the query.
+  // undefined = whatever is oldest. `is_live` is a maintained mirror of metadata.live whose
+  // composite index (items_queue_pool_idx) lets this run as a search instead of a table scan.
   nextQueued(live?: boolean): DownloadItem | undefined {
-    const flag = "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')";
-    const pool = live === undefined ? "" : live ? ` AND ${flag}=1` : ` AND coalesce(${flag},0)!=1`;
+    const pool = live === undefined ? "" : live ? " AND is_live=1" : " AND is_live=0";
     const row = this.sqlite.prepare(`SELECT * FROM items WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?)${pool} ORDER BY created_at LIMIT 1`).get(now()) as any;
     return row ? this.mapItem(row) : undefined;
   }
@@ -510,8 +523,7 @@ export class Database {
   // CPU and the same disk budget until both die. Callers that would open or create a live
   // capture consult this first, so the room only ever has one capture in flight.
   activeLiveItemForSource(sourceId: string, exceptItemId?: string): DownloadItem | undefined {
-    const flag = "json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')";
-    const row = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND id<>? AND ${flag}=1
+    const row = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND id<>? AND is_live=1
       AND status IN ('queued','downloading','paused','stopping','cancelling') ORDER BY created_at LIMIT 1`)
       .get(sourceId, exceptItemId ?? "") as any;
     return row ? this.mapItem(row) : undefined;
@@ -550,8 +562,10 @@ export class Database {
     const item = this.getItem(itemId);
     if (!item) return undefined;
     const next = { ...item.metadata, ...patch };
-    this.sqlite.prepare("UPDATE items SET metadata_json=?,updated_at=? WHERE id=?")
-      .run(JSON.stringify(next), now(), itemId);
+    // Keep the indexable is_live mirror in lockstep with metadata_json; it is what the queue
+    // queries read, so a patch that flips `live` must move the row between pools.
+    this.sqlite.prepare("UPDATE items SET metadata_json=?,is_live=?,updated_at=? WHERE id=?")
+      .run(JSON.stringify(next), (next as Record<string, unknown>).live === true ? 1 : 0, now(), itemId);
     return this.getItem(itemId);
   }
 

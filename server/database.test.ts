@@ -91,6 +91,40 @@ describe("Database", () => {
     expect(db.getItemBySourceExternalId(source.id, "clip")?.status).toBe("queued");
   });
 
+  it("serves the queue pools from the is_live index instead of a table scan", () => {
+    const db = createDb();
+    const person = db.createPerformer({ name: "Alice" });
+    const source = db.addSource(person.id, "test.live", { externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", metadata: { live: true } }, { externalId: "clip", mediaType: "video" }]);
+    // The scheduler runs these shapes every tick per slot; a json_extract predicate could not
+    // use an index, so each one scanned the whole items table. The hot pool pickup must be an
+    // index search that needs no sort (the index supplies created_at order and LIMIT 1 stops
+    // early); the rare in-flight lookup only has to avoid the table scan -- its status IN(...)
+    // makes a sort unavoidable, and it is bounded by one source's rows anyway.
+    const pool = db.sqlite.prepare("EXPLAIN QUERY PLAN SELECT * FROM items WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?) AND is_live=1 ORDER BY created_at LIMIT 1").all(Date.now()) as Array<{ detail: string }>;
+    const inFlight = db.sqlite.prepare("EXPLAIN QUERY PLAN SELECT * FROM items WHERE source_id=? AND id<>? AND is_live=1 AND status IN ('queued','downloading','paused','stopping','cancelling') ORDER BY created_at LIMIT 1").all(source.id, "") as Array<{ detail: string }>;
+    const poolDetail = pool.map((row) => row.detail).join(" | ");
+    const inFlightDetail = inFlight.map((row) => row.detail).join(" | ");
+    expect(poolDetail).toContain("USING INDEX items_queue_pool_idx");
+    expect(poolDetail).not.toContain("SCAN items");
+    expect(poolDetail).not.toContain("TEMP B-TREE");
+    expect(inFlightDetail).toContain("USING INDEX items_source_live_idx");
+    expect(inFlightDetail).not.toContain("SCAN items");
+  });
+
+  it("keeps the is_live mirror in lockstep when metadata is patched", () => {
+    const db = createDb();
+    const person = db.createPerformer({ name: "Alice" });
+    const source = db.addSource(person.id, "test.live", { externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test" });
+    db.ingestItems(source, [{ externalId: "clip", mediaType: "video" }]);
+    const item = db.getItemBySourceExternalId(source.id, "clip")!;
+    expect(db.nextQueued(false)?.id).toBe(item.id);
+    expect(db.nextQueued(true)).toBeUndefined();
+    db.setItemMetadata(item.id, { live: true });
+    expect(db.nextQueued(true)?.id).toBe(item.id);
+    expect(db.nextQueued(false)).toBeUndefined();
+  });
+
   it("migrates pre-scraper databases without losing source schedules", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
     const sqlite = new DatabaseSync(path.join(dir, "easyx.sqlite"));
