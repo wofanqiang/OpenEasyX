@@ -484,6 +484,28 @@ it("moves a tiny auto-ended live recording to recovery as a fragment (C3)", asyn
   } finally { queue.stop(); server.close(); }
 });
 
+it("rescues a whole segmented (A10) capture in one recovery run", async () => {
+  const dataDir = temp("easyx-recovseg-data"); const mediaDir = temp("easyx-recovseg-media"); const pluginDir = temp("easyx-recovseg-plugins");
+  const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+  fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.recov-seg", name: "RecovSeg", version: "1", description: "Test", author: "Test", capabilities: [] } };`);
+  const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+  const queue = new DownloadQueue(db, manager, mediaDir);
+  // An interrupted A10 capture: three real MPEG-TS parts and no folded capture.ts. The old
+  // rescue path saved only the alphabetically-first slice and needed one run per part.
+  const staged = path.join(mediaDir, ".downloads", "item_seg"); fs.mkdirSync(staged, { recursive: true });
+  for (const name of ["capture_part000.ts", "capture_part001.ts", "capture_part002.ts"]) fs.writeFileSync(path.join(staged, name), segmentTemplateBytes());
+  const recovered = path.join(mediaDir, ".recording-recovery", safeSegment("item_seg"), "recovered.mp4");
+  const report = await queue.recoverResidualTs({ execute: true });
+  expect(report.rescued).toBe(1);
+  expect(fs.existsSync(recovered)).toBe(true);
+  // The rescued MP4 holds all three parts (bigger than any single slice), and every part is
+  // deleted so a second run cannot re-rescue the same recording from the remaining slices.
+  expect(fs.statSync(recovered).size).toBeGreaterThan(segmentTemplateBytes().length);
+  expect(fs.readdirSync(staged).filter((file) => file.endsWith(".ts"))).toEqual([]);
+  const second = await queue.recoverResidualTs({ execute: true });
+  expect(second.rescued).toBe(0);
+}, 30000);
+
 describe("concurrentLimit", () => {
   it("keeps downloads inside their historical 1..8 range", () => {
     expect(concurrentLimit(2, 2, 8)).toBe(2);

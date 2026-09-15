@@ -1034,8 +1034,10 @@ export class DownloadQueue {
     }
   }
 
-  /** Remux a live MPEG-TS capture into an MP4, shifting the audio by the measured A/V skew. */
-  private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload): Promise<number> {
+  /** Remux a live MPEG-TS capture into an MP4, shifting the audio by the measured A/V skew.
+   *  `concatList` (A10 segmented-capture rescue) swaps the single-file input for the concat
+   *  demuxer, so every part is remuxed in one pass without an intermediate folded capture.ts. */
+  private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload, concatList?: string, inputBytes?: number): Promise<number> {
     let audioShift = readAvSyncSidecar(tsPath + ".avsync.json") ?? 0;
     if (audioShift === 0) {
       try {
@@ -1058,9 +1060,14 @@ export class DownloadQueue {
     const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
     // `+faststart` rewrites the whole file after the muxer has written it, so this step takes
     // minutes on a multi-GB capture and must not read as a stalled download.
-    let captureBytes = 0; try { captureBytes = fs.statSync(tsPath).size; } catch { /* keep 0 */ }
+    let captureBytes = 0;
+    if (inputBytes !== undefined) captureBytes = inputBytes;
+    else { try { captureBytes = fs.statSync(tsPath).size; } catch { /* keep 0 */ } }
     await this.withPostProcessDeadline(control, captureBytes, "Remux", () => this.runCommandDownload("ffmpeg", [
-      "-y", "-fflags", "+genpts+igndts", "-i", tsPath,
+      "-y", "-fflags", "+genpts+igndts",
+      // The concat demuxer streams every capture part as one continuous input; a plain
+      // `-i tsPath` here would remux only the first slice of a segmented capture.
+      ...(concatList ? ["-f", "concat", "-safe", "0", "-i", concatList] : ["-i", tsPath]),
       "-map", "0", "-c:v", "copy", "-c:a", "aac",
       ...(audioFilter ? ["-af", audioFilter] : []),
       // Still corrects any drift inside the audio timeline itself.
@@ -1072,16 +1079,23 @@ export class DownloadQueue {
     return audioShift;
   }
 
-  private findCaptureSource(dir: string): string | undefined {
+  /** Single-file capture candidates only; segmented (A10) captures are folded at remux time. */
+  private findNamedCapture(dir: string): string | undefined {
     for (const candidate of ["capture.ts", "capture.mkv", "capture.mp4"]) {
       const candidatePath = path.join(dir, candidate);
       if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).size > 0) return candidatePath;
     }
-    try {
-      const ts = fs.readdirSync(dir).filter((file) => file.endsWith(".ts") && fs.statSync(path.join(dir, file)).size > 0);
-      if (ts.length) return path.join(dir, ts[0]);
-    } catch { /* directory read failed */ }
     return undefined;
+  }
+
+  /** Last-resort capture candidate: any non-empty .ts that is neither named nor a segment part. */
+  private findLooseCapture(dir: string): string | undefined {
+    try {
+      const ts = fs.readdirSync(dir)
+        .filter((file) => file.endsWith(".ts") && !CAPTURE_SEGMENT_PATTERN.test(file) && fs.statSync(path.join(dir, file)).size > 0)
+        .sort();
+      return ts.length ? path.join(dir, ts[0]) : undefined;
+    } catch { return undefined; }
   }
 
   private async isPlayableCapture(tsPath: string): Promise<boolean> {
@@ -1145,7 +1159,13 @@ export class DownloadQueue {
         if (this.active.has(itemId) || (item && ACTIVE.has(item.status))) {
           report.skipped++; report.items.push({ itemId, action: "skipped" }); continue;
         }
-        const tsPath = this.findCaptureSource(path.join(root, name));
+        const stagingDir = path.join(root, name);
+        // A10 segmented captures land as capture_partNNN.ts. The remux below folds them via the
+        // concat demuxer so a whole recording is rescued in ONE run; the old path saved only the
+        // alphabetically-first slice and needed one recovery run per 10-minute part.
+        const folded = this.findNamedCapture(stagingDir);
+        const parts = captureSegmentFiles(stagingDir, { skipEmpty: true });
+        const tsPath = folded ?? parts[0] ?? this.findLooseCapture(stagingDir);
         if (!tsPath) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
         const recoverable = await this.isPlayableCapture(tsPath);
         if (!recoverable) {
@@ -1160,7 +1180,17 @@ export class DownloadQueue {
         if (dryRun) { report.rescued++; report.items.push({ itemId, action: "rescued" }); continue; }
         try {
           this.prepareOutputDirectory(recoveryDir);
-          await this.remuxCaptureToMp4(tsPath, outPath, { action: undefined, paused: false, encoding: false } as ActiveDownload);
+          // Multi-part captures go through the concat demuxer directly: an intermediate folded
+          // capture.ts would double the disk footprint of a multi-GB recording during the rescue.
+          let concatList: string | undefined;
+          if (!folded && parts.length >= 2) {
+            concatList = path.join(stagingDir, "capture.concat.txt");
+            fs.writeFileSync(concatList, parts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
+          }
+          const inputBytes = concatList
+            ? parts.reduce((total, part) => { try { return total + fs.statSync(part).size; } catch { return total; } }, 0)
+            : undefined;
+          await this.remuxCaptureToMp4(tsPath, outPath, { action: undefined, paused: false, encoding: false } as ActiveDownload, concatList, inputBytes);
           const probe = await this.probeVideo(outPath);
           const sidecar = {
             itemId, title: item?.title ?? itemId,
@@ -1174,11 +1204,16 @@ export class DownloadQueue {
           if (path.resolve(tsPath) !== path.resolve(outPath)) {
             // The rescue itself succeeded, so the item is still reported as rescued; only the
             // leftover capture could not be removed (for example a staging folder the server
-            // user cannot write to). Count it instead of hiding a failed cleanup.
-            try { fs.unlinkSync(tsPath); }
-            catch (error) {
-              report.leftover++;
-              this.writeLog?.("warn", "download", "Rescued capture could not be deleted", { itemId, path: tsPath, error: String(error) });
+            // user cannot write to). Count it instead of hiding a failed cleanup. Segmented
+            // captures delete every part: otherwise the next run would re-rescue the same
+            // recording from the remaining slices.
+            for (const leftoverFile of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
+              if (path.resolve(leftoverFile) === path.resolve(outPath)) continue;
+              try { fs.unlinkSync(leftoverFile); }
+              catch (error) {
+                report.leftover++;
+                this.writeLog?.("warn", "download", "Rescued capture could not be deleted", { itemId, path: leftoverFile, error: String(error) });
+              }
             }
           }
           report.rescued++; report.items.push({ itemId, action: "rescued" });

@@ -216,8 +216,11 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const selectAll = () => setSelectedIds((current) => visible.every((item) => current.has(item.itemId)) ? new Set() : new Set(visible.map((item) => item.itemId)));
   const cancelSelection = () => { setSelectionMode(false); setSelectedIds(new Set()); };
 
-  if (preview) return <PlayerViewer media={previewMedia(preview)} context={{}} autoStart={false} readOnly
-    close={closePreview} favorite={() => {}} advance={() => {}} setNotice={setNotice}/>;
+  // The playback view renders outside the recovery shell, so it still needs the `.library-mode`
+  // wrapper: library.css is @scope'd to it, and without it the Back button falls back to the
+  // browser's default light button style (light pill with light text — unreadable).
+  if (preview) return <div className="library-mode"><PlayerViewer media={previewMedia(preview)} context={{}} autoStart={false} readOnly
+    close={closePreview} favorite={() => {}} advance={() => {}} setNotice={setNotice}/></div>;
 
   const total = items?.length ?? 0;
   const allSelected = Boolean(visible.length) && visible.every((item) => selectedIds.has(item.itemId));
