@@ -6,7 +6,7 @@ import path from "node:path";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, concurrentLimit, postProcessDeadlineMs, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, concurrentLimit, httpStatusFromError, postProcessDeadlineMs, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -242,6 +242,38 @@ describe("postProcessDeadlineMs", () => {
     // The regression: a ~2 GB capture was SIGKILLed mid-remux at ~122s, i.e. right on the
     // 120s download stall timeout, and the whole recording was written off as failed.
     expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBeGreaterThan(120_000 * 2);
+  });
+});
+
+describe("retryDisposition", () => {
+  it("reads the HTTP status out of the shapes the download paths actually emit", () => {
+    expect(httpStatusFromError("Download returned HTTP 404")).toBe(404);
+    expect(httpStatusFromError("ffmpeg: Server returned 403 Forbidden")).toBe(403);
+    expect(httpStatusFromError("ERROR: unable to download video data: HTTP Error 410: Gone")).toBe(410);
+    expect(httpStatusFromError("Download failed: status code 500")).toBe(500);
+    expect(httpStatusFromError("ETIMEDOUT: connection timed out")).toBeUndefined();
+    expect(httpStatusFromError("got 200 OK")).toBeUndefined(); // a 2xx is not a failure status
+  });
+
+  it("fails a gone media URL immediately, never retrying it", () => {
+    expect(retryDisposition("Download returned HTTP 404", 1)).toBe("permanent");
+    expect(retryDisposition("Server returned 410 Gone", 1)).toBe("permanent");
+  });
+
+  it("gives a 403 exactly one retry before giving up", () => {
+    // First failure: many CDNs 403 an expired signed URL, which a fresh resolve fixes.
+    expect(retryDisposition("Server returned 403 Forbidden", 1)).toBe("retry");
+    // Second failure: it is genuinely forbidden, so stop burning a slot.
+    expect(retryDisposition("Server returned 403 Forbidden", 2)).toBe("permanent");
+  });
+
+  it("keeps network errors, 5xx and stalls retryable", () => {
+    expect(retryDisposition("Download timed out (no progress received within the configured stall timeout).", 1)).toBe("retry");
+    expect(retryDisposition("ECONNRESET", 1)).toBe("retry");
+    expect(retryDisposition("Server returned 503 Service Unavailable", 1)).toBe("retry");
+    expect(retryDisposition("Server returned 500", 4)).toBe("retry");
+    // A message with no status at all must never be judged permanent.
+    expect(retryDisposition("Extractor completed without producing a media file", 5)).toBe("retry");
   });
 });
 

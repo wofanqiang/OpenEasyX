@@ -81,6 +81,48 @@ export function postProcessDeadlineMs(inputBytes: number): number {
   return Math.min(45 * 60_000, Math.max(8 * 60_000, scaled));
 }
 
+/** HTTP status codes a media URL can never recover from: the resource is gone for good. */
+const PERMANENT_HTTP_STATUS = new Set([404, 410]);
+/**
+ * 403 is deliberately NOT permanent on the first strike: many CDNs answer with 403 for an
+ * expired signed URL, which a fresh stream resolution fixes. It only becomes permanent once a
+ * retry has already failed, so a genuinely forbidden resource still stops wasting a slot.
+ */
+const RETRY_ONCE_HTTP_STATUS = new Set([403]);
+
+/** Pull the first 4xx/5xx HTTP status out of a download error message, if the message carries one. */
+export function httpStatusFromError(message: string): number | undefined {
+  const patterns = [
+    /download returned http\s*(\d{3})/i,
+    /server returned\s*(\d{3})/i,
+    /http error\s*(\d{3})/i,
+    /status(?:\s*code)?[:\s]+(\d{3})/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(message);
+    if (!match) continue;
+    const status = Number(match[1]);
+    if (status >= 400 && status <= 599) return status;
+  }
+  return undefined;
+}
+
+/**
+ * Decide whether a failed download is worth retrying.
+ *
+ * Only an *explicit* HTTP status may mark a failure permanent: 404/410 mean the media is gone,
+ * and 403 is treated as an expired token that survives exactly one retry. Everything else --
+ * 5xx, 400/401, timeouts, socket resets, stalls -- stays retryable, because a wrong
+ * "permanent" verdict would drop a recording a plain retry would have saved.
+ */
+export function retryDisposition(message: string, attempts: number): "permanent" | "retry" {
+  const status = httpStatusFromError(message);
+  if (status === undefined) return "retry";
+  if (PERMANENT_HTTP_STATUS.has(status)) return "permanent";
+  if (RETRY_ONCE_HTTP_STATUS.has(status) && attempts >= 2) return "permanent";
+  return "retry";
+}
+
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
   private finalizers = new Map<string, Promise<void>>();
@@ -518,20 +560,32 @@ export class DownloadQueue {
     }
   }
 
-  private handleFailure(itemId: string, message: string, control: ActiveDownload) {
+  /** Schedule a retry or mark the item failed. Returns which branch was taken so the caller
+   *  can keep the staging directory alive for a retry (A9: the partial file is the resume point). */
+  private handleFailure(itemId: string, message: string, control: ActiveDownload): "retry" | "failed" {
     const settings = this.db.getSettings();
     const maxAttempts = Math.max(0, Number(settings.downloadRetryAttempts ?? 5));
     const attempts = (this.db.getItem(itemId)?.attempts ?? 0) + 1;
-    if (attempts < maxAttempts) {
+    // A deterministic HTTP failure (gone media, or a forbidden URL that already survived one
+    // retry) must not burn the whole exponential-backoff schedule: fail it now so the slot
+    // frees up. Every other failure keeps the normal retry path.
+    if (retryDisposition(message, attempts) === "retry" && attempts < maxAttempts) {
       const base = Math.max(1, Number(settings.downloadRetryBaseSeconds ?? 30));
       const delay = Math.min(base * 2 ** (attempts - 1), 3600) * 1000;
       const jitter = Math.floor(Math.random() * Math.min(delay, 30_000));
       const nextRetryAt = new Date(Date.now() + delay + jitter).toISOString();
       this.db.scheduleRetry(itemId, message, attempts, nextRetryAt);
       this.writeLog?.("warn", "download", "Download failed, scheduling automatic retry", { itemId, attempt: attempts, maxAttempts, nextRetryAt, error: message });
+      return "retry";
     } else {
+      const status = httpStatusFromError(message);
       this.db.setItemStatus(itemId, "failed", { error: message });
-      this.writeLog?.("error", "download", "Download failed permanently after exhausting retries", { itemId, attempts, error: message });
+      if (status !== undefined && retryDisposition(message, attempts) === "permanent") {
+        this.writeLog?.("error", "download", "Download failed permanently: the source returned an unrecoverable HTTP status", { itemId, attempts, status, error: message });
+      } else {
+        this.writeLog?.("error", "download", "Download failed permanently after exhausting retries", { itemId, attempts, error: message });
+      }
+      return "failed";
     }
   }
 
