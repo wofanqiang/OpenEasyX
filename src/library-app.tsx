@@ -345,11 +345,16 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
   }, [preset.query, preset.kind, preset.performer, preset.source, preset.watched, preset.sort, preset.page, historyOnly]);
   useEffect(() => { route({ query, kind, performer, source, watched, sort, page }); }, [query, kind, performer, source, watched, sort, page]);
   useEffect(() => {
+    const controller = new AbortController();
     const timer = setTimeout(() => {
       setLoading(true);
-      void api<LibraryResult>(`/api/library?${params}`).then(setResult).finally(() => setLoading(false));
+      // Aborting on unmount/filter change also stops a slow earlier response from
+      // overwriting a newer one, and keeps a failed request from staying unhandled.
+      void api<LibraryResult>(`/api/library?${params}`, { signal: controller.signal }).then(setResult).catch((error) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+      }).finally(() => setLoading(false));
     }, 180);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); controller.abort(); };
   }, [params, refreshToken]);
   useEffect(() => { setSelectionMode(false); setSelectedIds(new Set()); }, [params]);
   const title = favoriteOnly ? "Favorite media" : historyOnly ? "Watch history" : performer || "Media library";

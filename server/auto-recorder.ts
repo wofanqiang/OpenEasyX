@@ -211,7 +211,13 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
   const schedule = () => {
     if (stopped) return;
     timer = setTimeout(async () => {
-      await tick();
+      // A rejected tick must not break the chain, or the watcher would silently stop
+      // rescheduling itself and auto-recording would never run again.
+      try {
+        await tick();
+      } catch (error) {
+        log?.(`auto-record: polling cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       if (!stopped) schedule();
     }, intervalSeconds() * 1000);
     timer.unref();

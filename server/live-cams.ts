@@ -209,11 +209,22 @@ export class LiveCamService {
             }).sort((left, right) => Number(!right.statusUnavailable && right.online !== false) - Number(!left.statusUnavailable && left.online !== false) || whole(right.viewers) - whole(left.viewers) || left.username.localeCompare(right.username));
           } else {
             const savedFavorites = this.db.listLiveCamFavorites(entry.manifest.id);
-            const discovered = await Promise.all(savedFavorites.map(async (favorite) => {
-              const result = await plugin.listLiveCams!(this.plugins.context(entry.manifest.id, signal), { page: 1, pageSize: 8, search: favorite.username });
-              const needle = favorite.username.toLowerCase();
-              return result.cams.find((cam) => cam.username.toLowerCase() === needle || cam.id.toLowerCase() === favorite.camId.toLowerCase());
-            }));
+            // Mirror the branch above: batch the lookups and isolate failures, so one
+            // unreachable favorite cannot reject the whole listing.
+            const discovered: Array<LiveCam | undefined> = [];
+            for (let offset = 0; offset < savedFavorites.length; offset += 4) {
+              const batch = await Promise.all(savedFavorites.slice(offset, offset + 4).map(async (favorite): Promise<LiveCam | undefined> => {
+                try {
+                  const result = await plugin.listLiveCams!(this.plugins.context(entry.manifest.id, signal), { page: 1, pageSize: 8, search: favorite.username });
+                  const needle = favorite.username.toLowerCase();
+                  return result.cams.find((cam) => cam.username.toLowerCase() === needle || cam.id.toLowerCase() === favorite.camId.toLowerCase());
+                } catch (error) {
+                  warning ??= error instanceof Error ? error.message : String(error);
+                  return undefined;
+                }
+              }));
+              discovered.push(...batch);
+            }
             const unique = new Map(discovered.filter(Boolean).map((cam) => [cam!.username.toLowerCase(), cam!]));
             favorites = [...unique.values()].map((cam) => ({ ...cam, online: true })).sort((left, right) => whole(right.viewers) - whole(left.viewers));
           }
@@ -226,18 +237,23 @@ export class LiveCamService {
         }
       } else if (plugin.listMedia) {
         const sources = this.db.listSources().filter((source) => source.enabled && source.scraperPluginId === entry.manifest.id);
-        const discovered = await Promise.all(sources.map(async (source) => {
-          const candidates = await plugin.listMedia!(this.plugins.context(entry.manifest.id, signal), source);
-          const candidate = candidates.find((item) => item.metadata?.live === true);
-          if (!candidate) return undefined;
-          const performer = this.db.getPerformer(source.performerId);
-          const username = usernameFromUrl(source.profileUrl);
-          const metadata = candidate.metadata ?? {};
-          return {
-            id: source.id, username, title: candidate.title ?? performer?.name ?? username, pageUrl: candidate.pageUrl ?? source.profileUrl,
-            thumbnailUrl: performer?.imageUrl, viewers: whole(metadata.viewers), gender: text(metadata.gender),
-            tags: Array.isArray(metadata.tags) ? metadata.tags.map(String) : [],
-          } satisfies LiveCam;
+        const discovered = await Promise.all(sources.map(async (source): Promise<LiveCam | undefined> => {
+          try {
+            const candidates = await plugin.listMedia!(this.plugins.context(entry.manifest.id, signal), source);
+            const candidate = candidates.find((item) => item.metadata?.live === true);
+            if (!candidate) return undefined;
+            const performer = this.db.getPerformer(source.performerId);
+            const username = usernameFromUrl(source.profileUrl);
+            const metadata = candidate.metadata ?? {};
+            return {
+              id: source.id, username, title: candidate.title ?? performer?.name ?? username, pageUrl: candidate.pageUrl ?? source.profileUrl,
+              thumbnailUrl: performer?.imageUrl, viewers: whole(metadata.viewers), gender: text(metadata.gender),
+              tags: Array.isArray(metadata.tags) ? metadata.tags.map(String) : [],
+            } satisfies LiveCam;
+          } catch (error) {
+            warning ??= error instanceof Error ? error.message : String(error);
+            return undefined;
+          }
         }));
         cams = discovered.filter(Boolean) as LiveCam[];
         if (query.search) {

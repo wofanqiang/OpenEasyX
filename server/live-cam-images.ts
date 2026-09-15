@@ -9,6 +9,40 @@ import type { PluginManager } from "./plugin-manager.js";
 
 const run = promisify(execFile);
 
+const INTERNAL_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa", ".lan"];
+
+/**
+ * Portrait URLs come from provider listings and room metadata, which means somebody who
+ * controls a listing can point them at addresses the server can reach but the caller
+ * cannot -- cloud metadata endpoints, the Docker bridge, anything on the private network.
+ * Reject non-web protocols, reserved IP literals and obvious internal host names. This
+ * cannot stop DNS rebinding on its own, which is why redirects are resolved by hand
+ * below so every hop is checked the same way.
+ */
+export function isSafeImageUrl(value: string): boolean {
+  let url: URL;
+  try { url = new URL(value); } catch { return false; }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || INTERNAL_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return false;
+  if (host.startsWith("::ffff:")) return isSafeImageUrl(`${url.protocol}//${host.slice(7)}`);
+  if (host === "::1" || host === "::") return false;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const a = Number(ipv4[1]); const b = Number(ipv4[2]);
+    if (a === 0 || a === 10 || a === 127) return false;          // "this" network, private, loopback
+    if (a === 172 && b >= 16 && b <= 31) return false;           // private 172.16/12
+    if (a === 192 && b === 168) return false;                    // private 192.168/16
+    if (a === 169 && b === 254) return false;                    // link-local / cloud metadata
+    if (a === 100 && b >= 64 && b <= 127) return false;          // carrier-grade NAT
+    if (a >= 224) return false;                                  // multicast and reserved
+    return true;
+  }
+  // IPv6 literals: block loopback, unique-local, link-local and multicast.
+  if (/^[a-f0-9:]+$/.test(host) && /^(::1|fc|fd|fe[89ab]|ff)/.test(host)) return false;
+  return true;
+}
+
 export class LiveCamImages {
   private pending = new Map<string, Promise<void>>();
   private retryAt = new Map<string, number>();
@@ -35,6 +69,21 @@ export class LiveCamImages {
     return task;
   }
 
+  /** Fetches without automatic redirects, so every hop passes isSafeImageUrl(). */
+  private async fetchChecked(context: { fetch: typeof fetch; signal?: AbortSignal }, url: string, init: RequestInit): Promise<Response> {
+    let current = url;
+    for (let hop = 0; hop < 3; hop++) {
+      if (!isSafeImageUrl(current)) throw new Error("Refusing to fetch an image from a non-public address");
+      const response = await context.fetch(current, { ...init, redirect: "manual", signal: context.signal });
+      const status = response.status;
+      if (status < 300 || status > 399) return response;
+      const location = response.headers.get("location");
+      if (!location) return response;
+      current = new URL(location, current).toString();
+    }
+    throw new Error("Too many redirects while fetching a portrait");
+  }
+
   private async store(providerId: string, cam: LiveCam, performer: Performer) {
     const context = this.plugins.context(providerId, AbortSignal.timeout(20_000));
     const candidates = await liveProfileImages(context, cam).catch(() => [] as string[]);
@@ -46,8 +95,9 @@ export class LiveCamImages {
     for (const url of new Set(candidates)) {
       const temporary = path.join(this.directory, `${performer.id}.download`);
       const converted = path.join(this.directory, `${performer.id}.tmp.jpg`);
+      if (!isSafeImageUrl(url)) continue;
       try {
-        const response = await context.fetch(url, { headers: { referer: cam.pageUrl, "user-agent": "Mozilla/5.0" }, signal: context.signal });
+        const response = await this.fetchChecked(context, url, { headers: { referer: cam.pageUrl, "user-agent": "Mozilla/5.0" } });
         if (!response.ok || !response.headers.get("content-type")?.startsWith("image/") || !response.body) continue;
         const chunks: Uint8Array[] = []; let size = 0;
         const reader = response.body.getReader();
