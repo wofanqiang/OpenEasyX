@@ -36,6 +36,47 @@ function replyStub() {
 }
 
 describe("Open EasyX live cams", () => {
+  // A performer can be added by pasting its profile URL. That path writes the placeholder
+  // manual plugin into source.plugin_id, records the real scraper in scraper_plugin_id, and
+  // stores the URL (not the handle) as external_id. The watcher used to consult plugin_id
+  // alone, so those performers stayed armed in the UI but were never polled or recorded.
+  it("keeps a performer added by pasting a URL on the auto-record watch list", async () => {
+    const { database, plugins, service } = await fixture();
+    plugins.install("test.live");
+    const performer = database.createPerformer({ name: "Alice" });
+    const source = database.addSource(performer.id, "org.easyx.manual", {
+      externalId: "https://live.test/alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test",
+    });
+    database.updateSource(source.id, { scraperPluginId: "test.live" });
+    database.setPerformerAutoRecord(performer.id, true);
+    expect(service.autoRecordTargets()).toMatchObject([
+      { providerId: "test.live", username: "alice", pageUrl: "https://live.test/alice" },
+    ]);
+  });
+
+  it("still watches a performer whose source already names the live plugin", async () => {
+    const { database, plugins, service } = await fixture();
+    plugins.install("test.live");
+    const performer = database.createPerformer({ name: "Alice" });
+    database.addSource(performer.id, "test.live", {
+      externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test",
+    });
+    database.setPerformerAutoRecord(performer.id, true);
+    const targets = service.autoRecordTargets();
+    expect(targets).toHaveLength(1);
+    expect(targets[0]).toMatchObject({ providerId: "test.live", username: "alice" });
+  });
+
+  it("ignores a performer that was never armed", async () => {
+    const { database, plugins, service } = await fixture();
+    plugins.install("test.live");
+    const performer = database.createPerformer({ name: "Alice" });
+    database.addSource(performer.id, "test.live", {
+      externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test",
+    });
+    expect(service.autoRecordTargets()).toHaveLength(0);
+  });
+
   it("uses the reconnected account immediately instead of its cached login failure", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
     const followed = vi.fn().mockResolvedValueOnce({ authoritative: false, cams: [], skippedReason: "Session expired" })

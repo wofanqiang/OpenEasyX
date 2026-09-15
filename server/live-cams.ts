@@ -51,6 +51,20 @@ function usernameFromUrl(value: string): string {
   catch { return "live"; }
 }
 
+// A source stores its provider identity either as a bare handle ("alice_dusk_") or buried in
+// the profile URL ("https://chaturbate.com/alice_dusk/"), depending on how it was added. Both
+// have to reach the room lookup as the handle, and anything unusable must yield "" -- unlike
+// usernameFromUrl, whose "live" fallback would be sent to the provider as a real room name.
+function handleFromReference(value: string | undefined): string {
+  const raw = (value ?? "").trim();
+  if (!raw) return "";
+  if (!raw.includes("/") && !raw.includes(":")) return raw.replace(/^@/, "");
+  try {
+    const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
+    return url.pathname.split("/").filter(Boolean).at(-1)?.replace(/^@/, "") ?? "";
+  } catch { return ""; }
+}
+
 export class LiveCamService {
   private recentCams = new Map<string, { cam: PublicLiveCam; expiresAt: number }>();
   private snapshotLoads = new Map<string, Promise<LiveCamFavoriteSnapshot>>();
@@ -427,8 +441,17 @@ export class LiveCamService {
         push(pluginId, externalId, source?.profileUrl ?? "");
       }
       for (const source of sources) {
-        if (source.performerId !== performer.id || !providers.has(source.pluginId)) continue;
-        push(source.pluginId, source.externalId, source.profileUrl);
+        if (source.performerId !== performer.id) continue;
+        // Adding a performer by pasting its URL parks the placeholder manual plugin in
+        // plugin_id and records the real scraper in scraper_plugin_id. Consulting plugin_id
+        // alone silently dropped every such performer: it stayed armed in the UI, yet
+        // produced no target, so the watcher never polled -- or recorded -- it at all.
+        const providerId = providers.has(source.pluginId) ? source.pluginId : source.scraperPluginId;
+        if (!providerId || !providers.has(providerId)) continue;
+        // external_id is the handle for a plugin-added source but the full URL for a pasted
+        // one, and a URL never matches the username a provider reports back.
+        const username = handleFromReference(source.externalId) || handleFromReference(source.profileUrl);
+        push(providerId, username, source.profileUrl);
       }
       for (const favorite of this.performerFavoriteMatches(performer)) push(favorite.providerId, favorite.username, favorite.pageUrl);
     }
