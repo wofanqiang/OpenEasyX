@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "../../packages/plugin-sdk/index.js";
+import superchatPlugin from "./index.js";
 import {
   listSuperchatMedia, normalizedGender, primaryTagFor, resetSuperchatCaches, resolveSuperchatDownload,
   resolveSuperchatStream, roomUrl, setSuperchatFavorite, superchatFavoriteCam, superchatFollowedSnapshot,
@@ -414,5 +415,21 @@ describe("SuperChat favourites", () => {
     await expect(superchatFollowedSnapshot(session)).resolves.toEqual(expect.objectContaining({
       cams: [], authoritative: false, skippedReason: expect.any(String),
     }));
+  });
+});
+
+describe("SuperChat sweep budget", () => {
+  it("stops the catalogue sweep at the budget the context carries", async () => {
+    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const exclude = (JSON.parse(String(init?.body)) as { excludeModelIds: number[] }).excludeModelIds;
+      const models = Array.from({ length: 60 }, (_, index) => room({ id: exclude.length + index + 1, username: `budget-${exclude.length + index + 1}` }));
+      return new Response(JSON.stringify({ models }), { status: 200 });
+    });
+    const log = vi.fn();
+    const context = { config: {}, fetch, log, runCommand: vi.fn(), budgetMs: 0 } as unknown as PluginContext;
+    const page = await superchatPlugin.listLiveCams!(context, { page: 1, pageSize: 24 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(page.cams).toHaveLength(24);
+    expect(log).toHaveBeenCalledWith("warn", expect.stringContaining("0ms budget"));
   });
 });

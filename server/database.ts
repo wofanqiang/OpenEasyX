@@ -4,6 +4,7 @@ import path from "node:path";
 import { asJson, id, now } from "./utils.js";
 import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packages/plugin-sdk/index.js";
 import { outputDefaults } from "../packages/output-settings.js";
+import { liveCrawlBudgetDefaults } from "../packages/live-budget.js";
 
 export type Performer = {
   id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>; autoRecord: boolean;
@@ -149,6 +150,7 @@ export class Database {
     this.setDefault("autoRecordMinBytes", 5 * 1024 * 1024);
     this.setDefault("admin_password_hash", "");
     for (const [key, value] of Object.entries(outputDefaults)) this.setDefault(key, value);
+    for (const [key, value] of Object.entries(liveCrawlBudgetDefaults)) this.setDefault(key, value);
   }
 
   private migrateNitterToPublicX() {

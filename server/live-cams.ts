@@ -3,6 +3,7 @@ import type { LiveCam, LiveCamFavoriteSnapshot, LiveCamQuery, LiveStream } from 
 import type { Database, LiveCamFavorite, Performer, Source } from "./database.js";
 import { HlsProxy } from "./hls-proxy.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
+import { providerEnvelopeMs } from "../packages/live-budget.js";
 
 export type PublicLiveCam = LiveCam & { providerId: string; providerName: string; favorite: boolean; autoRecord: boolean; performerId?: string };
 export type LiveCamProviderStatus = { id: string; name: string; ok: boolean; count: number; pending?: boolean; error?: string; warning?: string };
@@ -122,7 +123,7 @@ export class LiveCamService {
     const epoch = this.favoriteEpoch.get(providerId);
     const operation = (async () => {
       const plugin = this.plugins.get(providerId);
-      const snapshot = await plugin.listFollowedLiveCams!(this.plugins.context(providerId, AbortSignal.timeout(45_000)))
+      const snapshot = await plugin.listFollowedLiveCams!(this.plugins.context(providerId, AbortSignal.timeout(providerEnvelopeMs(this.db.getSettings()))))
         .catch((error): LiveCamFavoriteSnapshot => ({ cams: [], authoritative: false, skippedReason: error instanceof Error ? error.message : String(error) }));
       if (!snapshot.authoritative && cached) {
         const partial = new Map(cached.snapshot.cams.map((cam) => [cam.username.toLowerCase(), { ...cam, statusUnavailable: true }]));
@@ -147,7 +148,7 @@ export class LiveCamService {
     const running = this.providerLoads.get(key);
     if (running) return running;
     const epoch = this.favoriteEpoch.get(entry.manifest.id);
-    const operation = this.loadProvider(entry, query, AbortSignal.timeout(45_000), favoritesOnly).then((result) => {
+    const operation = this.loadProvider(entry, query, AbortSignal.timeout(providerEnvelopeMs(this.db.getSettings())), favoritesOnly).then((result) => {
       if (!result.status.ok && cached?.result.items.length) result = {
         ...cached.result, items: cached.result.items.map((cam) => ({ ...cam, statusUnavailable: true })),
         status: { ...cached.result.status, warning: result.status.error },
@@ -525,7 +526,7 @@ export class LiveCamService {
         checks += 1;
         try {
           let cam: LiveCam;
-          const signal = AbortSignal.timeout(45_000);
+          const signal = AbortSignal.timeout(providerEnvelopeMs(this.db.getSettings()));
           if (plugin.getLiveCam) cam = await plugin.getLiveCam(this.plugins.context(providerId, signal), offline);
           else {
             const result = await plugin.listLiveCams!(this.plugins.context(providerId, signal), { page: 1, pageSize: 8, search: username });
@@ -576,7 +577,7 @@ export class LiveCamService {
         attempted.add(change.revision);
         this.db.updateLiveCamFavoriteChange(change.revision, "pending");
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(new Error("Account synchronization timed out. Your local favorite is saved; synchronization will retry.")), 45_000); timer.unref();
+        const timer = setTimeout(() => controller.abort(new Error("Account synchronization timed out. Your local favorite is saved; synchronization will retry.")), providerEnvelopeMs(this.db.getSettings())); timer.unref();
         try {
           const plugin = this.plugins.get(providerId);
           const abort = new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true }));

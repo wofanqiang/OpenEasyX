@@ -106,6 +106,15 @@ export type CommandResult = {
 export type PluginContext = {
   config: Record<string, unknown>;
   signal?: AbortSignal;
+  /**
+   * How long this plugin may spend on one catalogue/listing sweep, taken from the
+   * `liveCrawlBudgetPreset` setting so a single control governs every plugin. Stop at the
+   * deadline and return what you already have: the server aborts at this value plus a small
+   * margin, and an abort turns a short list into an error page.
+   *
+   * This is a sweep budget, not a command timeout - `runCommand({ timeoutMs })` is independent.
+   */
+  budgetMs?: number;
   fetch: typeof globalThis.fetch;
   runCommand: (command: string, args: string[], options?: { timeoutMs?: number; maxOutputBytes?: number }) => Promise<CommandResult>;
   log: (level: "debug" | "info" | "warn" | "error", message: string, details?: unknown) => void;

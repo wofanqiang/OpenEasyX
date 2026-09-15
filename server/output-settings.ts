@@ -2,6 +2,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { DownloadItem } from "./database.js";
 import { outputSettings, renderOutputPath, validateOutputTemplate, type RecordingPreset } from "../packages/output-settings.js";
+import { liveCrawlBudgetPresetIds } from "../packages/live-budget.js";
 
 const template = (kind: "path" | "filename") => z.string().superRefine((value, context) => {
   const message = validateOutputTemplate(value, kind); if (message) context.addIssue({ code: "custom", message });
@@ -19,6 +20,9 @@ export const settingsSchema = z.object({
   autoRecordMinBytes: z.number().int().min(0).max(2_000_000_000).optional(),
   outputPathTemplate: template("path").optional(), outputFilenameTemplate: template("filename").optional(),
   recordingPreset: z.enum(["source", "h264-high", "h264-small", "h265"]).optional(),
+  // Presets rather than a free number: the ceiling is what keeps a plugin's sweep budget below
+  // the provider envelope, and the envelope below the page's own timeouts.
+  liveCrawlBudgetPreset: z.enum(liveCrawlBudgetPresetIds).optional(),
 });
 
 export function downloadOutputPath(settings: Record<string, unknown>, item: DownloadItem, performer: string, site: string, originalFilename: string): string {

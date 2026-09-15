@@ -40,6 +40,13 @@ describe("Database", () => {
     expect(db.getSettings().autoRecordCheckSeconds).toBe(60);
   });
 
+  it("defaults the live catalogue sweep budget to the balanced preset and persists a change", () => {
+    const db = createDb();
+    expect(db.getSettings().liveCrawlBudgetPreset).toBe("balanced");
+    db.updateSettings({ liveCrawlBudgetPreset: "max" });
+    expect(db.getSettings().liveCrawlBudgetPreset).toBe("max");
+  });
+
   it("queues discovered media by default without overriding a saved preference", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
     const initial = new Database(dir);

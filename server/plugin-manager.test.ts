@@ -72,6 +72,26 @@ describe("plugin lifecycle", () => {
     expect(database.getPluginState("test.simple").config).toEqual({ maxItems: 25 });
   });
 
+  it("hands every plugin the same sweep budget taken from the setting", async () => {
+    // Cleans up after itself instead of using temporaryDirectories: an open SQLite handle makes
+    // the shared afterEach fail with EPERM on Windows, which would add a failure this test does
+    // not own.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-plugin-budget-"));
+    const pluginRoot = path.join(root, "plugins"); fs.mkdirSync(path.join(pluginRoot, "sample"), { recursive: true });
+    fs.writeFileSync(path.join(pluginRoot, "sample", "index.mjs"), `export default { manifest: { id: "test.budget", name: "Budget", version: "1", description: "Test", author: "Test", capabilities: [] } };`);
+    const database = new Database(path.join(root, "data"));
+    try {
+      const manager = new PluginManager(database, [pluginRoot]); await manager.load();
+      expect(manager.context("test.budget").budgetMs).toBe(30_000);
+      database.updateSettings({ liveCrawlBudgetPreset: "conservative" });
+      expect(manager.context("test.budget").budgetMs).toBe(15_000);
+      database.updateSettings({ liveCrawlBudgetPreset: "max" });
+      expect(manager.context("test.budget").budgetMs).toBe(40_000);
+    } finally {
+      database.sqlite.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("stores imported account sessions privately and removes them on uninstall", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-plugin-session-")); temporaryDirectories.push(root);
     const pluginRoot = path.join(root, "plugins"); const sessionsRoot = path.join(root, "sessions");

@@ -22,6 +22,10 @@ describe("output settings", () => {
     expect(settingsSchema.safeParse({ outputFilenameTemplate: "" }).success).toBe(false);
     expect(settingsSchema.safeParse({ recordingPreset: "arbitrary-shell-command" }).success).toBe(false);
   });
+  it("accepts only the published live catalogue budget presets", () => {
+    for (const preset of ["conservative", "balanced", "max"]) expect(settingsSchema.safeParse({ liveCrawlBudgetPreset: preset }).success).toBe(true);
+    for (const value of ["wild", "45", "", 40, 15, null]) expect(settingsSchema.safeParse({ liveCrawlBudgetPreset: value }).success).toBe(false);
+  });
   it("preserves media extensions and uses MP4 only for re-encoded live videos", () => {
     const settings = { recordingPreset: "h264-small" };
     expect(downloadOutputPath(settings, item, "Alice", "site", "video.webm")).toBe("Alice/site/video.webm");

@@ -161,3 +161,24 @@ describe("public live-cam discovery paging", () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe("Stripchat sweep budget", () => {
+  it("stops the sweep at the budget the context carries and pages what arrived", async () => {
+    vi.useFakeTimers();
+    try {
+      // Far past any snapshot an earlier test cached, so this call sweeps instead of serving one.
+      vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+      const models = Array.from({ length: 500 }, (_, index) => ({ id: index + 1, username: `budget-${index + 1}`, status: "public", viewersCount: 1, broadcastGender: "couple" }));
+      const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { excludeModelIds: number[] };
+        return new Response(JSON.stringify({ models: models.slice(body.excludeModelIds.length, body.excludeModelIds.length + 60) }), { status: 200 });
+      });
+      const log = vi.fn();
+      const context = { config: {}, fetch, log, runCommand: vi.fn(), budgetMs: 0 };
+      const page = await listDiscoveredLiveCams(context, "stripchat", { page: 1, pageSize: 24, gender: "couple" });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(page).toMatchObject({ total: 60, pages: 3 });
+      expect(log).toHaveBeenCalledWith("info", expect.stringContaining("0ms budget"));
+    } finally { vi.useRealTimers(); }
+  });
+});

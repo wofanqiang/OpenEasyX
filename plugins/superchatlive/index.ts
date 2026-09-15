@@ -17,6 +17,7 @@
 import { definePlugin, type LiveCam, type LiveCamFavoriteSnapshot, type LiveCamPage, type LiveCamQuery, type LiveStream, type MediaCandidate, type MediaSource, type PluginContext } from "../../packages/plugin-sdk/index.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
 import { ffmpegLiveCaptureCommand } from "../../packages/live-capture.js";
+import { LIVE_CRAWL_BUDGET_FALLBACK_MS } from "../../packages/live-budget.js";
 import { configuredArgs, testYtDlp, ytDlpLiveStream } from "../yt-dlp-utils.js";
 import {
   SUPERCHAT_API, SUPERCHAT_ORIGIN, SUPERCHAT_STREAM_HEADERS,
@@ -52,11 +53,11 @@ const VR_TAG = "vr";
 const BATCH_SIZE = 60;
 const BATCH_LIMIT = 150;
 const REQUEST_TIMEOUT_MS = 20_000;
-// Cap one sweep so a slow catalogue can never block a page render behind it. 30s is the ceiling
-// the outer bounds leave room for: the server aborts a provider after 45s
-// (`AbortSignal.timeout(45_000)` in server/live-cams.ts) and the page holds a 60s REST fallback
-// plus a 90s SSE guard, so a wider sweep still lands inside every one of them.
-const CRAWL_BUDGET_MS = 30_000;
+// The sweep budget comes from the `liveCrawlBudgetPreset` setting via `context.budgetMs`, so one
+// control governs every plugin. The fallback below only covers a context built without one (bare
+// unit tests). The ordering that must hold: plugin budget < provider envelope (budget + 5s) <
+// page REST fallback (60s) < page SSE guard (90s) - see packages/live-budget.ts.
+const CRAWL_BUDGET_FALLBACK_MS = LIVE_CRAWL_BUDGET_FALLBACK_MS;
 const CATALOGUE_TTL_MS = 180_000;
 // Past its freshness window a snapshot is still served instantly for this long while a
 // refresh runs in the background; past the grace period we wait instead of showing a
@@ -153,7 +154,7 @@ function requestSignal(context: PluginContext): AbortSignal {
  * A per-batch signal clamped to whatever is left of the crawl budget.
  *
  * Composing rather than picking matters: `context.signal` alone would let one hung batch run to
- * the caller's own envelope (45s) even after the deadline passed, which is exactly the overrun the
+ * the provider envelope even after the deadline passed, which is exactly the overrun the
  * deadline exists to prevent.
  */
 function budgetSignal(context: PluginContext, remainingMs: number): AbortSignal {
@@ -312,11 +313,12 @@ export function superchatPage(cams: LiveCam[], query: LiveCamQuery): LiveCamPage
  */
 async function loadCatalogue(context: PluginContext, primaryTag: string): Promise<LiveCam[]> {
   const seen = new Map<number, Record<string, unknown>>();
-  const deadline = Date.now() + CRAWL_BUDGET_MS;
+  const budgetMs = context.budgetMs ?? CRAWL_BUDGET_FALLBACK_MS;
+  const deadline = Date.now() + budgetMs;
   for (let batch = 0; batch < BATCH_LIMIT; batch += 1) {
     const remaining = deadline - Date.now();
     if (batch > 0 && remaining <= 0) {
-      context.log("warn", `SuperChat live catalogue stopped at its ${CRAWL_BUDGET_MS}ms budget with ${seen.size} rooms loaded`);
+      context.log("warn", `SuperChat live catalogue stopped at its ${budgetMs}ms budget with ${seen.size} rooms loaded`);
       break;
     }
     let pageRooms: Record<string, unknown>[];

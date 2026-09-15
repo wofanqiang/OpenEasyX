@@ -1,5 +1,6 @@
 import type { LiveCam, LiveCamPage, LiveCamQuery, PluginContext } from "../packages/plugin-sdk/index.js";
 import { absoluteUrl, browserHtml, decodeHtml, plainHtml, renderedBrowserHtml } from "./browser-html-utils.js";
+import { LIVE_CRAWL_BUDGET_FALLBACK_MS } from "../packages/live-budget.js";
 
 export type LiveCamDiscoveryProvider = "bongacams" | "cam4" | "cams" | "camsoda" | "livejasmin" | "myfreecams" | "stripchat" | "twitch" | "xcams";
 
@@ -14,7 +15,10 @@ const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/13
 const STRIPCHAT_BATCH_SIZE = 60;
 const STRIPCHAT_BATCH_LIMIT = 100;
 const STRIPCHAT_REQUEST_TIMEOUT_MS = 20_000;
-const STRIPCHAT_CRAWL_BUDGET_MS = 20_000;
+// The sweep budget comes from the `liveCrawlBudgetPreset` setting via `context.budgetMs`, shared
+// with every other plugin; this fallback only covers a context built without one. It used to be a
+// fixed 20s while the VR plugin swept for 30s - the setting is what makes them agree.
+const STRIPCHAT_CRAWL_BUDGET_FALLBACK_MS = LIVE_CRAWL_BUDGET_FALLBACK_MS;
 const CATALOGUE_TTL_MS = 180_000;
 // A snapshot keeps being served instantly for this long past its freshness window, so a slow or
 // failing refresh never blocks a render. Past the grace period we wait instead of showing a
@@ -279,13 +283,14 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
   const load = async () => {
     const url = "https://stripchat.com/api/front/v2/models/get-list";
     const models = new Map<string, Record<string, unknown>>();
-    const deadline = Date.now() + STRIPCHAT_CRAWL_BUDGET_MS;
+    const budgetMs = context.budgetMs ?? STRIPCHAT_CRAWL_BUDGET_FALLBACK_MS;
+    const deadline = Date.now() + budgetMs;
     for (let batch = 0; batch < STRIPCHAT_BATCH_LIMIT; batch += 1) {
       const remaining = deadline - Date.now();
       // Page the rooms collected so far rather than letting one slow sweep stall the caller for a
       // minute. The caller merges this with the previous snapshot, so a short page is harmless.
       if (batch > 0 && remaining <= 0) {
-        context.log("info", `Stripchat live catalogue stopped at its ${STRIPCHAT_CRAWL_BUDGET_MS}ms budget with ${models.size} rooms loaded`);
+        context.log("info", `Stripchat live catalogue stopped at its ${budgetMs}ms budget with ${models.size} rooms loaded`);
         break;
       }
       let pageModels: Record<string, unknown>[];
@@ -326,7 +331,7 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
   // Its own infinite catalogue uses get-list with an exclusion cursor. Its
   // totalCount is capped at 2,000 even when thousands more live rooms remain,
   // so continue until the provider returns a short or empty batch - capped by
-  // STRIPCHAT_CRAWL_BUDGET_MS so one slow sweep cannot block a page render.
+  // the configured sweep budget so one slow sweep cannot block a page render.
   // Loading the snapshot before paging it locally also keeps viewer
   // reordering from moving rooms between pages while somebody navigates.
   const cacheKey = `stripchat:${primaryTag}`; const cached = cache.get(cacheKey);

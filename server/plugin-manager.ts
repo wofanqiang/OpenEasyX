@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import type { EasyXPlugin, PluginContext, PluginManifest } from "../packages/plugin-sdk/index.js";
 import type { Database } from "./database.js";
 import type { LogWriter } from "./log-store.js";
+import { liveCrawlBudgetMs } from "../packages/live-budget.js";
 
 export class PluginManager {
   private plugins = new Map<string, EasyXPlugin>();
@@ -106,6 +107,8 @@ export class PluginManager {
     return {
       config: configOverride ?? state.config,
       signal,
+      // One setting governs every plugin's sweep budget.
+      budgetMs: liveCrawlBudgetMs(this.db.getSettings()),
       fetch: globalThis.fetch,
       runCommand: (command, args, options = {}) => new Promise((resolve, reject) => {
         execFile(command, args, {
