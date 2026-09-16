@@ -15,6 +15,7 @@ import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatch
 import type { LiveStream, MediaCandidate } from "../packages/plugin-sdk/index.js";
 import type { LogLevel } from "./log-store.js";
 import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
+import { PostProcessGate } from "./postprocess-gate.js";
 import type { HlsProxy } from "./hls-proxy.js";
 
 type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean };
@@ -165,6 +166,8 @@ export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
   private finalizers = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
+  private lowPrioritySupport?: boolean;
+  private readonly postProcessGate: PostProcessGate;
   constructor(
     private db: Database,
     private plugins: PluginManager,
@@ -174,7 +177,14 @@ export class DownloadQueue {
     private onDeleteCompleted?: (item: DownloadItem) => unknown,
     private readonly liveProxy?: HlsProxy,
     private readonly selfOrigin?: string,
-  ) {}
+  ) {
+    // Post-processing (concat fold / TS remux / re-encode) runs serialized and load-gated:
+    // N workers finishing at once must not start N concurrent ffmpeg remuxes, because on a
+    // small VPS that saturates the CPU and starves the live captures themselves (measured:
+    // 1-core box, loadavg 13, capture throughput ~0). Concurrency and thresholds are tunable
+    // via EASYX_POSTPROCESS_CONCURRENCY / _LOAD_PAUSE / _LOAD_RESUME.
+    this.postProcessGate = PostProcessGate.fromEnv((level, message, meta) => this.writeLog?.(level, "download", message, meta));
+  }
 
   /**
    * Record through the app's own HLS proxy when a plugin asks for it by setting
@@ -458,8 +468,9 @@ export class DownloadQueue {
               this.writeLog?.("info", "download", `Concatenating ${parts.length} segmented capture parts`, { itemId: item.id, partBytes });
               const listPath = path.join(temporaryDirectory, "capture.concat.txt");
               fs.writeFileSync(listPath, parts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
-              await this.withPostProcessDeadline(control, partBytes, "Concat",
-                () => this.runCommandDownload("ffmpeg", concatCaptureArgs(listPath, tsPath), temporaryDirectory, undefined, () => {}, control));
+              await this.postProcessGate.run("Concat", () =>
+                this.withPostProcessDeadline(control, partBytes, "Concat",
+                  () => this.runPostProcessCommand("ffmpeg", concatCaptureArgs(listPath, tsPath), temporaryDirectory, control)));
               if (!fs.existsSync(tsPath) || fs.statSync(tsPath).size === 0) throw new Error("Concatenation completed without producing a media file");
             }
           }
@@ -563,8 +574,9 @@ export class DownloadQueue {
         this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
         this.writeLog?.("info", "download", "Encoding live recording", { itemId: item.id, preset });
         let encodeBytes = 0; try { encodeBytes = fs.statSync(temporary).size; } catch { /* keep 0 */ }
-        await this.withPostProcessDeadline(control, encodeBytes, "Re-encode",
-          () => this.runCommandDownload("ffmpeg", recordingEncodingArgs(preset, temporary, encoded), temporaryDirectory, undefined, () => {}, control));
+        await this.postProcessGate.run("Re-encode", () =>
+          this.withPostProcessDeadline(control, encodeBytes, "Re-encode",
+            () => this.runPostProcessCommand("ffmpeg", recordingEncodingArgs(preset, temporary, encoded), temporaryDirectory, control)));
         if (control.action === "cancel" || control.action === "delete") throw new Error("Encoding cancelled");
         if (!fs.existsSync(encoded) || !fs.statSync(encoded).size) throw new Error("Encoder completed without producing a media file");
         fs.unlinkSync(temporary); temporary = encoded;
@@ -665,8 +677,9 @@ export class DownloadQueue {
             } else {
               const listPath = path.join(temporaryDirectory, "capture.concat.txt");
               fs.writeFileSync(listPath, strayParts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
-              await this.withPostProcessDeadline(control, partBytes, "Concat",
-                () => this.runCommandDownload("ffmpeg", concatCaptureArgs(listPath, capturePath), temporaryDirectory, undefined, () => {}, control));
+            await this.postProcessGate.run("Concat", () =>
+              this.withPostProcessDeadline(control, partBytes, "Concat",
+                () => this.runPostProcessCommand("ffmpeg", concatCaptureArgs(listPath, capturePath), temporaryDirectory, control)));
             }
             if (fs.existsSync(capturePath) && fs.statSync(capturePath).size > 0) {
               recoverySource = capturePath;
@@ -873,14 +886,23 @@ export class DownloadQueue {
     try { child.kill(signal); } catch { /* Signal unsupported on this platform. */ }
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void): Promise<void> {
+  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, options?: { lowPriority?: boolean }): Promise<void> {
     return new Promise((resolve, reject) => {
       // Memory guard for live recordings on small VPS: cap yt-dlp fragment concurrency
       // and buffer so a single download cannot balloon the cgroup and trip OOM.
       const effectiveArgs = command === "yt-dlp"
         ? [...args, "--concurrent-fragments", "1", "--buffer-size", "4M"]
         : args;
-      const child = spawn(command, effectiveArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+      // Post-process commands may be deprioritized so live captures keep the CPU. nice(1)
+      // and ionice(1) exec() into the target binary, so the spawned PID is still the child
+      // we signal -- pause/stop/kill semantics are unchanged by the wrapper.
+      let spawnCommand = command;
+      let spawnArgs = effectiveArgs;
+      if (options?.lowPriority) {
+        spawnCommand = "nice";
+        spawnArgs = ["-n", "19", "ionice", "-c", "3", command, ...effectiveArgs];
+      }
+      const child = spawn(spawnCommand, spawnArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
       control.closed = new Promise<void>((resolve) => child.once("close", resolve));
       if (control.paused) this.signal(control, "SIGSTOP");
@@ -990,6 +1012,36 @@ export class DownloadQueue {
     });
   }
 
+  /**
+   * Post-process commands (concat / remux / re-encode) run at the lowest CPU and I/O
+   * priority: the capture that just finished must never compete with the live captures
+   * still on the air, and an idle machine simply runs the job at full speed anyway. The
+   * support probe runs once; a system without nice/ionice falls back to normal priority
+   * instead of failing every remux.
+   */
+  private async lowPrioritySupported(): Promise<boolean> {
+    if (this.lowPrioritySupport !== undefined) return this.lowPrioritySupport;
+    if (process.platform !== "linux") {
+      this.lowPrioritySupport = false;
+    } else {
+      try {
+        await this.capture("nice", ["-n", "19", "true"]);
+        this.lowPrioritySupport = true;
+      } catch {
+        this.writeLog?.("warn", "download", "nice/ionice unavailable; post-processing runs at normal priority");
+        this.lowPrioritySupport = false;
+      }
+    }
+    return this.lowPrioritySupport;
+  }
+
+  private async runPostProcessCommand(command: string, args: string[], outputDirectory: string, control: ActiveDownload, onStderr?: (text: string) => void): Promise<void> {
+    if (await this.lowPrioritySupported()) {
+      return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr, { lowPriority: true });
+    }
+    return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr);
+  }
+
   private async withFinalizeLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.finalizers.get(key) ?? Promise.resolve();
     const result = previous.catch(() => undefined).then(operation);
@@ -1063,7 +1115,10 @@ export class DownloadQueue {
     let captureBytes = 0;
     if (inputBytes !== undefined) captureBytes = inputBytes;
     else { try { captureBytes = fs.statSync(tsPath).size; } catch { /* keep 0 */ } }
-    await this.withPostProcessDeadline(control, captureBytes, "Remux", () => this.runCommandDownload("ffmpeg", [
+    // The gate also covers the recovery path below: a rescue remux must not fight live
+    // captures either, and the deadline only starts once a slot is actually granted.
+    await this.postProcessGate.run("Remux", () =>
+      this.withPostProcessDeadline(control, captureBytes, "Remux", () => this.runPostProcessCommand("ffmpeg", [
       "-y", "-fflags", "+genpts+igndts",
       // The concat demuxer streams every capture part as one continuous input; a plain
       // `-i tsPath` here would remux only the first slice of a segmented capture.
@@ -1073,7 +1128,7 @@ export class DownloadQueue {
       // Still corrects any drift inside the audio timeline itself.
       "-async", "1",
       "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
-    ], path.dirname(mp4Staging), undefined, () => {}, control));
+      ], path.dirname(mp4Staging), control)));
     if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
     if (!fs.existsSync(mp4Staging) || !fs.statSync(mp4Staging).size) throw new Error("Remux to MP4 produced no output");
     return audioShift;
