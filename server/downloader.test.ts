@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, captureSegmentFiles, clampedRecordingLimit, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -614,13 +614,21 @@ describe("receivedBytes", () => {
   });
 });
 
-describe("clampedRecordingLimit", () => {
-  it("caps a generous setting on small machines but keeps values that already fit", () => {
-    expect(clampedRecordingLimit(8, 1)).toBe(4);   // 1-core box: hard ceiling of 4
-    expect(clampedRecordingLimit(32, 1)).toBe(4);
-    expect(clampedRecordingLimit(4, 1)).toBe(4);   // the default fits everywhere
-    expect(clampedRecordingLimit(8, 4)).toBe(8);   // 4 cores -> budget 8
-    expect(clampedRecordingLimit(3, 16)).toBe(3);  // small settings are never raised
+describe("recording pool size", () => {
+  it("honours an explicit maxConcurrentRecordings on a 1-core box instead of halving it", () => {
+    // 6 on a 1-core machine used to be capped to max(4, 1*2) = 4, so the 5th and 6th live rooms
+    // sat in `queued` while their broadcasts went unrecorded (a live stream cannot be backfilled).
+    expect(concurrentLimit(6, 4, 32)).toBe(6);    // the operator's value survives on one core
+    expect(concurrentLimit(32, 4, 32)).toBe(32);  // still bounded by MAX_RECORDINGS
+    expect(concurrentLimit(3, 4, 32)).toBe(3);    // small settings are never raised
+    expect(concurrentLimit(0, 4, 32)).toBe(1);    // floored at one lane
+  });
+
+  it("grows the plan to the configured pool so the queued live rooms can start", () => {
+    // 4 captures in flight: a pool of 4 yields no recording slot (the reported `queued` state),
+    // a pool of 6 yields two more lanes, and recordings still lead downloads.
+    expect(slotPlan({ recordings: 4, downloads: 0 }, { recordings: 4, downloads: 1 })).toEqual(["download"]);
+    expect(slotPlan({ recordings: 4, downloads: 0 }, { recordings: 6, downloads: 1 })).toEqual(["recording", "recording", "download"]);
   });
 });
 

@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
@@ -29,8 +28,15 @@ const MAX_DOWNLOADS = 8;
 // Default lowered from 8: on the small (1-core / 1.6GB) boxes this app commonly runs on,
 // eight simultaneous ffmpeg captures starve the very recordings they serve (measured: the
 // captures fall to ~50% of real time, fall behind the LL-HLS edge, and the CDN starts
-// evicting segments -> "recorded 30 minutes, got 3"). Four is the measured safe ceiling
-// for pure pulls on one core; `clampedRecordingLimit` enforces it for explicit settings too.
+// evicting segments -> "recorded 30 minutes, got 3"). Four is the measured safe *default*.
+//
+// It is only a default: an explicit `maxConcurrentRecordings` is honoured literally, with no
+// core-count ceiling. The ceiling used to be `max(4, cores * 2)`, which silently halved an
+// explicit 6 to 4 on a 1-core box -- so the operator's setting and the running pool disagreed,
+// and the surplus live rooms sat in `queued` while their broadcasts went unrecorded (a live
+// stream cannot be backfilled). What made the old ceiling necessary is gone: the capture path
+// no longer races a concurrent remux (postprocess-gate serialises it and yields under load),
+// and six lanes with no remux alongside were measured fine on a 1-core box.
 const DEFAULT_MAX_RECORDINGS = 4;
 const MAX_RECORDINGS = 32;
 // A stale staging directory that still holds media is worth rescuing (A10); anything else
@@ -46,17 +52,6 @@ export function concurrentLimit(value: unknown, fallback: number, max: number): 
   const raw = Number(value);
   if (!Number.isFinite(raw)) return fallback;
   return Math.max(1, Math.min(max, Math.trunc(raw)));
-}
-
-/**
- * Cap the recording pool by the machine's size: roughly two captures per core, with a
- * floor of 4 (a pure ffmpeg pull is cheap, and a 1-core box measurably sustains four).
- * A generous setting on a tiny box used to self-destruct: the captures starved each
- * other, fell behind the live edge, and produced truncated recordings. The operator's
- * value is kept whenever it already fits the budget.
- */
-export function clampedRecordingLimit(value: number, cores: number): number {
-  return Math.min(value, Math.max(4, cores * 2));
 }
 
 /**
@@ -212,7 +207,6 @@ export class DownloadQueue {
   private finalizers = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
   private lowPrioritySupport?: boolean;
-  private recordingLimitWarned = false;
   private readonly postProcessGate: PostProcessGate;
   constructor(
     private db: Database,
@@ -378,14 +372,10 @@ export class DownloadQueue {
 
   private tick() {
     const settings = this.db.getSettings();
-    const configuredRecordings = concurrentLimit(settings.maxConcurrentRecordings, DEFAULT_MAX_RECORDINGS, MAX_RECORDINGS);
-    const effectiveRecordings = clampedRecordingLimit(configuredRecordings, Math.max(1, os.cpus().length));
-    if (effectiveRecordings < configuredRecordings && !this.recordingLimitWarned) {
-      this.recordingLimitWarned = true;
-      this.writeLog?.("warn", "download", `maxConcurrentRecordings=${configuredRecordings} exceeds what ${os.cpus().length} core(s) can sustain; capping the recording pool at ${effectiveRecordings}`, { configured: configuredRecordings, effective: effectiveRecordings, cores: os.cpus().length });
-    }
+    // Both pools are the operator's configured value, bounded only by the pool maxima. The
+    // recordings pool is deliberately NOT scaled down by core count: see DEFAULT_MAX_RECORDINGS.
     const limits = {
-      recordings: effectiveRecordings,
+      recordings: concurrentLimit(settings.maxConcurrentRecordings, DEFAULT_MAX_RECORDINGS, MAX_RECORDINGS),
       downloads: concurrentLimit(settings.maxConcurrentDownloads, DEFAULT_MAX_DOWNLOADS, MAX_DOWNLOADS),
     };
     // Each pool drains only its own queue, so a recording can never be blocked behind a
