@@ -180,6 +180,28 @@ export function nextSegmentStart(directory: string): number {
   return max + 1;
 }
 
+/**
+ * Bytes actually received into a staging directory -- the number the progress poll reports.
+ *
+ * A segmented live capture keeps its recording as capture_partNNN.ts, and the same directory may
+ * ALSO hold derived copies of that very content: the folded capture.ts, the remuxed encoded.mp4,
+ * and the finished <name>.mp4 that an A10 resume deliberately leaves in place from an earlier
+ * round of the same broadcast. Summing such a directory flat counts the recording twice or three
+ * times -- a 16.89 GB capture was displayed as 30 GB because the 13 GB finished MP4 was added on
+ * top of the parts it had just been folded from. Parts are the single source of truth whenever
+ * they exist, so no derived copy is ever added to them; every other staging directory (fetch and
+ * yt-dlp partials, a single capture.ts) keeps the flat sum.
+ */
+export function receivedBytes(directory: string): number {
+  try {
+    const files = fs.readdirSync(directory, { withFileTypes: true }).filter((entry) => entry.isFile());
+    const parts = files.filter((entry) => CAPTURE_SEGMENT_PATTERN.test(entry.name));
+    return (parts.length ? parts : files).reduce((total, entry) => {
+      try { return total + fs.statSync(path.join(directory, entry.name)).size; } catch { return total; }
+    }, 0);
+  } catch { return 0; }
+}
+
 /** ffmpeg arguments that concatenate capture parts into one TS via the concat demuxer. */
 export function concatCaptureArgs(listPath: string, output: string): string[] {
   return ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", output];
@@ -1073,8 +1095,11 @@ export class DownloadQueue {
       child.stdout.on("data", remember); child.stderr.on("data", remember);
       // Command extractors report progress on stdout; this poll is only a fallback for
       // silent ones, so a 1.5s cadence is plenty and keeps the directory scan cheap (A2).
+      // Received bytes, not directory bytes: a segmented capture's folded/remuxed copies
+      // live in the same directory as its parts, and counting both inflated the size shown
+      // for a live recording (A11).
       const poll = setInterval(() => {
-        const downloadedBytes = this.directoryBytes(outputDirectory);
+        const downloadedBytes = receivedBytes(outputDirectory);
         if (downloadedBytes > 0) reportProgress(expectedBytes ? downloadedBytes / expectedBytes : undefined, downloadedBytes);
       }, 1500); poll.unref();
       const finish = (error?: Error) => { if (settled) return; settled = true; clearInterval(poll); error ? reject(error) : resolve(); };
@@ -1084,14 +1109,16 @@ export class DownloadQueue {
         // Keep the extractor's own words around even on success: a truncated live capture
         // exits 0 with the whole story ("403 Forbidden", "Invalid data") in its stderr.
         control.lastOutput = output.trim();
-        if (code === 0 || (control.action === "stop" && this.directoryBytes(outputDirectory) > 0)) finish();
+        if (code === 0 || (control.action === "stop" && receivedBytes(outputDirectory) > 0)) finish();
         else finish(new Error(`${command} exited with code ${code}: ${output.trim() || "no error output"}`));
       });
     });
   }
 
   // Size of a staging directory, one level deep: command extractors write flat into their
-  // output directory, so the fallback poll never needs a recursive walk (A2).
+  // output directory, so no walk here ever needs to recurse (A2). This is the FLAT total,
+  // derived copies included, because the recovery cap must account for every byte a rescued
+  // directory actually occupies -- the progress poll reports `receivedBytes` instead (A11).
   private directoryBytes(directory: string): number {
     try {
       return fs.readdirSync(directory, { withFileTypes: true }).reduce((total, entry) => {

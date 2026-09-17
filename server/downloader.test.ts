@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, captureSegmentFiles, clampedRecordingLimit, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, captureSegmentFiles, clampedRecordingLimit, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -577,6 +577,40 @@ describe("capture segments (A10)", () => {
       "-f", "concat", "-safe", "0", "-i", "/media/staging/capture.concat.txt",
       "-c", "copy", "/media/staging/capture.ts",
     ]);
+  });
+});
+
+describe("receivedBytes", () => {
+  it("counts a segmented capture once, never together with its folded copies", () => {
+    const dir = temp("easyx-received-bytes");
+    for (const [name, size] of [
+      ["capture_part000.ts", 1000], ["capture_part001.ts", 2000], ["capture_part002.ts", 0],
+      // Left behind by an A10 resume: the finished MP4 of an earlier round of the same room.
+      ["_room-2026-09-17T03-59-57-891Z.mp4", 3000],
+      // Left behind by the fold and the remux that produced it.
+      ["capture.ts", 5000], ["encoded.mp4", 4000],
+      ["capture.concat.txt", 10], ["capture.ts.avsync.json", 20],
+    ] as Array<[string, number]>) {
+      fs.writeFileSync(path.join(dir, name), Buffer.alloc(size));
+    }
+    // The parts alone: the other 12,030 bytes are copies of these very 3,000.
+    expect(receivedBytes(dir)).toBe(3000);
+  });
+
+  it("keeps the flat sum for staging directories without parts", () => {
+    const dir = temp("easyx-received-flat");
+    fs.writeFileSync(path.join(dir, "clip.mp4.part"), Buffer.alloc(700));
+    fs.writeFileSync(path.join(dir, "clip.mp4"), Buffer.alloc(300));
+    expect(receivedBytes(dir)).toBe(1000);
+    // A lone part is renamed onto capture.ts, so from then on that file is the source.
+    const single = temp("easyx-received-single");
+    fs.writeFileSync(path.join(single, "capture.ts"), Buffer.alloc(900));
+    expect(receivedBytes(single)).toBe(900);
+  });
+
+  it("reads an empty or missing directory as zero bytes", () => {
+    expect(receivedBytes(temp("easyx-received-empty"))).toBe(0);
+    expect(receivedBytes(temp("easyx-received-missing"))).toBe(0);
   });
 });
 
