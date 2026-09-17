@@ -94,6 +94,7 @@ export class Catalog {
     readonly dataDir: string,
     readonly eagerThumbnails = process.env.NODE_ENV !== "test" && process.env.EASYX_EAGER_THUMBNAILS !== "false",
     private readonly storedMetadata?: (relativePath: string) => Record<string, unknown>,
+    private readonly warn: (message: string) => void = () => {},
   ) {
     fs.mkdirSync(mediaRoot, { recursive: true });
     fs.mkdirSync(path.join(dataDir, "thumbnails"), { recursive: true, mode: 0o700 });
@@ -139,7 +140,13 @@ export class Catalog {
           });
           if (this.eagerThumbnails) {
             const media = this.db.getMedia(id);
-            if (media) void this.thumbnail(media).catch(() => { this.db.markMediaUnplayable(media.id); });
+            // Rendering a poster is cosmetic, so a failure here never hides the item: a recording
+            // we cannot draw a frame from is usually one we can still play, and hiding it is
+            // effectively permanent (nothing re-arms a row whose mtime never moves). Only the play
+            // path retires media now, and it does so on a fact it can observe -- an empty file.
+            if (media) void this.thumbnail(media).catch((error) => {
+              this.warn(`Thumbnail for ${media.relativePath} could not be generated: ${error instanceof Error ? error.message : String(error)}`);
+            });
           }
           indexed++;
         } catch { /* A file may disappear while the scan is in progress. */ }
@@ -261,9 +268,34 @@ export class Catalog {
     const operation = this.enqueueFfmpeg(async () => {
       const temporary = `${destination}.tmp.jpg`;
       try {
-        const seek = media.kind === "video" ? ["-ss", (Math.max(0, await this.probe(media)) * 0.5).toFixed(3)] : [];
-        await runFfmpeg([...seek, "-i", source, "-frames:v", "1", "-vf", "scale=640:640:force_original_aspect_ratio=decrease", "-q:v", "4", "-y", temporary], 30_000);
-        if (!fs.existsSync(temporary) || fs.statSync(temporary).size <= 0) throw new Error("FFmpeg produced an empty thumbnail");
+        // A frame from the middle of the recording makes the nicest poster, but only while the
+        // cached duration still describes the bytes on disk. Seeking past the end makes ffmpeg
+        // write nothing, so try offsets that hold for any file before giving up: a poster is
+        // cosmetic, and losing it must not cost the item its place in the library.
+        const seeks: Array<string | undefined> = media.kind === "video"
+          ? [...new Set([Math.max(0, await this.probe(media)) * 0.5, 10, 0])].map((seconds) => seconds.toFixed(3))
+          : [undefined];
+        let failure: Error | undefined;
+        for (const [index, seek] of seeks.entries()) {
+          try {
+            await runFfmpeg([
+              ...(seek === undefined ? [] : ["-ss", seek]),
+              "-i", source, "-frames:v", "1", "-vf", "scale=640:640:force_original_aspect_ratio=decrease", "-q:v", "4", "-y", temporary,
+            ], 30_000);
+            if (!fs.existsSync(temporary) || fs.statSync(temporary).size <= 0) throw new Error("FFmpeg produced an empty thumbnail");
+            failure = undefined;
+            break;
+          } catch (error) {
+            failure = error instanceof Error ? error : new Error(String(error));
+            try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } catch {}
+            // A missed first seek is the signature of a duration that outlived its file, so re-probe
+            // without the cache and let the next attempt seek something that exists.
+            if (index === 0 && media.kind === "video") {
+              try { await this.probe(media, true); } catch { /* the fixed fallbacks still apply */ }
+            }
+          }
+        }
+        if (failure) throw failure;
         fs.renameSync(temporary, destination); return destination;
       } finally { try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } catch {} }
     }).finally(() => this.thumbnails.delete(media.id));
@@ -271,8 +303,8 @@ export class Catalog {
     return operation;
   }
 
-  private probe(media: Media) {
-    if (media.duration > 0) return Promise.resolve(media.duration);
+  private probe(media: Media, force = false) {
+    if (!force && media.duration > 0) return Promise.resolve(media.duration);
     return new Promise<number>((resolve, reject) => {
       const child = spawn("ffprobe", [
         "-v", "error", "-show_entries", "format=duration:stream=width,height", "-select_streams", "v:0", "-of", "json", this.absolutePath(media),

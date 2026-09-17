@@ -50,7 +50,7 @@ const db = new Database(dataDir);
 const auth = new AuthService(db, process.env.EASYX_SESSION_SECRET, (line) => appLogger.info({ scope: "auth" }, line));
 await auth.bootstrap();
 const libraryDb = new LibraryDatabase(dataDir);
-const catalog = new Catalog(libraryDb, mediaDir, dataDir, undefined, (relativePath) => db.storedMediaMetadata(relativePath));
+const catalog = new Catalog(libraryDb, mediaDir, dataDir, undefined, (relativePath) => db.storedMediaMetadata(relativePath), (message) => appLogger.warn({ scope: "catalog" }, message));
 const pluginRepositories = new PluginRepositoryManager(dataDir, path.resolve("plugins"), externalPluginsDir);
 const plugins = new PluginManager(db, pluginRepositories.roots(), path.join(dataDir, "sessions"), writeLog);
 await plugins.load();

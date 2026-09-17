@@ -136,8 +136,13 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
   });
   app.get<{ Params: { id: string } }>("/api/media/:id/thumbnail", async (request, reply) => {
     const media = requiredMedia(request.params.id);
-    try { return reply.type("image/jpeg").header("cache-control", "public, max-age=31536000, immutable").send(fs.createReadStream(await catalog.thumbnail(media))); }
-    catch { libraryDb.markMediaUnplayable(media.id); return reply.status(404).send({ error: "Thumbnail is not available" }); }
+    let file: string;
+    // The thumbnail is generated before the content type is declared. Fastify rejects a send()
+    // whose payload does not match a type already set on the reply, so declaring image/jpeg first
+    // turned this recovery path into a 500 instead of the 404 it claims to be.
+    try { file = await catalog.thumbnail(media); }
+    catch { return reply.status(404).send({ error: "Thumbnail is not available" }); }
+    return reply.type("image/jpeg").header("cache-control", "public, max-age=31536000, immutable").send(fs.createReadStream(file));
   });
   app.get<{ Params: { id: string } }>("/api/media/:id/preview.gif", async (request, reply) => {
     const media = requiredMedia(request.params.id);

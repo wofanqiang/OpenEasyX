@@ -105,6 +105,67 @@ describe("media catalog", () => {
     db.close();
   });
 
+  it("drops cached measurements when a different recording replaces a file", async () => {
+    const { data, media, db } = fixture();
+    const file = path.join(media, "Example Performer", "example.com", "session.mp4");
+    fs.writeFileSync(file, "first recording");
+    const catalog = new Catalog(db, media, data, false);
+    await catalog.scan();
+    const item = db.listMedia().items[0];
+
+    db.updateProbe(item.id, { duration: 3288.293, width: 1920, height: 1080 });
+    db.updateProgress(item.id, 300, 3288.293);
+    expect(db.getMedia(item.id)).toMatchObject({ duration: 3288.293, width: 1920, height: 1080 });
+
+    fs.writeFileSync(file, "second, shorter recording");
+    await catalog.scan();
+
+    // Both durations described the previous file. Leaving either cached is what made the thumbnail
+    // seek past the end of the replacement and hide an item that was perfectly playable. Viewing
+    // progress, by contrast, is user state and survives.
+    expect(db.getMedia(item.id)).toMatchObject({ duration: 0, width: 0, height: 0, progressSeconds: 300 });
+    db.close();
+  });
+
+  it("keeps cached measurements while the file behind a path is unchanged", async () => {
+    const { data, media, db } = fixture();
+    const file = path.join(media, "Example Performer", "example.com", "stable.mp4");
+    fs.writeFileSync(file, "unchanged");
+    const catalog = new Catalog(db, media, data, false);
+    await catalog.scan();
+    const item = db.listMedia().items[0];
+    db.updateProbe(item.id, { duration: 120, width: 640, height: 360 });
+
+    await catalog.scan();
+    expect(db.getMedia(item.id)).toMatchObject({ duration: 120, width: 640, height: 360 });
+    db.close();
+  });
+
+  it.skipIf(!ffmpegAvailable)("still renders a thumbnail when the cached duration outlived its file", async () => {
+    const { data, media, db } = fixture();
+    const file = path.join(media, "Example Performer", "example.com", "replaced.mp4");
+    const generated = spawnSync("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10:duration=20",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", file,
+    ], { encoding: "utf8" });
+    expect(generated.status, generated.stderr).toBe(0);
+    const catalog = new Catalog(db, media, data, false);
+    await catalog.scan();
+    const item = db.listMedia().items[0];
+
+    // A far longer previous recording at this path left the duration behind: halving it aimed the
+    // seek 1500s into a 20s clip, where ffmpeg writes a zero-byte frame.
+    db.updateProbe(item.id, { duration: 3000 });
+    const thumbnail = await catalog.thumbnail(db.getMedia(item.id)!);
+
+    expect(fs.statSync(thumbnail).size).toBeGreaterThan(0);
+    // Falling back also repairs the cache, so every later attempt seeks somewhere that exists.
+    const healed = db.getMedia(item.id)!.duration;
+    expect(healed).toBeGreaterThan(10);
+    expect(healed).toBeLessThan(30);
+    db.close();
+  });
+
   it.skipIf(!ffmpegAvailable)("lazily remuxes legacy MPEG-TS recordings mislabeled as MP4 for browser playback", async () => {
     const { data, media, db } = fixture();
     const file = path.join(media, "Example Performer", "example.com", "legacy-live.mp4");

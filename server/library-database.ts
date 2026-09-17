@@ -159,6 +159,18 @@ export class LibraryDatabase {
   }
 
   upsertMedia(item: IndexedMedia) {
+    // A recording is routinely replaced by a longer or shorter one at the same path, and the two
+    // numbers identify the bytes: once size or mtime moves, every measurement cached for the
+    // previous file is wrong. `media.duration` is the harmful one because the thumbnail generator
+    // halves it to choose a seek offset, so a stale value sends ffmpeg past the end of the
+    // replacement, the frame comes back empty, and the item used to be hidden as unplayable -- for
+    // good, since the scan keeps mtime pinned (see applyMediaDate) and nothing re-arms it.
+    // `playback.duration` reaches the same call site through getMedia's COALESCE, so both caches go.
+    // Measurements are dropped; user state (progress, completion, favourite) deliberately is not,
+    // so a re-recorded file keeps its viewing history.
+    this.sqlite.prepare(`UPDATE playback SET duration=0 WHERE duration<>0 AND media_id IN
+      (SELECT id FROM media WHERE relative_path=? AND (size<>? OR modified_at<>?))`)
+      .run(item.relativePath, item.size, item.modifiedAt);
     this.sqlite.prepare(`
       INSERT INTO media(
         id,relative_path,kind,title,performer,source,extension,mime_type,size,modified_at,
@@ -169,6 +181,9 @@ export class LibraryDatabase {
         extension=excluded.extension,mime_type=excluded.mime_type,size=excluded.size,
         modified_at=excluded.modified_at,metadata_json=excluded.metadata_json,
         last_seen_scan=excluded.last_seen_scan,missing=0,
+        duration=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.duration END,
+        width=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.width END,
+        height=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.height END,
         playable=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 1 ELSE media.playable END
     `).run(
       item.id, item.relativePath, item.kind, item.title, item.performer, item.source,
