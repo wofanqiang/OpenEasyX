@@ -95,6 +95,7 @@ export class LibraryDatabase {
         playable INTEGER NOT NULL DEFAULT 1
       );
       CREATE INDEX IF NOT EXISTS media_library_idx ON media(missing, kind, modified_at DESC);
+      CREATE INDEX IF NOT EXISTS media_ingest_idx ON media(missing, kind, added_at DESC);
       CREATE INDEX IF NOT EXISTS media_performer_idx ON media(missing, performer COLLATE NOCASE);
       CREATE TABLE IF NOT EXISTS playback (
         media_id TEXT PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
@@ -168,6 +169,12 @@ export class LibraryDatabase {
     // `playback.duration` reaches the same call site through getMedia's COALESCE, so both caches go.
     // Measurements are dropped; user state (progress, completion, favourite) deliberately is not,
     // so a re-recorded file keeps its viewing history.
+    // `added_at` is the library's ingest time -- the column "Recently added" sorts by -- and it is
+    // refreshed on the same size/mtime change, because a file that replaced another one at this
+    // path was ingested just now even though the row is old. The mtime cannot carry that meaning:
+    // applyMediaDate pins it to the broadcast date, so a recording archived today from Recovery
+    // sorts next to everything else from its broadcast week and never looks new. A row coming back
+    // from `missing=1` is a re-ingest too, and its old timestamp would bury it as well.
     this.sqlite.prepare(`UPDATE playback SET duration=0 WHERE duration<>0 AND media_id IN
       (SELECT id FROM media WHERE relative_path=? AND (size<>? OR modified_at<>?))`)
       .run(item.relativePath, item.size, item.modifiedAt);
@@ -181,6 +188,7 @@ export class LibraryDatabase {
         extension=excluded.extension,mime_type=excluded.mime_type,size=excluded.size,
         modified_at=excluded.modified_at,metadata_json=excluded.metadata_json,
         last_seen_scan=excluded.last_seen_scan,missing=0,
+        added_at=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at OR media.missing=1 THEN excluded.added_at ELSE media.added_at END,
         duration=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.duration END,
         width=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.width END,
         height=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.height END,
@@ -248,7 +256,7 @@ export class LibraryDatabase {
     if (query.watched === "unfinished") where.push("COALESCE(p.completed,0)=0");
     if (query.watched === "completed") where.push("COALESCE(p.completed,0)=1");
     const order = {
-      recent: "m.modified_at DESC", oldest: "m.modified_at ASC", title: "m.title COLLATE NOCASE ASC",
+      recent: "m.added_at DESC,m.modified_at DESC", oldest: "m.added_at ASC,m.modified_at ASC", title: "m.title COLLATE NOCASE ASC",
       largest: "m.size DESC", "most-viewed": "COALESCE(p.view_count,0) DESC,m.modified_at DESC",
       history: "p.last_viewed_at DESC,m.modified_at DESC",
     }[query.sort ?? "recent"];
@@ -282,7 +290,7 @@ export class LibraryDatabase {
     if (query.watched === "unfinished") where.push("COALESCE(p.completed,0)=0");
     if (query.watched === "completed") where.push("COALESCE(p.completed,0)=1");
     const order = {
-      recent: "m.modified_at DESC", oldest: "m.modified_at ASC", title: "m.title COLLATE NOCASE ASC",
+      recent: "m.added_at DESC,m.modified_at DESC", oldest: "m.added_at ASC,m.modified_at ASC", title: "m.title COLLATE NOCASE ASC",
       largest: "m.size DESC", "most-viewed": "COALESCE(p.view_count,0) DESC,m.modified_at DESC",
       history: "p.last_viewed_at DESC,m.modified_at DESC",
     }[query.sort ?? "recent"];

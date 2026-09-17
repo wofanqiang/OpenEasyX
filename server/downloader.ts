@@ -710,6 +710,25 @@ export class DownloadQueue {
         }
       }
 
+      // Video-track check: the wall-clock comparison above reads the container, and a live
+      // capture's container duration is the *audio* track's length -- ffmpeg keeps encoding silence
+      // after the picture stops, so a video track that died three minutes into a thirty-minute
+      // broadcast still ships as a full-length MP4 and passes every gate above. Measuring the video
+      // track itself is the only way to see it. Unlike the wall-clock check this one also runs on a
+      // manual stop, because pressing stop does not make a frozen picture intentional. Best-effort
+      // throughout: a failed probe must never fail the finalize.
+      if (item.mediaType === "video" && item.metadata.live === true) {
+        try {
+          const tracks = await this.probeTracks(temporary);
+          // Below two minutes the ratio says nothing useful: the video track legitimately starts a
+          // moment after the audio one, so a short clip would read as truncated.
+          if (tracks.container >= 120 && tracks.video > 0 && tracks.video < tracks.container * 0.9) {
+            this.db.setItemMetadata(item.id, { videoTruncated: true, containerDurationSec: Math.round(tracks.container), videoTrackSec: Math.round(tracks.video) });
+            this.writeLog?.("warn", "download", `Live recording keeps its picture for only ${Math.round(tracks.video)}s of ${Math.round(tracks.container)}s: the video track stopped while the audio kept recording`, { itemId: item.id, containerSec: Math.round(tracks.container), videoTrackSec: Math.round(tracks.video), videoFrames: tracks.frames });
+          }
+        } catch { /* Best-effort: a failed probe must never fail the finalize. */ }
+      }
+
       await this.withFinalizeLock(`output:${item.id}`, async () => {
         const visual = await this.visualFingerprint(temporary, item.mediaType);
         const qualityScore = Math.max(item.qualityScore, visual?.qualityScore ?? 0);
@@ -1342,6 +1361,77 @@ export class DownloadQueue {
     } catch { return { duration: 0, width: 0, height: 0 }; }
   }
 
+  /**
+   * Track-level probe. `probeVideo` reports the container duration, and for a live capture that
+   * number comes from whichever track is longest -- the audio, in practice. It stays honest even
+   * when the picture stopped minutes earlier: ffmpeg keeps encoding silence while the video
+   * decoder starves, so the finished MP4 declares the whole session and every duration-based gate
+   * above accepts it. Only the video track's own length exposes the fault.
+   */
+  private async probeTracks(file: string): Promise<{ container: number; video: number; frames: number }> {
+    try {
+      const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries",
+        "format=duration:stream=codec_type,duration,nb_frames,avg_frame_rate", "-of", "json", file]);
+      const parsed = JSON.parse(probe.stdout.toString("utf8")) as {
+        format?: { duration?: string };
+        streams?: Array<{ codec_type?: string; duration?: string; nb_frames?: string; avg_frame_rate?: string }>;
+      };
+      const video = (parsed.streams ?? []).find((stream) => stream.codec_type === "video");
+      const frames = Number(video?.nb_frames ?? 0) || 0;
+      let videoSeconds = Number(video?.duration ?? 0) || 0;
+      // Some containers omit a stream's own duration, and the frame count over the frame rate says
+      // the same thing: a track whose samples never arrived reports neither, which reads as 0.
+      if (videoSeconds <= 0 && frames > 0) {
+        const [numerator, denominator] = String(video?.avg_frame_rate ?? "").split("/").map(Number);
+        if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator > 0) videoSeconds = frames / (numerator / denominator);
+      }
+      return { container: Number(parsed.format?.duration ?? 0) || 0, video: videoSeconds, frames };
+    } catch { return { container: 0, video: 0, frames: 0 }; }
+  }
+
+  /**
+   * Decode-depth playability. `isPlayableCapture` only asks whether a stream is *declared*, and a
+   * corrupted container answers that question happily, so this one decodes the first frame of each
+   * track and reads a decoder error as unplayable. `-xerror` turns the first decoder error into a
+   * non-zero exit instead of letting ffmpeg limp to the end and report success. It gates deletions,
+   * so it fails closed: an exception anywhere means "unplayable".
+   */
+  private async isPlayableMedia(file: string): Promise<boolean> {
+    try { if (!fs.existsSync(file) || fs.statSync(file).size <= 0) return false; } catch { return false; }
+    let hasVideo = false; let hasAudio = false;
+    try {
+      const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type", "-of", "json", file]);
+      for (const stream of (JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string }> }).streams ?? []) {
+        if (stream.codec_type === "video") hasVideo = true;
+        if (stream.codec_type === "audio") hasAudio = true;
+      }
+    } catch { return false; }
+    if (!hasVideo && !hasAudio) return false;
+    const decodes = async (args: string[]) => {
+      try { await this.capture("ffmpeg", ["-v", "error", "-xerror", "-i", file, ...args, "-f", "null", "-"]); return true; }
+      catch { return false; }
+    };
+    // Either track decoding is enough to call the file watchable: a silent recording and a
+    // picture-only recording are both legitimate.
+    if (hasVideo && await decodes(["-map", "0:v:0", "-frames:v", "1"])) return true;
+    if (hasAudio && await decodes(["-map", "0:a:0", "-frames:a", "1"])) return true;
+    return false;
+  }
+
+  /**
+   * Drop a `recovered.mp4` that nothing can open, keeping whatever an earlier salvage left beside
+   * it: raw capture parts in the same folder may still be rescuable, and once the broken MP4 is
+   * gone the next pass picks them up and folds them. The folder itself only goes when it is empty.
+   */
+  private discardUnplayableRecovered(directory: string): boolean {
+    let removed = false;
+    for (const name of ["recovered.mp4", "recovered.json", "recovered.poster.jpg"]) {
+      try { fs.unlinkSync(path.join(directory, name)); removed = true; } catch { /* already gone */ }
+    }
+    try { if (!fs.readdirSync(directory).length) fs.rmSync(directory, { recursive: true, force: true }); } catch { /* best-effort */ }
+    return removed;
+  }
+
   async ensureRecoveredPoster(itemId: string, mp4?: string): Promise<string | null> {
     const dir = path.join(this.recoveryRoot, safeSegment(itemId));
     const poster = path.join(dir, "recovered.poster.jpg");
@@ -1376,9 +1466,24 @@ export class DownloadQueue {
       } catch { continue; }
       for (const name of names) {
         const itemId = name;
-        // A recovery folder that already holds a rescued MP4 is a finished rescue, not a
-        // residual capture, so it is not counted as a scan candidate.
-        if (root === this.recoveryRoot && fs.existsSync(path.join(root, name, "recovered.mp4"))) continue;
+        const stagingDir = path.join(root, name);
+        // A recovery folder that already holds a rescued MP4 is a finished rescue, not a residual
+        // capture -- but it is still examined, because a rescue can itself leave an MP4 nothing can
+        // open: given no usable input the muxer writes a header-only file that the Recovery page
+        // lists as rescuable while no player can start it. This pass is the only place such a file
+        // disappears on its own, without the operator hunting for the one entry that will not play.
+        const rescued = root === this.recoveryRoot ? path.join(stagingDir, "recovered.mp4") : undefined;
+        if (rescued && fs.existsSync(rescued) && fs.statSync(rescued).size > 0) {
+          report.scanned++;
+          if (await this.isPlayableMedia(rescued)) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
+          if (execute) { try { this.discardUnplayableRecovered(stagingDir); report.deleted++; } catch { report.failed++; } }
+          else report.deleted++;
+          report.items.push({ itemId, action: "deleted" });
+          this.writeLog?.("warn", "download", execute
+            ? "Unplayable recovered recording deleted; any raw parts beside it were kept"
+            : "Unplayable recovered recording would be deleted", { itemId });
+          continue;
+        }
         report.scanned++;
         const item = this.db.getItem(itemId);
         if (this.active.has(itemId) || (item && ACTIVE.has(item.status))) {
@@ -1393,7 +1498,6 @@ export class DownloadQueue {
           this.writeLog?.("warn", "download", "Residual capture left untouched: the item already has a library file", { itemId, root: path.basename(root), name });
           continue;
         }
-        const stagingDir = path.join(root, name);
         // A10 segmented captures land as capture_partNNN.ts. The remux below folds them via the
         // concat demuxer so a whole recording is rescued in ONE run; the old path saved only the
         // alphabetically-first slice and needed one recovery run per 10-minute part.
@@ -1425,6 +1529,20 @@ export class DownloadQueue {
             ? parts.reduce((total, part) => { try { return total + fs.statSync(part).size; } catch { return total; } }, 0)
             : undefined;
           await this.remuxCaptureToMp4(tsPath, outPath, { action: undefined, paused: false, encoding: false } as ActiveDownload, concatList, inputBytes);
+          // A remux that reported success can still have produced a file nothing can open: handed
+          // no usable input the muxer writes a header-only MP4, which would sit in the Recovery list
+          // looking rescuable while never being watchable. The capture passed `isPlayableCapture`
+          // above, so an unplayable output is not footage worth keeping alive -- drop it together
+          // with its capture rather than filing it, and let the summary report the deletion.
+          if (!(await this.isPlayableMedia(outPath))) {
+            this.discardUnplayableRecovered(recoveryDir);
+            for (const doomed of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
+              try { fs.unlinkSync(doomed); } catch { /* best-effort */ }
+            }
+            report.deleted++; report.items.push({ itemId, action: "deleted" });
+            this.writeLog?.("warn", "download", "Rescue produced an unplayable MP4; it and its capture were deleted", { itemId });
+            continue;
+          }
           const probe = await this.probeVideo(outPath);
           const sidecar = {
             itemId, title: item?.title ?? itemId,

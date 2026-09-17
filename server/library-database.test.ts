@@ -346,4 +346,59 @@ describe("media catalog", () => {
     expect(db.playlist({ source: "example.com", kind: "image", sort: "title" })).toEqual(items.filter((item) => item.kind === "image").map((item) => item.id));
     db.close();
   });
+
+  it("re-stamps the ingest time when a different recording replaces a file", async () => {
+    const { data, media, db } = fixture();
+    const file = path.join(media, "Example Performer", "example.com", "replaced.mp4");
+    fs.writeFileSync(file, "first");
+    await new Catalog(db, media, data).scan();
+    const item = db.listMedia().items[0];
+    // Pin the row to a date no scan could produce, so the assertion below can only pass if the
+    // upsert rewrote the column instead of leaving whatever was already there.
+    db.sqlite.prepare("UPDATE media SET added_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(item.id);
+
+    // A replacement file at the same path: a re-recording, or a recording newly archived from
+    // Recovery. Different inode and different bytes, which is what a real replacement looks like.
+    fs.unlinkSync(file);
+    fs.writeFileSync(file, "a completely different recording");
+    await new Catalog(db, media, data).scan();
+
+    const refreshed = db.listMedia().items[0].addedAt;
+    expect(refreshed).not.toBe("2020-01-01T00:00:00.000Z");
+    expect(Date.parse(refreshed)).toBeGreaterThan(Date.parse("2026-01-01T00:00:00.000Z"));
+    db.close();
+  });
+
+  it("keeps the ingest time while the file behind a path is unchanged", async () => {
+    const { data, media, db } = fixture();
+    const file = path.join(media, "Example Performer", "example.com", "stable.mp4");
+    fs.writeFileSync(file, "recording");
+    const catalog = new Catalog(db, media, data); await catalog.scan();
+    const item = db.listMedia().items[0];
+    db.sqlite.prepare("UPDATE media SET added_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(item.id);
+
+    // A routine re-scan must not make the whole library look freshly added.
+    await catalog.scan();
+    expect(db.listMedia().items[0].addedAt).toBe("2020-01-01T00:00:00.000Z");
+    db.close();
+  });
+
+  it("orders the library by ingest time rather than by the pinned broadcast date", async () => {
+    const { data, media, db } = fixture();
+    const directory = path.join(media, "Example Performer", "example.com");
+    fs.writeFileSync(path.join(directory, "archived.mp4"), "archived");
+    fs.writeFileSync(path.join(directory, "broadcast.mp4"), "broadcast");
+    await new Catalog(db, media, data).scan();
+    const byTitle = Object.fromEntries(db.listMedia({ pageSize: 10 }).items.map((item) => [item.title, item]));
+    // `archived` carries an old mtime, exactly as applyMediaDate leaves a recording folded in from
+    // Recovery, yet it is the one that just entered the library. Sorting on the mtime buries it
+    // next to everything else from its broadcast week; sorting on the ingest time shows it first.
+    db.sqlite.prepare("UPDATE media SET modified_at='2020-05-05T00:00:00.000Z',added_at='2026-09-17T00:00:00.000Z' WHERE id=?").run(byTitle.archived.id);
+    db.sqlite.prepare("UPDATE media SET modified_at='2026-09-16T00:00:00.000Z',added_at='2026-09-16T00:00:00.000Z' WHERE id=?").run(byTitle.broadcast.id);
+
+    expect(db.listMedia({ pageSize: 10, sort: "recent" }).items.map((item) => item.title)).toEqual(["archived", "broadcast"]);
+    expect(db.listMedia({ pageSize: 10, sort: "oldest" }).items.map((item) => item.title)).toEqual(["broadcast", "archived"]);
+    expect(db.playlist({ sort: "recent" })).toEqual([byTitle.archived.id, byTitle.broadcast.id]);
+    db.close();
+  });
 });

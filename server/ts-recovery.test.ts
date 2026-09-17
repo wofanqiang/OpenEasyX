@@ -36,6 +36,15 @@ function writeUnplayableCapture(file: string) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, "definitely not a transport stream");
 }
+/** A real, decodable MP4: the shape a successful rescue leaves in the recovery folder. */
+function writePlayableMp4(file: string) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  execFileSync("ffmpeg", [
+    "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10",
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "1",
+    "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-movflags", "+faststart", file,
+  ]);
+}
 
 async function harness() {
   const dataDir = temp("easyx-recovery-data"); const mediaDir = temp("easyx-recovery-media"); const pluginDir = temp("easyx-recovery-plugins");
@@ -227,5 +236,45 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     // The bytes are left exactly where they were.
     expect(fs.existsSync(path.join(env.captureDir(done.id), "capture.ts"))).toBe(true);
     expect(fs.existsSync(env.recoveryDir(done.id))).toBe(false);
+  });
+
+  it("deletes a recovered MP4 that nothing can decode, and leaves a playable one alone", async () => {
+    const env = await harness();
+    const broken = env.item("broken-rescue");
+    const good = env.item("good-rescue");
+    // A rescue that produced a file no player can open: the Recovery page would list it as
+    // rescuable forever, and this pass is the only thing that can ever remove it without the
+    // operator having to click through entries guessing which one will not play.
+    fs.mkdirSync(env.recoveryDir(broken.id), { recursive: true });
+    fs.writeFileSync(path.join(env.recoveryDir(broken.id), "recovered.mp4"), "not a video at all");
+    fs.writeFileSync(path.join(env.recoveryDir(broken.id), "recovered.json"), JSON.stringify({ itemId: broken.id }));
+    writePlayableMp4(path.join(env.recoveryDir(good.id), "recovered.mp4"));
+
+    const dry = await env.queue.recoverResidualTs({ dryRun: true });
+    expect(dry.deleted).toBe(1);
+    // A dry run must not touch the disk.
+    expect(fs.existsSync(path.join(env.recoveryDir(broken.id), "recovered.mp4"))).toBe(true);
+
+    const report = await env.queue.recoverResidualTs({ execute: true });
+    expect(report.deleted).toBe(1);
+    expect(report.failed).toBe(0);
+    expect(fs.existsSync(env.recoveryDir(broken.id))).toBe(false);
+    // The playable rescue survives untouched and is still offered in the Recovery list.
+    expect(fs.existsSync(path.join(env.recoveryDir(good.id), "recovered.mp4"))).toBe(true);
+    expect((await env.queue.listRecovered()).map((entry) => entry.itemId)).toEqual([good.id]);
+  });
+
+  it("keeps raw parts beside an unplayable recovered MP4 instead of discarding the folder", async () => {
+    const env = await harness();
+    const item = env.item("broken-with-parts");
+    const dir = env.recoveryDir(item.id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "recovered.mp4"), "header only, no stream");
+    // An earlier salvage covering a different slice of the broadcast: footage nobody asked to lose.
+    fs.writeFileSync(path.join(dir, "capture_part000.ts"), "earlier slice, still raw");
+
+    await env.queue.recoverResidualTs({ execute: true });
+    expect(fs.existsSync(path.join(dir, "recovered.mp4"))).toBe(false);
+    expect(fs.existsSync(path.join(dir, "capture_part000.ts"))).toBe(true);
   });
 });

@@ -135,7 +135,12 @@ export class Catalog {
             id,
             relativePath, kind, title: titleValue || cleanTitle(relativePath), performer: performerValue || (parts.length > 1 ? parts[0] : "Unsorted"),
             source: sourceDomain(sourceValue || (parts.length > 2 ? parts[1] : "")), extension, mimeType: MIMES[extension] ?? "application/octet-stream",
-            size: stat.size, modifiedAt: stat.mtime.toISOString(), addedAt: stat.birthtime.toISOString(),
+            // birthtime is the honest "when did this file first appear", which is what the library
+            // shows as its ingest time, but a filesystem without it reports the epoch -- and that
+            // would sort a recording captured a minute ago below everything from 1970. Fall back to
+            // the mtime, which is at least a real date.
+            size: stat.size, modifiedAt: stat.mtime.toISOString(),
+            addedAt: (stat.birthtimeMs > 0 ? stat.birthtime : stat.mtime).toISOString(),
             duration: 0, width: 0, height: 0, metadata, scanId,
           });
           if (this.eagerThumbnails) {

@@ -690,5 +690,42 @@ describe("live recording completeness gates", () => {
     queue.stop();
     const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
     expect(metadata.truncated).toBeUndefined();
+    // Deliberately below the two-minute floor of the video-track check: the ratio between the two
+    // tracks says nothing useful on a capture this short, so it is not judged at all.
+    expect(metadata.videoTruncated).toBeUndefined();
+  });
+
+  it("flags a live capture whose video track stopped long before the audio track", async () => {
+    const dataDir = temp("easyx-vtrack-data"); const mediaDir = temp("easyx-vtrack-media"); const pluginDir = temp("easyx-vtrack-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    const template = segmentTemplateBytes();
+    const templatePath = path.join(pluginDir, "template.ts"); fs.writeFileSync(templatePath, template);
+    // The signature of a starved video decoder: the audio track runs for five minutes so the
+    // container declares five minutes, while the picture exists only for the half-second the
+    // template holds. Nothing about the container duration looks wrong.
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `
+      export default { manifest: { id: "test.vtrack", name: "VTrack", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] },
+        async resolveDownload() { return { kind: "command", command: "ffmpeg", filename: "live.mp4", args: ["-y", "-v", "error", "-i", ${JSON.stringify(templatePath)}, "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=8000", "-map", "0:v:0", "-map", "1:a:0", "-t", "300", "-c:v", "copy", "-c:a", "aac", "{output}"] }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.vtrack", { installed: true, enabled: true });
+    // The five-minute file is still tiny (silence plus half a second of picture), so the fragment
+    // floor has to go or the capture would be filed as a fragment instead of being measured.
+    db.updateSettings({ autoRecordMinBytes: 0 });
+    const person = db.upsertPerformer({ externalId: "person", name: "VTrack Performer" }, "test.vtrack");
+    const source = db.addSource(person.id, "test.vtrack", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", filename: "live.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    await waitFor(() => db.getItem(item.id)?.status === "completed", 60_000);
+    queue.stop();
+    const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
+    expect(metadata.videoTruncated).toBe(true);
+    expect(Number(metadata.containerDurationSec)).toBeGreaterThanOrEqual(290);
+    expect(Number(metadata.videoTrackSec)).toBeLessThanOrEqual(5);
+    // The file stays in the library: a frozen picture is worth keeping, it just must not pass as a
+    // complete recording. Only the wall-clock gate would have said anything, and the container is
+    // honest, so even that sees nothing wrong.
+    expect(fs.existsSync(path.join(mediaDir, "VTrack Performer", "example.test", "live.mp4"))).toBe(true);
+    expect(metadata.truncated).toBeUndefined();
   });
 });
