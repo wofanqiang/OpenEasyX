@@ -277,4 +277,21 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     expect(fs.existsSync(path.join(dir, "recovered.mp4"))).toBe(false);
     expect(fs.existsSync(path.join(dir, "capture_part000.ts"))).toBe(true);
   });
+
+  it("reports a recovered MP4 it could not remove as failed instead of claiming a deletion", async () => {
+    const env = await harness();
+    const item = env.item("stuck-rescue");
+    const dir = env.recoveryDir(item.id);
+    // Something that cannot be unlinked sitting where the file should be. The pass must not report
+    // this as a deletion: an operator who reads "deleted" would never go looking for the file again,
+    // and this one is still on disk.
+    fs.mkdirSync(path.join(dir, "recovered.mp4", "blocker"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "recovered.mp4", "blocker", "x.ts"), "junk");
+
+    const report = await env.queue.recoverResidualTs({ execute: true });
+    expect(report.deleted).toBe(0);
+    expect(report.failed).toBe(1);
+    expect(report.items).toEqual([{ itemId: item.id, action: "failed" }]);
+    expect(fs.existsSync(path.join(dir, "recovered.mp4"))).toBe(true);
+  });
 });

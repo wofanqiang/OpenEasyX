@@ -1424,12 +1424,14 @@ export class DownloadQueue {
    * gone the next pass picks them up and folds them. The folder itself only goes when it is empty.
    */
   private discardUnplayableRecovered(directory: string): boolean {
-    let removed = false;
     for (const name of ["recovered.mp4", "recovered.json", "recovered.poster.jpg"]) {
-      try { fs.unlinkSync(path.join(directory, name)); removed = true; } catch { /* already gone */ }
+      try { fs.unlinkSync(path.join(directory, name)); } catch { /* already gone, or not ours to remove */ }
     }
     try { if (!fs.readdirSync(directory).length) fs.rmSync(directory, { recursive: true, force: true }); } catch { /* best-effort */ }
-    return removed;
+    // Report from the filesystem rather than from "the unlink did not throw": a folder the server
+    // user cannot write to (wrong owner, read-only volume) must come back as a failure, not as a
+    // deletion that never happened.
+    return !fs.existsSync(path.join(directory, "recovered.mp4"));
   }
 
   async ensureRecoveredPoster(itemId: string, mp4?: string): Promise<string | null> {
@@ -1473,15 +1475,18 @@ export class DownloadQueue {
         // lists as rescuable while no player can start it. This pass is the only place such a file
         // disappears on its own, without the operator hunting for the one entry that will not play.
         const rescued = root === this.recoveryRoot ? path.join(stagingDir, "recovered.mp4") : undefined;
-        if (rescued && fs.existsSync(rescued) && fs.statSync(rescued).size > 0) {
+        // Existence only: a zero-byte or non-file `recovered.mp4` is just as unwatchable as a
+        // corrupted one, and `listRecovered` hides it anyway, so it is judged rather than skipped.
+        if (rescued && fs.existsSync(rescued)) {
           report.scanned++;
           if (await this.isPlayableMedia(rescued)) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
-          if (execute) { try { this.discardUnplayableRecovered(stagingDir); report.deleted++; } catch { report.failed++; } }
-          else report.deleted++;
-          report.items.push({ itemId, action: "deleted" });
-          this.writeLog?.("warn", "download", execute
-            ? "Unplayable recovered recording deleted; any raw parts beside it were kept"
-            : "Unplayable recovered recording would be deleted", { itemId });
+          if (!execute) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
+          else if (this.discardUnplayableRecovered(stagingDir)) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
+          else {
+            report.failed++; report.items.push({ itemId, action: "failed" });
+            this.writeLog?.("warn", "download", "Unplayable recovered recording could not be deleted", { itemId });
+          }
+          if (execute) this.writeLog?.("warn", "download", "Unplayable recovered recording is no longer playable and was removed; any raw parts beside it were kept", { itemId });
           continue;
         }
         report.scanned++;
@@ -1535,12 +1540,14 @@ export class DownloadQueue {
           // above, so an unplayable output is not footage worth keeping alive -- drop it together
           // with its capture rather than filing it, and let the summary report the deletion.
           if (!(await this.isPlayableMedia(outPath))) {
-            this.discardUnplayableRecovered(recoveryDir);
+            const discarded = this.discardUnplayableRecovered(recoveryDir);
             for (const doomed of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
-              try { fs.unlinkSync(doomed); } catch { /* best-effort */ }
+              try { fs.unlinkSync(doomed); }
+              catch { report.leftover++; this.writeLog?.("warn", "download", "Unplayable rescue could not be cleaned up", { itemId, path: doomed }); }
             }
-            report.deleted++; report.items.push({ itemId, action: "deleted" });
-            this.writeLog?.("warn", "download", "Rescue produced an unplayable MP4; it and its capture were deleted", { itemId });
+            if (discarded) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
+            else { report.failed++; report.items.push({ itemId, action: "failed" }); }
+            this.writeLog?.("warn", "download", "Rescue produced an unplayable MP4; it and its capture were dropped instead of filed", { itemId });
             continue;
           }
           const probe = await this.probeVideo(outPath);
