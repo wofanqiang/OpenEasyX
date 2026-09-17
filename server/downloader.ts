@@ -787,11 +787,14 @@ export class DownloadQueue {
             } catch {
               fs.renameSync(recoverySource, recoveredMp4);
             }
+            // Probe for real: the sidecar drives the duration/resolution the Recovery page
+            // shows, and hardcoding zeros there made every salvaged recording read as 0:00.
+            const probe = await this.probeVideo(recoveredMp4);
             const sidecar = {
               itemId: item.id, title: item.title ?? item.id,
               performer: item.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
               source: item.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
-              duration: 0, width: 0, height: 0, size: fs.statSync(recoveredMp4).size,
+              duration: probe.duration, width: probe.width, height: probe.height, size: fs.statSync(recoveredMp4).size,
               recoveredAt: new Date().toISOString(), avsyncDelta: 0,
             };
             fs.writeFileSync(path.join(recoveryDirectory, "recovered.json"), JSON.stringify(sidecar, null, 2));
@@ -1331,14 +1334,14 @@ export class DownloadQueue {
 
   /** Scan both the active download staging area and the recovery folder for leftover captures. */
   async recoverResidualTs(options: { dryRun?: boolean; execute?: boolean } = {}): Promise<{
-    scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; dryRun: boolean;
-    items: Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" }>;
+    scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; superseded: number; dryRun: boolean;
+    items: Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" | "superseded" }>;
   }> {
     const dryRun = options.dryRun === true || options.execute !== true;
     const execute = options.execute === true;
     const report = {
-      scanned: 0, rescued: 0, deleted: 0, skipped: 0, failed: 0, leftover: 0, dryRun,
-      items: [] as Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" }>,
+      scanned: 0, rescued: 0, deleted: 0, skipped: 0, failed: 0, leftover: 0, superseded: 0, dryRun,
+      items: [] as Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" | "superseded" }>,
     };
     const roots = [this.downloadsRoot, this.recoveryRoot];
     const ACTIVE = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
@@ -1357,6 +1360,15 @@ export class DownloadQueue {
         const item = this.db.getItem(itemId);
         if (this.active.has(itemId) || (item && ACTIVE.has(item.status))) {
           report.skipped++; report.items.push({ itemId, action: "skipped" }); continue;
+        }
+        // The item already has its finished file in the library, so `catalogRecovered` will always
+        // answer `already-completed` — nothing folded here could ever be filed. Remuxing gigabytes
+        // to produce an unfillable file wastes the box and risks the very footage being rescued, so
+        // report these and leave the bytes exactly where they are for the operator to decide.
+        if (item && item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
+          report.superseded++; report.items.push({ itemId, action: "superseded" });
+          this.writeLog?.("warn", "download", "Residual capture left untouched: the item already has a library file", { itemId, root: path.basename(root), name });
+          continue;
         }
         const stagingDir = path.join(root, name);
         // A10 segmented captures land as capture_partNNN.ts. The remux below folds them via the
@@ -1461,14 +1473,16 @@ export class DownloadQueue {
   }
 
   /** Move a recovered recording into the library at its canonical path (reuses the finalize logic). */
-  async catalogRecovered(itemId: string): Promise<{ cataloged: boolean; reason?: string; storagePath?: string }> {
+  async catalogRecovered(itemId: string): Promise<{ cataloged: boolean; reason?: string; storagePath?: string; leftovers?: string[] }> {
     const mp4 = path.join(this.recoveryRoot, safeSegment(itemId), "recovered.mp4");
     if (!fs.existsSync(mp4) || !fs.statSync(mp4).size) throw Object.assign(new Error("No recovered file for this item"), { statusCode: 404 });
     const item = this.db.getItem(itemId);
     if (!item) throw Object.assign(new Error("Recording item not found"), { statusCode: 404 });
     // Guard: the item is already a completed library entry with its file on disk — never overwrite it.
+    // The recovered file is deliberately KEPT: there is no safe place to file it, and deleting
+    // footage on the user's behalf is not ours to decide. The explicit delete action removes it.
     if (item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
-      this.clearRecovery(itemId);
+      this.writeLog?.("warn", "download", "Recovered recording left in place: the item already has a library file", { itemId, file: mp4 });
       return { cataloged: false, reason: "already-completed" };
     }
     const performer = this.db.getPerformer(item.performerId);
@@ -1488,17 +1502,45 @@ export class DownloadQueue {
       if (duplicate && duplicate.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
         fs.unlinkSync(finalPath);
         this.db.setItemStatus(item.id, "duplicate", { progress: 1, checksum, duplicateOf: duplicate.id });
-        this.clearRecovery(itemId);
-        return { cataloged: false, reason: "duplicate" };
+        const leftovers = this.consumeRecovered(itemId);
+        return { cataloged: false, reason: "duplicate", leftovers };
       }
       this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
-      this.clearRecovery(itemId);
-      return { cataloged: true, storagePath: relativePath };
+      const leftovers = this.consumeRecovered(itemId);
+      return { cataloged: true, storagePath: relativePath, leftovers };
     });
   }
 
+  /**
+   * Remove only what a successful catalog consumed. A recovery folder can also hold leftovers
+   * from an EARLIER salvage (raw capture parts, `recovered.parts.json`, a suffixed
+   * `recovered-*.mp4`) covering a different slice of the broadcast, so wiping the folder would
+   * discard footage the user never asked to lose.
+   */
+  private consumeRecovered(itemId: string): string[] {
+    const dir = path.join(this.recoveryRoot, safeSegment(itemId));
+    for (const name of ["recovered.mp4", "recovered.json", "recovered.poster.jpg"]) {
+      try { fs.unlinkSync(path.join(dir, name)); } catch { /* already gone */ }
+    }
+    let leftovers: string[] = [];
+    try { leftovers = fs.readdirSync(dir); } catch { /* the whole folder is gone */ }
+    if (!leftovers.length) {
+      // Nothing from an earlier salvage is at stake, so the (now empty) folder goes with its file.
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      return [];
+    }
+    // An earlier salvage covering a different slice of the broadcast lives here too: keeping
+    // it is the whole point, so report it and let the operator decide.
+    this.writeLog?.("warn", "download", "Recovery folder still holds earlier captures; they were kept", { itemId, leftovers });
+    return leftovers;
+  }
+
+  /** Explicit, user-initiated removal (the delete action). Logs what disappears — never silent. */
   private clearRecovery(itemId: string) {
     const dir = path.join(this.recoveryRoot, safeSegment(itemId));
+    let entries: string[] = [];
+    try { entries = fs.readdirSync(dir); } catch { /* nothing to remove */ }
+    if (entries.length) this.writeLog?.("info", "download", "Deleting recovered recordings", { itemId, entries });
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
 

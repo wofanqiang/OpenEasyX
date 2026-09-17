@@ -138,7 +138,7 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     expect(await env.queue.listRecovered()).toEqual([]);
   });
 
-  it("never overwrites a recording that is already completed in the library", async () => {
+  it("never overwrites a completed library recording and keeps the salvage for the operator", async () => {
     const env = await harness();
     const completed = env.item("already-done");
     writePlayableCapture(path.join(env.captureDir(completed.id), "capture.ts"));
@@ -153,7 +153,10 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     const result = await env.queue.catalogRecovered(completed.id);
     expect(result).toEqual({ cataloged: false, reason: "already-completed" });
     expect(fs.readFileSync(libraryFile, "utf8")).toBe("the original library copy");
-    expect(fs.existsSync(env.recoveryDir(completed.id))).toBe(false);
+    // Deleting footage on the user's behalf is not ours to decide: the salvage stays put and
+    // the operator removes it from the Recovery page.
+    expect(fs.existsSync(path.join(env.recoveryDir(completed.id), "recovered.mp4"))).toBe(true);
+    expect(await env.queue.listRecovered()).toHaveLength(1);
   });
 
   it("deletes recovered recordings in bulk and reports failures per id", async () => {
@@ -183,5 +186,46 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
 
     await env.queue.catalogRecovered(rescued.id);
     expect(env.queue.recoveredStreamPath(rescued.id)).toBeNull();
+  });
+
+  it("keeps an earlier salvage in the recovery folder when a later one is cataloged", async () => {
+    const env = await harness();
+    const rescued = env.item("keep-earlier");
+    writePlayableCapture(path.join(env.captureDir(rescued.id), "capture.ts"));
+    await env.queue.recoverResidualTs({ execute: true });
+
+    // An EARLIER salvage covering a different slice of the broadcast is still in the folder.
+    const dir = env.recoveryDir(rescued.id);
+    fs.writeFileSync(path.join(dir, "capture_part000.ts"), "earlier slice, still raw");
+    fs.writeFileSync(path.join(dir, "recovered.parts.json"), JSON.stringify({ parts: 1 }));
+
+    const result = await env.queue.catalogRecovered(rescued.id);
+    expect(result.cataloged).toBe(true);
+    // Only what the catalog consumed is unlinked; the earlier footage survives.
+    expect(fs.existsSync(path.join(dir, "recovered.mp4"))).toBe(false);
+    expect(fs.existsSync(path.join(dir, "capture_part000.ts"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "recovered.parts.json"))).toBe(true);
+    expect(result.leftovers?.slice().sort()).toEqual(["capture_part000.ts", "recovered.parts.json"]);
+  });
+
+  it("reports a residual capture as superseded instead of remuxing an unfillable file", async () => {
+    const env = await harness();
+    const done = env.item("superseded");
+    writePlayableCapture(path.join(env.captureDir(done.id), "capture.ts"));
+
+    // The item finished normally and its file is already in the library, so nothing folded
+    // here could ever be filed: report it rather than burn the box on a useless remux.
+    const libraryFile = path.join(env.mediaDir, "Recovery Performer", "example.test", "superseded.mp4");
+    fs.mkdirSync(path.dirname(libraryFile), { recursive: true });
+    fs.writeFileSync(libraryFile, "the original library copy");
+    env.db.setItemStatus(done.id, "completed", { progress: 1, storagePath: path.join("Recovery Performer", "example.test", "superseded.mp4") });
+
+    const report = await env.queue.recoverResidualTs({ execute: true });
+    expect(report.superseded).toBe(1);
+    expect(report.rescued).toBe(0);
+    expect(report.items).toEqual([{ itemId: done.id, action: "superseded" }]);
+    // The bytes are left exactly where they were.
+    expect(fs.existsSync(path.join(env.captureDir(done.id), "capture.ts"))).toBe(true);
+    expect(fs.existsSync(env.recoveryDir(done.id))).toBe(false);
   });
 });
