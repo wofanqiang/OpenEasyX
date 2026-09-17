@@ -804,24 +804,61 @@ export class DownloadQueue {
         }
       }
       if (!control.action && !control.paused && !recoverySource && strayParts.length) {
-        // Last-resort salvage: the parts cannot be folded into one file (ffmpeg itself is
-        // failing), so move them to recovery as-is for manual inspection instead of
-        // deleting hours of footage with the staging directory.
-        try {
-          const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
-          this.prepareOutputDirectory(recoveryDirectory);
-          const saved: string[] = [];
-          for (const part of strayParts) {
-            const target = this.availableDestination(path.join(recoveryDirectory, path.basename(part)), item.id);
-            fs.renameSync(part, target);
-            saved.push(path.basename(target));
+        // The fold above (parts -> capture.ts) can fail for reasons that say nothing about the
+        // parts themselves -- most often the post-process slot was held through a load spike and
+        // the deadline killed the fold. So salvage straight through the concat demuxer and give
+        // the Recovery page a real MP4. Without this the bytes sat here as bare parts, and
+        // `listRecovered()` (which only recognises recovered.mp4) never listed them at all.
+        const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
+        const partBytes = strayParts.reduce((total, part) => { try { return total + fs.statSync(part).size; } catch { return total; } }, 0);
+        let salvaged = false;
+        if (partBytes > 0) {
+          try {
+            this.prepareOutputDirectory(recoveryDirectory);
+            const recoveredMp4 = this.availableDestination(path.join(recoveryDirectory, "recovered.mp4"), item.id);
+            // Multi-part captures go through the concat demuxer directly: an intermediate folded
+            // capture.ts would double the disk footprint of a multi-GB recording.
+            const concatList = strayParts.length >= 2 && temporaryDirectory ? path.join(temporaryDirectory, "capture.concat.txt") : undefined;
+            if (concatList) fs.writeFileSync(concatList, strayParts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
+            // Suspend the download stall timer for the rest of this attempt: the salvage is
+            // concluding work and must not be mistaken for a stalled capture.
+            control.encoding = true;
+            await this.remuxCaptureToMp4(concatList ?? strayParts[0], recoveredMp4, control, concatList, partBytes);
+            const probe = await this.probeVideo(recoveredMp4);
+            fs.writeFileSync(path.join(recoveryDirectory, "recovered.json"), JSON.stringify({
+              itemId: item.id, title: item.title ?? item.id,
+              performer: item.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
+              source: item.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
+              duration: probe.duration, width: probe.width, height: probe.height,
+              size: fs.statSync(recoveredMp4).size, recoveredAt: new Date().toISOString(), avsyncDelta: 0,
+            }, null, 2));
+            try { await this.ensureRecoveredPoster(item.id, recoveredMp4); } catch { /* Poster is optional. */ }
+            for (const part of strayParts) { try { fs.unlinkSync(part); } catch { /* a leftover part is harmless; the next rescue run removes it */ } }
+            temporary = "";
+            message += ` Recording preserved for recovery at ${path.relative(this.mediaRoot, recoveredMp4)}.`;
+            salvaged = true;
+          } catch { /* fall through to the raw-parts fallback below */ }
+        }
+        if (!salvaged) {
+          // Truly un-remuxable parts: keep the bytes and record what was saved, so no recorded
+          // minute is ever deleted with the staging directory. The Recovery page cannot list
+          // these (there is no recovered.mp4); `cleanup-residual-ts` folds them later.
+          try {
+            this.prepareOutputDirectory(recoveryDirectory);
+            const saved: string[] = [];
+            for (const part of strayParts) {
+              const target = this.availableDestination(path.join(recoveryDirectory, path.basename(part)), item.id);
+              fs.renameSync(part, target);
+              saved.push(path.basename(target));
+            }
+            temporary = "";
+            fs.writeFileSync(path.join(recoveryDirectory, "recovered.parts.json"), JSON.stringify({ itemId: item.id, title: item.title ?? item.id, parts: saved }, null, 2));
+            message += ` ${saved.length} raw capture part(s) preserved for recovery.`;
+            this.writeLog?.("warn", "download", "Recording parts kept raw; run the residual recovery pass to fold them", { itemId: item.id, parts: saved.length });
+          } catch {
+            preserveTemporary = true;
+            message += " Raw capture parts preserved in staging; recover them before retrying.";
           }
-          temporary = "";
-          fs.writeFileSync(path.join(recoveryDirectory, "recovered.parts.json"), JSON.stringify({ itemId: item.id, title: item.title ?? item.id, parts: saved }, null, 2));
-          message += ` ${saved.length} raw capture part(s) preserved for recovery.`;
-        } catch {
-          preserveTemporary = true;
-          message += " Raw capture parts preserved in staging; recover them before retrying.";
         }
       }
       if (control.action) {
