@@ -361,16 +361,23 @@ describe("stalledDownload", () => {
 });
 
 describe("postProcessDeadlineMs", () => {
-  it("scales with the capture size, with an 8 minute floor and a 45 minute cap", () => {
+  it("scales with the capture size, with an 8 minute floor and a 3 hour cap", () => {
     expect(postProcessDeadlineMs(0)).toBe(8 * 60_000);
-    expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBe(512_000);       // 2 GiB at 4 MiB/s
-    expect(postProcessDeadlineMs(100 * 1024 ** 3)).toBe(45 * 60_000); // capped
+    expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBe(2_048_000);        // 2 GiB at 1 MiB/s
+    expect(postProcessDeadlineMs(100 * 1024 ** 3)).toBe(3 * 60 * 60_000); // capped
   });
 
   it("gives a multi-GB remux far more room than the download stall timeout", () => {
     // The regression: a ~2 GB capture was SIGKILLed mid-remux at ~122s, i.e. right on the
     // 120s download stall timeout, and the whole recording was written off as failed.
     expect(postProcessDeadlineMs(2 * 1024 ** 3)).toBeGreaterThan(120_000 * 2);
+  });
+
+  it("leaves a healthy remux room to finish on the 1-core box", () => {
+    // Measured on the 1-core VPS: a 2.42 GiB segmented capture remuxed at ~4.05 MB/s and
+    // needed ~596s, while the old 4 MiB/s assumption granted only 576s. The budget has to
+    // clear that by a wide margin, or a good recording gets killed and filed as `failed`.
+    expect(postProcessDeadlineMs(Math.round(2.42 * 1024 ** 3))).toBeGreaterThan(596_000 * 3);
   });
 });
 

@@ -90,13 +90,19 @@ export function stalledDownload(control: Pick<ActiveDownload, "encoding" | "acti
 }
 
 /**
- * Deadline for a post-processing step that cannot report progress. The budget scales with
- * the input because `+faststart` rewrites the whole file and a re-encode runs slower than
- * realtime: 4 MiB/s, floored at 8 minutes and capped at 45 minutes.
+ * Deadline for a post-processing step that cannot report progress.
+ *
+ * The rate has to stay pessimistic: `+faststart` rewrites the whole file, so the budget
+ * covers far more I/O than the input size alone suggests. Measured on the 1-core VPS, a
+ * 2.42 GiB segmented capture remuxed at ~4.05 MB/s and needed ~596s -- the old 4 MiB/s
+ * assumption granted only 576s, so a perfectly healthy remux was SIGKILLed 20s short of
+ * the finish line. Losing that race remuxes the same bytes all over again during recovery
+ * and files a good capture as `failed`, so the estimate is cut to 1 MiB/s (~4x headroom
+ * over the measurement), floored at 8 minutes and capped at 3 hours.
  */
 export function postProcessDeadlineMs(inputBytes: number): number {
-  const scaled = Math.ceil(Math.max(0, inputBytes) / (4 * 1024 * 1024)) * 1000;
-  return Math.min(45 * 60_000, Math.max(8 * 60_000, scaled));
+  const scaled = Math.ceil(Math.max(0, inputBytes) / (1 * 1024 * 1024)) * 1000;
+  return Math.min(3 * 60 * 60_000, Math.max(8 * 60_000, scaled));
 }
 
 /** HTTP status codes a media URL can never recover from: the resource is gone for good. */
