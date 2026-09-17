@@ -12,6 +12,10 @@ const NETWORK_INPUT = /(?:https?|rtmp|rtsp|mms):\/\/|\.m3u8\b/i;
 const OUR_BINARY = /\b(?:ffmpeg|yt[-_]?dlp)\b/i;
 // A10 segmented captures write capture_part000.ts... instead of one capture.ts.
 const SEGMENT_OUTPUT = /capture_part\d+\.ts/i;
+// Chromium instances the plugin browser fetcher leaves behind. Our fetcher always runs with a
+// temp profile prefixed "easyx-capture-", which is what tells our chromium apart from a user's.
+const CHROMIUM_BINARY = /\b(?:chromium|chromium-browser|google-chrome|chrome|headless_shell)\b/i;
+const OUR_BROWSER_PROFILE = /easyx-capture-/i;
 
 /**
  * True only for a *live capture* we started: it writes `capture.ts` (or its rolling
@@ -26,6 +30,12 @@ export function isLiveCaptureCmdline(cmdline: string): boolean {
   return NETWORK_INPUT.test(cmdline);
 }
 
+/** True only for a chromium we launched for a plugin browser capture (its temp profile is ours),
+ *  so a user's own chromium/chrome is never matched. */
+export function isBrowserOrphanCmdline(cmdline: string): boolean {
+  return CHROMIUM_BINARY.test(cmdline) && OUR_BROWSER_PROFILE.test(cmdline);
+}
+
 /** Extract the staging directory that owns a `capture.ts` (or capture_partNNN.ts) from a command line, or undefined. */
 export function captureStagingDir(cmdline: string): string | undefined {
   const match = cmdline.match(/(\S*capture(?:\.ts|_part\d+\.ts))/i);
@@ -35,8 +45,8 @@ export function captureStagingDir(cmdline: string): string | undefined {
   return path.dirname(path.resolve(file));
 }
 
-/** Linux-only: enumerate /proc/<pid>/cmdline for live-capture orphans. Non-Linux returns []. */
-export function scanCaptureProcesses(_mediaRoot?: string): OrphanProcess[] {
+/** Linux-only: enumerate /proc/<pid>/cmdline, keeping the processes a predicate accepts. */
+function scanProc(accept: (cmdline: string) => boolean): OrphanProcess[] {
   if (process.platform === "win32" || !fs.existsSync("/proc")) return [];
   const out: OrphanProcess[] = [];
   for (const pidStr of fs.readdirSync("/proc")) {
@@ -49,9 +59,24 @@ export function scanCaptureProcesses(_mediaRoot?: string): OrphanProcess[] {
     } catch {
       continue;
     }
-    if (cmd && isLiveCaptureCmdline(cmd)) out.push({ pid, cmdline: cmd });
+    if (cmd && accept(cmd)) out.push({ pid, cmdline: cmd });
   }
   return out;
+}
+
+/** Linux-only: enumerate /proc/<pid>/cmdline for live-capture orphans. Non-Linux returns []. */
+export function scanCaptureProcesses(_mediaRoot?: string): OrphanProcess[] {
+  return scanProc(isLiveCaptureCmdline);
+}
+
+/** Linux-only: orphaned plugin chromium (see isBrowserOrphanCmdline). Non-Linux returns []. */
+export function scanBrowserProcesses(): OrphanProcess[] {
+  return scanProc(isBrowserOrphanCmdline);
+}
+
+/** Every orphan we may have spawned (live captures + plugin chromium) in one pass. */
+export function scanOrphanProcesses(): OrphanProcess[] {
+  return [...scanCaptureProcesses(), ...scanBrowserProcesses()];
 }
 
 /** SIGTERM the whole process group, then SIGKILL any survivor after `timeoutMs`. */
@@ -106,12 +131,12 @@ export function reapOrphans(opts: {
 }): Set<string> {
   const protectedDirs = new Set<string>();
   if (opts.mode === "off") return protectedDirs;
-  const scan = opts.scan ?? scanCaptureProcesses;
+  const scan = opts.scan ?? scanOrphanProcesses;
   const killFn = opts.kill ?? ((pid: number) => killProcessGroup(pid));
   const targets = scan();
   for (const target of targets) {
     const dir = captureStagingDir(target.cmdline);
-    opts.log?.("warn", "download", `orphan capture process detected (pid ${target.pid}); reap mode=${opts.mode}`, {
+    opts.log?.("warn", "download", `orphan process detected (pid ${target.pid}); reap mode=${opts.mode}`, {
       cmdline: target.cmdline.slice(0, 240),
     });
     if (opts.mode === "kill") {
@@ -121,7 +146,7 @@ export function reapOrphans(opts: {
     }
   }
   if (targets.length) {
-    opts.log?.("warn", "download", `reaped ${targets.length} orphan capture process(es) (mode=${opts.mode})`);
+    opts.log?.("warn", "download", `reaped ${targets.length} orphan process(es) (mode=${opts.mode})`);
   }
   return protectedDirs;
 }

@@ -514,10 +514,10 @@ export class DownloadQueue {
           // segment muxer only cuts on TS packet boundaries, so the join adds no A/V gap.
           const parts = captureSegmentFiles(temporaryDirectory, { skipEmpty: true });
           if (parts.length && !fs.existsSync(tsPath)) {
-            // Same reasoning as the remux below: the capture already ended, so clear any
-            // pending action before spawning ffmpeg and let `encoding` shield the fold-in
-            // from a late stop/cancel.
-            control.action = undefined;
+            // The capture already ended, so a late "stop" must not abort the fold-in (it would
+            // discard a finished recording). A "cancel"/"delete" is kept so the post-process
+            // checks below can still end the item as cancelled/deleted.
+            if (control.action === "stop") control.action = undefined;
             control.encoding = true;
             recordingFinalize = true;
             this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
@@ -539,13 +539,12 @@ export class DownloadQueue {
             // A live capture ends either because the user pressed stop or because the
             // stream went offline, and in both cases the capture is already finished:
             // the remux below concludes the recording, it is not a fresh download.
-            // Clear any pending action *before* spawning ffmpeg, because
-            // runCommandDownload immediately signals a child spawned while
-            // control.action is still set. Left as "stop", it would SIGINT the remux the
-            // instant it starts, produce no MP4, and let the catch branch discard the
-            // whole capture. `encoding` then keeps a later stop/cancel from cutting the
-            // remux short (see interrupt()).
-            control.action = undefined;
+            // A "stop" is cleared *before* spawning ffmpeg because runCommandDownload
+            // immediately signals a child spawned while control.action is still set; left
+            // as "stop" it would SIGINT the remux the instant it starts and discard the
+            // whole capture. A "cancel"/"delete" is kept so the remux is aborted and the
+            // post-process check throws, ending the item as cancelled/deleted.
+            if (control.action === "stop") control.action = undefined;
             control.encoding = true;
             recordingFinalize = true;
             this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
@@ -630,7 +629,8 @@ export class DownloadQueue {
       if (item.mediaType === "video" && item.metadata.live === true && settings.recordingPreset && settings.recordingPreset !== "source") {
         const encoded = path.join(temporaryDirectory, "encoded.mp4");
         const preset = settings.recordingPreset;
-        control.action = undefined; control.encoding = true;
+        // Keep a "cancel"/"delete" so the re-encode is aborted and the item ends cancelled/deleted.
+        if (control.action === "stop") control.action = undefined; control.encoding = true;
         this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
         this.writeLog?.("info", "download", "Encoding live recording", { itemId: item.id, preset });
         let encodeBytes = 0; try { encodeBytes = fs.statSync(temporary).size; } catch { /* keep 0 */ }
@@ -692,7 +692,7 @@ export class DownloadQueue {
         }
       }
 
-      await this.withFinalizeLock("output", async () => {
+      await this.withFinalizeLock(`output:${item.id}`, async () => {
         const visual = await this.visualFingerprint(temporary, item.mediaType);
         const qualityScore = Math.max(item.qualityScore, visual?.qualityScore ?? 0);
         this.db.setDownloadFingerprint(item.id, visual?.hash, qualityScore);
@@ -778,9 +778,25 @@ export class DownloadQueue {
           try {
             const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
             this.prepareOutputDirectory(recoveryDirectory);
-            const recovery = this.availableDestination(path.join(recoveryDirectory, path.basename(recoverySource)), item.id);
-            fs.renameSync(recoverySource, recovery); temporary = "";
-            message += ` Recording preserved for recovery at ${path.relative(this.mediaRoot, recovery)}.`;
+            const recoveredMp4 = this.availableDestination(path.join(recoveryDirectory, "recovered.mp4"), item.id);
+            try {
+              // Prefer a real MP4 the recovery UI can play; the post-process gate keeps it off
+              // live captures' CPUs. On a corrupt capture or a missing ffmpeg, fall back to moving
+              // the raw TS under the recovered.mp4 name so the file is still listed and inspectable.
+              await this.remuxCaptureToMp4(recoverySource, recoveredMp4, control);
+            } catch {
+              fs.renameSync(recoverySource, recoveredMp4);
+            }
+            const sidecar = {
+              itemId: item.id, title: item.title ?? item.id,
+              performer: item.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
+              source: item.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
+              duration: 0, width: 0, height: 0, size: fs.statSync(recoveredMp4).size,
+              recoveredAt: new Date().toISOString(), avsyncDelta: 0,
+            };
+            fs.writeFileSync(path.join(recoveryDirectory, "recovered.json"), JSON.stringify(sidecar, null, 2));
+            temporary = "";
+            message += ` Recording preserved for recovery at ${path.relative(this.mediaRoot, recoveredMp4)}.`;
           } catch {
             preserveTemporary = true;
             message += ` Recording preserved in staging at ${path.relative(this.mediaRoot, recoverySource)}; recover it before retrying.`;
@@ -1074,15 +1090,13 @@ export class DownloadQueue {
     const date = new Date(publishedAt);
     if (Number.isNaN(date.valueOf())) return;
     if (mediaType === "image") {
+      // Embed the canonical date in EXIF too; the filesystem mtime below is the fallback.
       const exifDate = date.toISOString().slice(0, 19).replace(/-/g, ":").replace("T", " ");
       try { await this.capture("exiftool", ["-overwrite_original", `-DateTimeOriginal=${exifDate}`, `-CreateDate=${exifDate}`, `-ModifyDate=${exifDate}`, `-XMP:DateCreated=${date.toISOString()}`, file]); } catch { /* Filesystem date still preserves the canonical date. */ }
-    } else if (mediaType === "video" && [".mp4", ".m4v", ".mov", ".mkv", ".webm"].includes(path.extname(file).toLowerCase())) {
-      const extension = path.extname(file); const dated = `${file}.dated${extension}`;
-      try {
-        await this.capture("ffmpeg", ["-y", "-v", "error", "-i", file, "-map", "0", "-map_metadata", "0", "-c", "copy", "-metadata", `creation_time=${date.toISOString()}`, "-metadata", `date=${date.toISOString()}`, dated]);
-        if (fs.existsSync(dated) && fs.statSync(dated).size > 0) fs.renameSync(dated, file);
-      } catch { if (fs.existsSync(dated)) fs.unlinkSync(dated); }
     }
+    // Videos keep their container untouched: a `-c copy` remux of a multi-GB capture is a full
+    // read+write that fights live recordings for I/O on small hosts. The on-disk mtime already
+    // pins the canonical date the library view sorts by, so the ffmpeg rewrite is unnecessary.
     fs.utimesSync(file, date, date);
   }
 
@@ -1090,7 +1104,7 @@ export class DownloadQueue {
     for (const itemId of [...new Set(itemIds)]) {
       const item = this.db.getItem(itemId);
       if (!item?.storagePath || item.status !== "completed") continue;
-      await this.withFinalizeLock("output", () => this.applyMediaDate(path.join(this.mediaRoot, item.storagePath!), item.mediaType, item.publishedAt));
+      await this.withFinalizeLock(`output:${itemId}`, () => this.applyMediaDate(path.join(this.mediaRoot, item.storagePath!), item.mediaType, item.publishedAt));
     }
   }
 
@@ -1428,7 +1442,7 @@ export class DownloadQueue {
     this.prepareOutputDirectory(path.dirname(destination));
     const finalPath = this.availableDestination(destination, item.id);
     const canonicalDate = this.db.setCanonicalMediaDate(item.id, item.publishedAt);
-    return this.withFinalizeLock("output", async () => {
+    return this.withFinalizeLock(`output:${itemId}`, async () => {
       await this.applyMediaDate(mp4, item.mediaType, canonicalDate);
       fs.renameSync(mp4, finalPath);
       const relativePath = path.relative(this.mediaRoot, finalPath);

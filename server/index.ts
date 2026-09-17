@@ -111,6 +111,12 @@ function refreshLiveCamFavorites(providerId?: string) {
 }
 
 app.setErrorHandler((error, request, reply) => {
+  // A zod 4.x ZodError carries no `statusCode`, so without this branch every `.parse()`
+  // failure across the API would collapse to a 500 and leak the raw issues JSON to the client.
+  if (error instanceof z.ZodError) {
+    app.log.warn({ issues: error.issues, method: request.method, url: request.url, scope: "http" }, "Request validation failed");
+    return reply.status(400).send({ error: "Validation failed", issues: error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`) });
+  }
   const status = typeof (error as { statusCode?: unknown }).statusCode === "number" ? Number((error as { statusCode: number }).statusCode) : 500;
   const message = error instanceof Error ? error.message : String(error);
   app.log[status >= 500 ? "error" : "warn"]({ err: error, method: request.method, url: request.url, scope: "http" }, "Request failed");
@@ -789,7 +795,9 @@ app.put<{ Body: Record<string, unknown> }>("/api/settings", async (request) => {
   const parsed = settingsSchema.safeParse(request.body);
   if (!parsed.success) throw Object.assign(new Error(parsed.error.issues.map((issue) => issue.message).join(" ")), { statusCode: 400 });
   const settings = parsed.data;
-  return db.updateSettings(settings);
+  // Never echo the admin password hash back to the client.
+  const { admin_password_hash: _omitted, ...result } = db.updateSettings(settings);
+  return result;
 });
 
 const scheduledInFlight = new Set<string>();
@@ -845,16 +853,35 @@ if (fs.existsSync(webRoot)) {
 
 let subtitleWorker: ChildProcess | undefined;
 let subtitleWorkerRestart: NodeJS.Timeout | undefined;
+let subtitleWorkerFailures = 0;
+// A crash loop (e.g. torch import failing under a tight cgroup) must not spin forever:
+// back off 5s -> 10s -> 20s -> ... -> 60s, then give up after a bounded number of tries.
+const SUBTITLE_WORKER_MAX_BACKOFF = 60_000;
+const SUBTITLE_WORKER_MAX_FAILURES = 8;
+const SUBTITLE_WORKER_STABLE_MS = 60_000;
 let shuttingDown = false;
+function scheduleSubtitleWorkerRestart(code: number | null, signal: NodeJS.Signals | null) {
+  if (shuttingDown) return;
+  subtitleWorkerFailures++;
+  if (subtitleWorkerFailures >= SUBTITLE_WORKER_MAX_FAILURES) {
+    app.log.error({ code, signal, failures: subtitleWorkerFailures }, "Embedded subtitle worker gave up after repeated failures; not restarting");
+    return;
+  }
+  const backoff = Math.min(SUBTITLE_WORKER_MAX_BACKOFF, 5_000 * 2 ** (subtitleWorkerFailures - 1));
+  app.log.warn({ code, signal, failures: subtitleWorkerFailures, backoffMs: backoff }, "Embedded subtitle worker stopped; restarting with backoff");
+  subtitleWorkerRestart = setTimeout(startEmbeddedSubtitleWorker, backoff);
+}
 function startEmbeddedSubtitleWorker() {
   if (process.env.EASYX_EMBEDDED_SUBTITLE_WORKER !== "true" || shuttingDown) return;
+  const startedAt = Date.now();
   subtitleWorker = spawn(process.env.EASYX_SUBTITLE_PYTHON || "/opt/subtitles/bin/python", ["-m", "worker.subtitles"], { cwd: path.resolve("."), env: process.env, stdio: ["ignore", "inherit", "inherit"] });
   subtitleWorker.on("error", (error) => app.log.error(error, "Embedded subtitle worker could not start"));
   subtitleWorker.on("close", (code, signal) => {
     subtitleWorker = undefined;
     if (shuttingDown) return;
-    app.log.error({ code, signal }, "Embedded subtitle worker stopped; restarting in five seconds");
-    subtitleWorkerRestart = setTimeout(startEmbeddedSubtitleWorker, 5000);
+    // A worker that ran for a while before exiting is not a crash loop; reset the counter.
+    if (Date.now() - startedAt > SUBTITLE_WORKER_STABLE_MS) subtitleWorkerFailures = 0;
+    scheduleSubtitleWorkerRestart(code, signal);
   });
 }
 

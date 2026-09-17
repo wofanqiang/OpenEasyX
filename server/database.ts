@@ -54,7 +54,7 @@ export class Database {
   constructor(dataDir: string) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.sqlite = new DatabaseSync(path.join(dataDir, "easyx.sqlite"));
-    this.sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    this.sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
   }
 

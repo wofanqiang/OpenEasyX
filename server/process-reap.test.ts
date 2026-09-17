@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { captureStagingDir, isLiveCaptureCmdline, killProcessGroup, reapOrphans, type OrphanProcess, type ReapMode } from "./process-reap.js";
+import { captureStagingDir, isBrowserOrphanCmdline, isLiveCaptureCmdline, killProcessGroup, reapOrphans, type OrphanProcess, type ReapMode } from "./process-reap.js";
 
 const waitFor = async (fn: () => boolean, timeoutMs: number): Promise<boolean> => {
   const deadline = Date.now() + timeoutMs;
@@ -32,6 +32,20 @@ describe("isLiveCaptureCmdline", () => {
   it("does NOT match a thumbnail probe or unrelated ffmpeg", () => {
     expect(isLiveCaptureCmdline("ffmpeg -i /media/out.mp4 -vf scale=8:8 -f rawvideo pipe:1")).toBe(false);
     expect(isLiveCaptureCmdline("ls -la /media")).toBe(false);
+  });
+});
+
+describe("isBrowserOrphanCmdline", () => {
+  it("matches our plugin chromium by its easyx-capture temp profile", () => {
+    const cmdline = "/usr/bin/chromium --headless=new --no-sandbox --user-data-dir=/tmp/easyx-capture-ab12cd about:blank";
+    expect(isBrowserOrphanCmdline(cmdline)).toBe(true);
+    expect(isBrowserOrphanCmdline("/usr/bin/google-chrome --user-data-dir=/tmp/easyx-capture-xyz --remote-debugging-port=9000")).toBe(true);
+  });
+
+  it("does NOT match a user's chromium/chrome without our profile marker", () => {
+    expect(isBrowserOrphanCmdline("/usr/bin/chromium --user-data-dir=/home/u/.config/chromium")).toBe(false);
+    expect(isBrowserOrphanCmdline("google-chrome --profile-directory=Default")).toBe(false);
+    expect(isBrowserOrphanCmdline("ffmpeg -i https://x/s.m3u8 -y /media/.downloads/a/capture.ts")).toBe(false);
   });
 });
 

@@ -4,7 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { Database } from "./database.js";
 import type { PluginManager } from "./plugin-manager.js";
-import { scanCaptureProcesses, type OrphanProcess } from "./process-reap.js";
+import { scanOrphanProcesses, type OrphanProcess } from "./process-reap.js";
 
 const asyncExecFile = promisify(execFile);
 
@@ -54,7 +54,7 @@ export async function runDiagnostics(options: DiagnosticsOptions): Promise<Diagn
   const { db, plugins, mediaRoot, activePids } = options;
   const binaryVersion = options.binaryVersion ?? defaultBinaryVersion;
   const diskUsage = options.diskUsage ?? defaultDiskUsage;
-  const scanOrphans = options.scanOrphans ?? scanCaptureProcesses;
+  const scanOrphans = options.scanOrphans ?? scanOrphanProcesses;
   const pluginTimeoutMs = options.pluginTimeoutMs ?? 10_000;
   const stuckAfterMs = options.stuckAfterMs ?? 15 * 60_000;
   const checks: DiagnosticCheck[] = [];

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import type { EasyXPlugin, PluginContext, PluginManifest } from "../packages/plugin-sdk/index.js";
 import type { Database } from "./database.js";
 import type { LogWriter } from "./log-store.js";
@@ -111,15 +111,34 @@ export class PluginManager {
       budgetMs: liveCrawlBudgetMs(this.db.getSettings()),
       fetch: globalThis.fetch,
       runCommand: (command, args, options = {}) => new Promise((resolve, reject) => {
-        execFile(command, args, {
-          timeout: Math.max(1_000, Math.min(30 * 60_000, options.timeoutMs ?? 120_000)),
-          maxBuffer: Math.max(64 * 1024, Math.min(50 * 1024 * 1024, options.maxOutputBytes ?? 10 * 1024 * 1024)),
-          encoding: "utf8",
-          signal,
-        }, (error, stdout, stderr) => {
-          if (error && typeof (error as NodeJS.ErrnoException & { code?: unknown }).code === "string") return reject(error);
-          resolve({ exitCode: typeof (error as { code?: unknown } | null)?.code === "number" ? Number((error as { code: number }).code) : error ? 1 : 0, stdout, stderr });
-        });
+        const timeoutMs = Math.max(1_000, Math.min(30 * 60_000, options.timeoutMs ?? 120_000));
+        const maxOutputBytes = Math.max(64 * 1024, Math.min(50 * 1024 * 1024, options.maxOutputBytes ?? 10 * 1024 * 1024));
+        // Detach so the child becomes its own process-group leader: a plugin's command (e.g. the
+        // python browser fetcher launching chromium) can spawn grandchildren, and a timeout must
+        // reap the whole group instead of leaving the grandchildren orphaned. execFile only ever
+        // signaled the direct child, which is how 11 chromium processes survived for days.
+        const child = spawn(command, args, { detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], signal, env: process.env });
+        let stdout = ""; let stderr = "";
+        const capture = (chunk: Buffer, sink: "stdout" | "stderr") => {
+          const text = chunk.toString("utf8");
+          if (sink === "stdout") { stdout = (stdout + text).slice(-maxOutputBytes); }
+          else { stderr = (stderr + text).slice(-maxOutputBytes); }
+        };
+        child.stdout?.on("data", (chunk: Buffer) => capture(chunk, "stdout"));
+        child.stderr?.on("data", (chunk: Buffer) => capture(chunk, "stderr"));
+        const killGroup = () => {
+          if (process.platform === "win32" || child.pid === undefined) { try { child.kill("SIGKILL"); } catch { /* already gone */ } return; }
+          // A negative pid signals the whole process group, so any chromium the child spawned dies too.
+          try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+        };
+        const timer = setTimeout(killGroup, timeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+        if (signal) {
+          if (signal.aborted) killGroup();
+          else signal.addEventListener("abort", () => { clearTimeout(timer); killGroup(); }, { once: true });
+        }
+        child.once("error", (error) => { clearTimeout(timer); reject(error); });
+        child.once("close", (code) => { clearTimeout(timer); resolve({ exitCode: typeof code === "number" ? code : 1, stdout, stderr }); });
       }),
       log: (level, message, details) => this.writeLog
         ? this.writeLog(level, `plugin:${pluginId}`, message, details)
