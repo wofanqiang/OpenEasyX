@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
@@ -18,14 +19,19 @@ import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
 import { PostProcessGate } from "./postprocess-gate.js";
 import type { HlsProxy } from "./hls-proxy.js";
 
-type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean };
+type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean; lastOutput?: string };
 
 // Concurrency lives in two independent pools. Downloads keep their historical range so the
 // setting keeps meaning what it always meant; recordings get their own, larger one because a
 // broadcast is time sensitive and cannot be retried later.
 const DEFAULT_MAX_DOWNLOADS = 2;
 const MAX_DOWNLOADS = 8;
-const DEFAULT_MAX_RECORDINGS = 8;
+// Default lowered from 8: on the small (1-core / 1.6GB) boxes this app commonly runs on,
+// eight simultaneous ffmpeg captures starve the very recordings they serve (measured: the
+// captures fall to ~50% of real time, fall behind the LL-HLS edge, and the CDN starts
+// evicting segments -> "recorded 30 minutes, got 3"). Four is the measured safe ceiling
+// for pure pulls on one core; `clampedRecordingLimit` enforces it for explicit settings too.
+const DEFAULT_MAX_RECORDINGS = 4;
 const MAX_RECORDINGS = 32;
 // A stale staging directory that still holds media is worth rescuing (A10); anything else
 // in .downloads is scaffolding (sidecars, empty dirs) and is simply removed.
@@ -40,6 +46,17 @@ export function concurrentLimit(value: unknown, fallback: number, max: number): 
   const raw = Number(value);
   if (!Number.isFinite(raw)) return fallback;
   return Math.max(1, Math.min(max, Math.trunc(raw)));
+}
+
+/**
+ * Cap the recording pool by the machine's size: roughly two captures per core, with a
+ * floor of 4 (a pure ffmpeg pull is cheap, and a 1-core box measurably sustains four).
+ * A generous setting on a tiny box used to self-destruct: the captures starved each
+ * other, fell behind the live edge, and produced truncated recordings. The operator's
+ * value is kept whenever it already fits the budget.
+ */
+export function clampedRecordingLimit(value: number, cores: number): number {
+  return Math.min(value, Math.max(4, cores * 2));
 }
 
 /**
@@ -167,6 +184,7 @@ export class DownloadQueue {
   private finalizers = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
   private lowPrioritySupport?: boolean;
+  private recordingLimitWarned = false;
   private readonly postProcessGate: PostProcessGate;
   constructor(
     private db: Database,
@@ -177,6 +195,7 @@ export class DownloadQueue {
     private onDeleteCompleted?: (item: DownloadItem) => unknown,
     private readonly liveProxy?: HlsProxy,
     private readonly selfOrigin?: string,
+    private readonly onLiveFailure?: (item: DownloadItem, message: string) => void,
   ) {
     // Post-processing (concat fold / TS remux / re-encode) runs serialized and load-gated:
     // N workers finishing at once must not start N concurrent ffmpeg remuxes, because on a
@@ -331,8 +350,14 @@ export class DownloadQueue {
 
   private tick() {
     const settings = this.db.getSettings();
+    const configuredRecordings = concurrentLimit(settings.maxConcurrentRecordings, DEFAULT_MAX_RECORDINGS, MAX_RECORDINGS);
+    const effectiveRecordings = clampedRecordingLimit(configuredRecordings, Math.max(1, os.cpus().length));
+    if (effectiveRecordings < configuredRecordings && !this.recordingLimitWarned) {
+      this.recordingLimitWarned = true;
+      this.writeLog?.("warn", "download", `maxConcurrentRecordings=${configuredRecordings} exceeds what ${os.cpus().length} core(s) can sustain; capping the recording pool at ${effectiveRecordings}`, { configured: configuredRecordings, effective: effectiveRecordings, cores: os.cpus().length });
+    }
     const limits = {
-      recordings: concurrentLimit(settings.maxConcurrentRecordings, DEFAULT_MAX_RECORDINGS, MAX_RECORDINGS),
+      recordings: effectiveRecordings,
       downloads: concurrentLimit(settings.maxConcurrentDownloads, DEFAULT_MAX_DOWNLOADS, MAX_DOWNLOADS),
     };
     // Each pool drains only its own queue, so a recording can never be blocked behind a
@@ -366,17 +391,52 @@ export class DownloadQueue {
     let recordingFinalize = false;
     let avWatcher: AvSyncWatcher | undefined;
     let lastProgress = 0; let lastBytes = 0; let lastProgressUpdate = 0; let lastActivity = Date.now();
+    // Stall detection must key off *byte growth*, not "any progress report". The staging
+    // poll below calls reportProgress every 1.5s whenever the output directory holds >0
+    // bytes, so a live capture that stopped growing (the recorder fell behind the broadcast
+    // edge and the CDN started evicting segments) used to refresh lastActivity forever and
+    // the stall timer never fired -- the mechanism behind "recorded 30 minutes, got 3".
+    // lastByteGrowthAt only advances when the byte count actually rises.
+    let lastByteGrowthAt = Date.now();
+    let lastSampledBytes = 0;
+    // On top of the stall gate, a sustained near-zero growth rate is the earliest symptom of
+    // "losing the race against the live edge" (403s typically follow within minutes), so warn
+    // about it while there is still time to react.
+    const isLiveRecording = (item.metadata as Record<string, unknown> | undefined)?.live === true;
+    const LOW_RATE_BYTES_PER_S = 200 * 1024;
+    const LOW_RATE_SUSTAIN_MS = 30_000;
+    const LOW_RATE_WARN_INTERVAL_MS = 5 * 60_000;
+    let rateAnchorAt = Date.now();
+    let rateAnchorBytes = 0;
+    let lastLowRateWarnAt = 0;
+    const noteBytes = (stamp: number, bytes: number) => {
+      if (bytes > lastSampledBytes) lastByteGrowthAt = stamp;
+      lastSampledBytes = bytes;
+      if (!isLiveRecording || control.encoding || control.action || control.paused) { rateAnchorAt = stamp; rateAnchorBytes = bytes; return; }
+      // No bytes yet says nothing about falling behind (a slow resolve has not started
+      // writing); the stall timer owns the "never produced output" case.
+      if (bytes === 0) { rateAnchorAt = stamp; return; }
+      const elapsed = stamp - rateAnchorAt;
+      if (elapsed < LOW_RATE_SUSTAIN_MS) return;
+      const rate = (bytes - rateAnchorBytes) / (elapsed / 1000);
+      if (rate < LOW_RATE_BYTES_PER_S && stamp - lastLowRateWarnAt >= LOW_RATE_WARN_INTERVAL_MS) {
+        lastLowRateWarnAt = stamp;
+        this.writeLog?.("warn", "download", `Live capture is falling behind the broadcast (${Math.round(rate / 1024)} KB/s over the last ${Math.round(elapsed / 1000)}s); the room is about to outrun this recording`, { itemId: item.id, rateBps: Math.round(rate) });
+      }
+      rateAnchorAt = stamp; rateAnchorBytes = bytes;
+    };
     const reportProgress = (progress?: number, downloadedBytes?: number, force = false) => {
       const nextProgress = progress === undefined ? lastProgress : Math.max(lastProgress, Math.min(0.99, Math.max(0, progress)));
       const nextBytes = downloadedBytes === undefined ? lastBytes : Math.max(lastBytes, downloadedBytes);
       const stamp = Date.now();
+      noteBytes(stamp, nextBytes);
       if (!force && stamp - lastProgressUpdate < 250 && nextProgress - lastProgress < 0.005 && nextBytes - lastBytes < 256 * 1024) { lastActivity = stamp; return; }
       lastProgress = nextProgress; lastBytes = nextBytes; lastProgressUpdate = stamp; lastActivity = stamp;
       if (!control.action) this.db.setItemStatus(item.id, control.paused ? "paused" : "downloading", { progress: nextProgress, downloadedBytes: nextBytes });
     };
     const stallTimeoutMs = Math.max(0, Number(this.db.getSettings().downloadStallTimeoutSeconds ?? 120)) * 1000;
     const stallTimer = stallTimeoutMs > 0 ? setInterval(() => {
-      if (!stalledDownload(control, lastActivity, Date.now(), stallTimeoutMs)) return;
+      if (!stalledDownload(control, lastByteGrowthAt, Date.now(), stallTimeoutMs)) return;
       control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");
     }, 5000) : undefined;
     stallTimer?.unref();
@@ -578,7 +638,7 @@ export class DownloadQueue {
           this.withPostProcessDeadline(control, encodeBytes, "Re-encode",
             () => this.runPostProcessCommand("ffmpeg", recordingEncodingArgs(preset, temporary, encoded), temporaryDirectory, control)));
         if (control.action === "cancel" || control.action === "delete") throw new Error("Encoding cancelled");
-        if (!fs.existsSync(encoded) || !fs.statSync(encoded).size) throw new Error("Encoder completed without producing a media file");
+        if (!fs.existsSync(encoded) || !fs.statSync(encoded).size) throw new Error(`Encoder completed without producing a media file${control.lastOutput ? `: ${control.lastOutput.slice(-800)}` : ""}`);
         fs.unlinkSync(temporary); temporary = encoded;
         checksum = await this.hashFile(temporary);
       }
@@ -607,6 +667,28 @@ export class DownloadQueue {
           this.writeLog?.("info", "download", "Live recording flagged as fragment and moved to recovery", { itemId: item.id, size });
           void Promise.resolve(this.onCompleted?.()).catch((error) => this.writeLog?.("warn", "library", "Library refresh after download failed", { error }));
           return;
+        }
+      }
+
+      // Truncation check: the fragment bound above is only a floor, so a capture that
+      // silently fell behind (3 recorded minutes of a 30-minute broadcast) still entered
+      // the library looking healthy. Compare the real media duration against the wall
+      // clock the capture session ran for; a large shortfall stays in the library but is
+      // flagged (visible in the UI) and logged instead of being silently accepted.
+      if (item.mediaType === "video" && item.metadata.live === true && !control.manualStop) {
+        // Re-read from the DB: the in-memory row was fetched before setItemStatus stamped
+        // download_started_at, and scheduleRetry re-stamps it per attempt.
+        const startedAt = Date.parse(this.db.getItem(item.id)?.downloadStartedAt ?? "");
+        const expectedSec = Number.isFinite(startedAt) ? Math.max(0, (Date.now() - startedAt) / 1000) : 0;
+        if (expectedSec >= 60) {
+          try {
+            const probe = await this.probeVideo(temporary);
+            const actualSec = probe.duration;
+            if (actualSec > 0 && actualSec < expectedSec * 0.8) {
+              this.db.setItemMetadata(item.id, { truncated: true, expectedDurationSec: Math.round(expectedSec), actualDurationSec: Math.round(actualSec) });
+              this.writeLog?.("warn", "download", `Live recording looks truncated: captured ${Math.round(actualSec)}s of a ${Math.round(expectedSec)}s session`, { itemId: item.id, expectedSec: Math.round(expectedSec), actualSec: Math.round(actualSec) });
+            }
+          } catch { /* Best-effort: a failed probe must never fail the finalize. */ }
         }
       }
 
@@ -648,6 +730,9 @@ export class DownloadQueue {
         const relativePath = path.relative(this.mediaRoot, finalPath);
         this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
         this.writeLog?.("info", "download", "Download completed", { itemId: item.id, storagePath: relativePath, mediaType: item.mediaType });
+        // A capture that "succeeded" while its extractor kept complaining (403s on evicted
+        // segments, invalid data) is the signature of a truncated recording -- surface it.
+        if (control.lastOutput) this.writeLog?.("warn", "download", "Recording finished with extractor warnings", { itemId: item.id, output: control.lastOutput.slice(-500) });
         if (plugin.afterDownload) await plugin.afterDownload(this.plugins.context(item.pluginId), { absolutePath: finalPath, relativePath, mediaType: item.mediaType, checksumSha256: checksum });
         void Promise.resolve(this.onCompleted?.()).catch((error) => this.writeLog?.("warn", "library", "Library refresh after download failed", { error }));
       });
@@ -661,7 +746,6 @@ export class DownloadQueue {
       let recoverySource = temporary && fs.existsSync(temporary)
         ? temporary
         : (capturePath && fs.existsSync(capturePath) && fs.statSync(capturePath).size > 0 ? capturePath : "");
-      const isLiveRecording = (item.metadata as Record<string, unknown> | undefined)?.live === true;
       // A10: a segmented capture that died before finalize has no capture.ts yet, only
       // parts. Salvage them: folding the parts into one TS keeps the existing single-file
       // recovery flow working; if even that fold fails, the raw parts are moved below so
@@ -774,6 +858,12 @@ export class DownloadQueue {
     } else {
       const status = httpStatusFromError(message);
       this.db.setItemStatus(itemId, "failed", { error: message });
+      // Let the live-cam layer learn about confirmed-offline rooms (e.g. the provider page
+      // itself said so) so the auto-recorder stops re-queueing a room that is not live.
+      if (this.onLiveFailure) {
+        const failed = this.db.getItem(itemId);
+        if (failed) this.onLiveFailure(failed, message);
+      }
       if (status !== undefined && retryDisposition(message, attempts) === "permanent") {
         this.writeLog?.("error", "download", "Download failed permanently: the source returned an unrecoverable HTTP status", { itemId, attempts, status, error: message });
       } else {
@@ -929,6 +1019,9 @@ export class DownloadQueue {
       child.once("error", (error) => finish(error));
       child.once("close", (code) => {
         control.child = undefined;
+        // Keep the extractor's own words around even on success: a truncated live capture
+        // exits 0 with the whole story ("403 Forbidden", "Invalid data") in its stderr.
+        control.lastOutput = output.trim();
         if (code === 0 || (control.action === "stop" && this.directoryBytes(outputDirectory) > 0)) finish();
         else finish(new Error(`${command} exited with code ${code}: ${output.trim() || "no error output"}`));
       });

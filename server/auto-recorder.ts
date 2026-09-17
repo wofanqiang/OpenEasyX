@@ -2,6 +2,7 @@ import type { Database, DownloadItem } from "./database.js";
 import type { LiveCamService } from "./live-cams.js";
 import type { LiveCam } from "../packages/plugin-sdk/index.js";
 import { freeBytes, recordingDiskGuard, type FreeSpaceProbe } from "./disk-space.js";
+import { isOfflineConfirmedError } from "./offline-error.js";
 
 // Download statuses that mean "a recording for this cam is still in flight".
 // Mirrors the buckets used by Database.listItems(); kept local to avoid coupling.
@@ -114,14 +115,21 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
       // hammering a cam that is genuinely offline. Each additional failure in a row doubles the
       // wait (capped), because a room that keeps reporting "live" without ever yielding a
       // recordable capture would otherwise churn the queue at the flat cooldown forever.
-      const ended = db.getItem(entry.itemId)?.status;
-      const failed = ended === "failed";
+      const ended = db.getItem(entry.itemId);
+      const failed = ended?.status === "failed";
       let until: number;
       if (failed) {
         const previous = failStreak.get(key);
         const streak = previous && now - previous.at <= FAIL_STREAK_RESET_MS ? previous.count + 1 : 1;
         failStreak.set(key, { count: streak, at: now });
-        if (streak === 1) {
+        // A provider-confirmed offline (the room page itself said so) is not a stream blip:
+        // starting the wait at the short abnormal cooldown would re-render the room page and
+        // re-fail every 30s. Jump straight to the back-off ceiling; the status-cache override
+        // (see live-cams.reportLiveFailure) keeps the poll from queueing one at all.
+        if (isOfflineConfirmedError(ended?.error)) {
+          until = now + FAIL_COOLDOWN_CAP_MS;
+          log?.(`auto-record: ${key} failed with a confirmed-offline error; cooling down ${Math.round(FAIL_COOLDOWN_CAP_MS / 60000)}m`);
+        } else if (streak === 1) {
           until = now + Math.min(cooldownMs(), ABNORMAL_COOLDOWN_MS);
           log?.(`auto-record: recording ${entry.itemId} failed; ${key} enters a short cooldown`);
         } else {

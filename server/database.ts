@@ -150,7 +150,7 @@ export class Database {
     this.migrateNitterToPublicX();
     this.setDefault("retentionDays", 0);
     this.setDefault("maxConcurrentDownloads", 2);
-    this.setDefault("maxConcurrentRecordings", 8);
+    this.setDefault("maxConcurrentRecordings", 4);
     this.setDefault("minFreeDiskGb", 1);
     this.setDefault("downloadRetryAttempts", 5);
     this.setDefault("downloadRetryBaseSeconds", 30);

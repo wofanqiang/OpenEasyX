@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, captureSegmentFiles, clampedRecordingLimit, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -570,5 +570,76 @@ describe("capture segments (A10)", () => {
       "-f", "concat", "-safe", "0", "-i", "/media/staging/capture.concat.txt",
       "-c", "copy", "/media/staging/capture.ts",
     ]);
+  });
+});
+
+describe("clampedRecordingLimit", () => {
+  it("caps a generous setting on small machines but keeps values that already fit", () => {
+    expect(clampedRecordingLimit(8, 1)).toBe(4);   // 1-core box: hard ceiling of 4
+    expect(clampedRecordingLimit(32, 1)).toBe(4);
+    expect(clampedRecordingLimit(4, 1)).toBe(4);   // the default fits everywhere
+    expect(clampedRecordingLimit(8, 4)).toBe(8);   // 4 cores -> budget 8
+    expect(clampedRecordingLimit(3, 16)).toBe(3);  // small settings are never raised
+  });
+});
+
+describe("live recording completeness gates", () => {
+  it("flags a live capture whose media duration fell far short of the wall clock", async () => {
+    const dataDir = temp("easyx-trunc-data"); const mediaDir = temp("easyx-trunc-media"); const pluginDir = temp("easyx-trunc-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    // The plugin "records" by copying a real 0.5s MPEG-TS into {output} via stream copy.
+    const template = segmentTemplateBytes();
+    const templatePath = path.join(pluginDir, "template.ts"); fs.writeFileSync(templatePath, template);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `
+      export default { manifest: { id: "test.trunc", name: "Trunc", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] },
+        async resolveDownload() { return { kind: "command", command: "ffmpeg", filename: "live.mp4", args: ["-y", "-v", "error", "-i", ${JSON.stringify(templatePath)}, "-c", "copy", "{output}"] }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.trunc", { installed: true, enabled: true });
+    // The 0.5s capture is far below the default fragment floor; disable it so the
+    // truncation gate (not the fragment gate) is what this test exercises.
+    db.updateSettings({ autoRecordMinBytes: 0 });
+    const person = db.upsertPerformer({ externalId: "person", name: "Trunc Performer" }, "test.trunc");
+    const source = db.addSource(person.id, "test.trunc", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", filename: "live.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    // Pretend the session started 10 minutes ago, BEFORE the queue starts: setItemStatus
+    // only stamps download_started_at when it is NULL, so the pre-seeded value survives
+    // and finalize sees a 600s wall clock against a 0.5s file.
+    const sqlite = (db as unknown as { sqlite: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).sqlite;
+    sqlite.prepare("UPDATE items SET download_started_at=? WHERE id=?").run(new Date(Date.now() - 600_000).toISOString(), item.id);
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    const completed = path.join(mediaDir, "Trunc Performer", "example.test", "live.mp4");
+    await waitFor(() => db.getItem(item.id)?.status === "completed", 20_000);
+    queue.stop();
+    expect(fs.existsSync(completed)).toBe(true);
+    const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
+    expect(metadata.truncated).toBe(true);
+    expect(metadata.expectedDurationSec).toBeGreaterThanOrEqual(590);
+    expect(metadata.actualDurationSec).toBeLessThanOrEqual(5);
+  });
+
+  it("does not flag a capture whose duration matches the wall clock", async () => {
+    const dataDir = temp("easyx-ok-data"); const mediaDir = temp("easyx-ok-media"); const pluginDir = temp("easyx-ok-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    const template = segmentTemplateBytes();
+    const templatePath = path.join(pluginDir, "template.ts"); fs.writeFileSync(templatePath, template);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `
+      export default { manifest: { id: "test.ok", name: "Ok", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] },
+        async resolveDownload() { return { kind: "command", command: "ffmpeg", filename: "live.mp4", args: ["-y", "-v", "error", "-i", ${JSON.stringify(templatePath)}, "-c", "copy", "{output}"] }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.ok", { installed: true, enabled: true });
+    db.updateSettings({ autoRecordMinBytes: 0 });
+    const person = db.upsertPerformer({ externalId: "person", name: "Ok Performer" }, "test.ok");
+    const source = db.addSource(person.id, "test.ok", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", filename: "live.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    // No pre-seeded start time: the session is stamped when the download starts, so the
+    // wall clock (~1-2s) is within 20% of nothing meaningful -- expectedSec < 60 skips
+    // the gate entirely and the item must complete without a truncation flag.
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    await waitFor(() => db.getItem(item.id)?.status === "completed", 20_000);
+    queue.stop();
+    const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
+    expect(metadata.truncated).toBeUndefined();
   });
 });

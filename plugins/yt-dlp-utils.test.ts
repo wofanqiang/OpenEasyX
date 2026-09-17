@@ -43,10 +43,10 @@ describe("live recording output", () => {
     const request = ffmpegLiveCaptureCommand(stream, { referer: "https://live.test/", output: "{outputDir}/capture.ts", filename: "alice.mp4" });
     expect(request.command).toBe("ffmpeg");
     expect(request.filename).toBe("alice.mp4");
-    // reconnect lets a transient 403 / network blip self-heal inside one ffmpeg process
+    // reconnect lets a transient 403 (LL-HLS segment eviction) / 5xx / network blip self-heal inside one ffmpeg process
     expect(request.args).toContain("-reconnect");
     expect(request.args).toContain("-reconnect_on_http_error");
-    expect(request.args).toContain("5xx");
+    expect(request.args).toContain("403,5xx");
     // A10 segmented capture: rolling parts on TS packet boundaries; the downloader fills
     // {segmentStart} so a resumed capture appends instead of overwriting earlier parts.
     expect(request.args).toEqual(expect.arrayContaining([

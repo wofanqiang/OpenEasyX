@@ -32,7 +32,10 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
     // segments to their playlist PDT to measure the constant A/V offset.
     "-loglevel", "info", "-y",
     "-reconnect", "1", "-reconnect_on_network_error", "1",
-    "-reconnect_on_http_error", "5xx", "-reconnect_streamed", "1",
+    // 403 is what an LL-HLS CDN returns for a segment evicted before a lagging recorder
+    // reached it; reconnecting (and re-reading the refreshed playlist) self-heals that
+    // inside this process instead of tearing the capture down. Matches the comment above.
+    "-reconnect_on_http_error", "403,5xx", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "10",
     "-user_agent", FFMPEG_CHROME_USER_AGENT,
   ];

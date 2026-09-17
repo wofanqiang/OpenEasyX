@@ -22,7 +22,7 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-auto-record-"));
   const db = new Database(dir);
 
-  const items = new Map<string, Pick<DownloadItem, "status">>();
+  const items = new Map<string, Partial<Pick<DownloadItem, "status" | "error">>>();
   let itemCounter = 0;
   const listedItems: Array<Pick<DownloadItem, "id" | "pluginId" | "externalId" | "status" | "metadata">> = [];
   const dbStub = {
@@ -372,6 +372,51 @@ describe("auto recorder", () => {
       env.items.set("item-2", { status: "failed" });
       await env.recorder.tick();
       expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
+    } finally { env.cleanup(); vi.useRealTimers(); }
+  });
+
+  it("caps the cooldown when a failure confirms the room is offline", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      // The status API still says "live", but the provider's own page proves otherwise.
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+
+      env.items.set("item-0", { status: "failed", error: "The public room did not expose an HLS host" });
+      await env.recorder.tick();
+      expect(env.logs.some((line) => line.includes("confirmed-offline"))).toBe(true);
+
+      // Long past where the first-failure 30s cooldown would have fired: still held.
+      vi.setSystemTime(new Date(Date.now() + 10 * 60_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+
+      // Past the 1h ceiling the room gets one more attempt (and the status cache, fed by the
+      // same verdict, is what should keep it quiet in production).
+      vi.setSystemTime(new Date(Date.now() + 61 * 60_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(2);
+    } finally { env.cleanup(); vi.useRealTimers(); }
+  });
+
+  it("does not cap the cooldown for ordinary transient failures", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      env.items.set("item-0", { status: "failed", error: "ffmpeg was killed by a signal" });
+      await env.recorder.tick();
+      expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
+      expect(env.logs.every((line) => !line.includes("confirmed-offline"))).toBe(true);
     } finally { env.cleanup(); vi.useRealTimers(); }
   });
 });

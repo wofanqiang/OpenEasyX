@@ -58,10 +58,15 @@ await plugins.load();
 // ffmpeg needs an absolute origin it can reach from inside this process or container.
 const selfOrigin = process.env.EASYX_SELF_ORIGIN ?? `http://127.0.0.1:${port}`;
 const liveProxy = new HlsProxy(fetch);
+const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
+const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); }, liveProxy);
 const queue = new DownloadQueue(
   db, plugins, mediaDir, writeLog, () => catalog.scan(),
   (item) => catalog.deleteStoredMedia(item.storagePath!),
   liveProxy, selfOrigin,
+  // Confirmed-offline capture failures feed the live-cam status cache so the auto-recorder
+  // stops re-queueing a room whose provider page says it is offline.
+  (item, message) => liveCams.reportLiveFailure(item, message),
 );
 const browserLogin = new BrowserLoginManager(dataDir);
 // The /browser proxy is deliberately outside the session gate (the hook above only
@@ -70,13 +75,11 @@ const browserLogin = new BrowserLoginManager(dataDir);
 if (process.env.EASYX_ENABLE_BROWSER_LOGIN === "true") {
   appLogger.warn({ scope: "browser-login" }, "Browser login is enabled: /browser (noVNC) is served without authentication and the VNC server has no password. Only enable it on a trusted network.");
 }
-const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
-const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); }, liveProxy);
+const systemStats = new SystemStatsService({ mediaDir });
 for (const favorite of db.listLiveCamFavorites()) {
   const entry = plugins.list().find((entry) => entry.manifest.id === favorite.providerId && entry.installed && entry.enabled);
   if (entry) liveCams.createPerformer(favorite.providerId, { ...favorite, id: favorite.camId, online: false });
 }
-const systemStats = new SystemStatsService({ mediaDir });
 queue.start();
 systemStats.start();
 

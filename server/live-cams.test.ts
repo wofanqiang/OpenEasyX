@@ -738,4 +738,35 @@ describe("Open EasyX live cams", () => {
     const completed = iterator.next(); release();
     await expect(completed).resolves.toMatchObject({ value: { total: 1, complete: true, items: [{ username: "alice" }], providers: [{ count: 1 }] } });
   });
+
+  // When a queued capture fails because the provider page itself said the room is offline,
+  // the next status poll must report the room offline (the status API lags reality), so the
+  // auto-recorder cannot re-queue it. Transient failures must never poison the cache.
+  it("forces a confirmed-offline room to report offline until the override lapses", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-16T12:00:00.000Z"));
+    const { plugins, service } = await fixture();
+    plugins.install("test.live");
+    try {
+      // A transient failure must not poison the cache: alice still reports online.
+      const transient = { pluginId: "test.live", externalId: "auto-live:alice:2026-09-16T10-00-00-000Z" } as never;
+      service.reportLiveFailure(transient, "ffmpeg was killed by a signal");
+      const before = await service.autoRecordStatuses("test.live", [{ username: "alice", pageUrl: "https://live.test/alice" }]);
+      expect(before.cams[0]).toMatchObject({ username: "alice", online: true });
+
+      // The provider page itself said offline: the next poll reports the room offline.
+      const failed = { pluginId: "test.live", externalId: "auto-live:alice:2026-09-16T11-00-00-000Z" } as never;
+      service.reportLiveFailure(failed, "The public room did not expose an HLS host");
+      const statuses = await service.autoRecordStatuses("test.live", [{ username: "alice", pageUrl: "https://live.test/alice" }]);
+      expect(statuses.ok).toBe(true);
+      expect(statuses.cams[0]).toMatchObject({ username: "alice", online: false });
+
+      // Past the override window the status poll reports the room as the API sees it again.
+      vi.setSystemTime(new Date(Date.now() + 11 * 60_000));
+      const refreshed = await service.autoRecordStatuses("test.live", [{ username: "alice", pageUrl: "https://live.test/alice" }]);
+      expect(refreshed.cams[0]).toMatchObject({ username: "alice", online: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

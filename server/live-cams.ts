@@ -4,6 +4,8 @@ import type { Database, LiveCamFavorite, Performer, Source } from "./database.js
 import { HlsProxy } from "./hls-proxy.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 import { providerEnvelopeMs } from "../packages/live-budget.js";
+import type { DownloadItem } from "./database.js";
+import { isOfflineConfirmedError, OFFLINE_OVERRIDE_MS } from "./offline-error.js";
 
 export type PublicLiveCam = LiveCam & { providerId: string; providerName: string; favorite: boolean; autoRecord: boolean; performerId?: string };
 export type LiveCamProviderStatus = { id: string; name: string; ok: boolean; count: number; pending?: boolean; error?: string; warning?: string };
@@ -76,6 +78,11 @@ export class LiveCamService {
   private favoriteStatuses = new Map<string, { cam: LiveCam; expiresAt: number }>();
   private favoriteWrites = new Map<string, Promise<void>>();
   private favoriteEpoch = new Map<string, number>();
+  // Confirmed-offline verdicts from failed capture attempts (`providerId:username` -> until).
+  // The provider status API can lag reality and keep a just-ended room marked "live"; when a
+  // queued capture then fails with an offline-confirmed error, this override forces the next
+  // status poll to report the room offline so the auto-recorder never re-queues it.
+  private offlineOverrides = new Map<string, number>();
 
   constructor(private readonly db: Database, private readonly plugins: PluginManager, private readonly request: typeof fetch = fetch, private readonly saveImage?: (providerId: string, cam: LiveCam, performer: Performer) => void, private readonly hlsProxy: HlsProxy = new HlsProxy(request)) {}
 
@@ -544,7 +551,27 @@ export class LiveCamService {
       }));
       cams.push(...batch);
     }
+    // Apply confirmed-offline overrides last: whatever the status API claims, a room whose
+    // capture just failed with "the provider page says offline" stays offline until the
+    // override lapses, so the watcher cannot re-queue it on stale API data.
+    const now = Date.now();
+    for (const [key, until] of this.offlineOverrides) if (until <= now) this.offlineOverrides.delete(key);
+    for (const cam of cams) {
+      if (this.offlineOverrides.has(`${providerId}:${cam.username.trim().toLowerCase()}`)) cam.online = false;
+    }
     return { ok: true, cams };
+  }
+
+  /** Feed a failed live capture back into the status cache. Only offline-confirmed errors
+   *  (the provider's own page/API said the room is not live) count; transient network
+   *  failures must never poison the status cache. */
+  reportLiveFailure(item: DownloadItem, message: string): void {
+    if (!isOfflineConfirmedError(message)) return;
+    // Live captures are keyed "auto-live:<username>:<timestamp>" / "manual-live:..." (the
+    // same pattern auto-recorder uses to find a recording's room).
+    const username = /^(?:auto|manual)-live:([^:]+):/.exec(item.externalId)?.[1];
+    if (!username) return;
+    this.offlineOverrides.set(`${item.pluginId}:${username.toLowerCase()}`, Date.now() + OFFLINE_OVERRIDE_MS);
   }
 
   favoriteChanges() {
