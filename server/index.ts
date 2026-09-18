@@ -76,10 +76,11 @@ if (process.env.EASYX_ENABLE_BROWSER_LOGIN === "true") {
   appLogger.warn({ scope: "browser-login" }, "Browser login is enabled: /browser (noVNC) is served without authentication and the VNC server has no password. Only enable it on a trusted network.");
 }
 const systemStats = new SystemStatsService({ mediaDir });
-for (const favorite of db.listLiveCamFavorites()) {
-  const entry = plugins.list().find((entry) => entry.manifest.id === favorite.providerId && entry.installed && entry.enabled);
-  if (entry) liveCams.createPerformer(favorite.providerId, { ...favorite, id: favorite.camId, online: false });
-}
+// Performers are intentionally NOT materialized from live-cam favorites at boot. A favorite is a
+// pure bookmark (see LiveCamService.setFavorite and the adoptLegacyFavoriteAutoRecord note): recording
+// a room still creates its performer on demand via record(), but deleting a performer must not
+// resurrect it from a leftover favorite on the next restart. Keeping the two entities independent is
+// what makes "delete performer" stick.
 queue.start();
 systemStats.start();
 
@@ -651,7 +652,7 @@ app.post<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/sources
 app.delete<{ Params: { id: string }; Body: unknown }>("/api/performers/:id", async (request) => {
   const performer = db.getPerformer(request.params.id);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
-  const body = z.object({ deleteFiles: z.boolean().default(false) }).parse(request.body ?? {});
+  const body = z.object({ deleteFiles: z.boolean().default(true) }).parse(request.body ?? {});
   const items = db.listItems(10000).filter((item) => item.performerId === performer.id);
   if (items.some((item) => ["queued", "downloading"].includes(item.status))) {
     throw Object.assign(new Error("Wait for active downloads to finish before deleting this performer"), { statusCode: 409 });

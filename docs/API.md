@@ -58,7 +58,7 @@ There is no Viewer bridge plugin. The media library, live service, queue, and pl
 | `POST` | `/api/performers/:id/refresh` | Refresh identity, image, and URLs from connected plugins |
 | `POST` | `/api/performers/:id/discover-sources` | Run enabled source-discovery plugins |
 | `POST` | `/api/performers/:id/sources` | Add a URL and optionally select a compatible scraper plugin |
-| `DELETE` | `/api/performers/:id` | Delete metadata only or metadata plus associated media files |
+| `DELETE` | `/api/performers/:id` | Delete the performer; media files on disk are removed by default (`deleteFiles` defaults to `true`). Pass `{ "deleteFiles": false }` to keep the performer folder and tracked files on disk. |
 
 Grouped import body:
 

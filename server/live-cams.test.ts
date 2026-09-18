@@ -104,7 +104,24 @@ describe("Open EasyX live cams", () => {
     service.setFavoriteAutoRecord("test.live", "alice", false);
     expect(service.performerAutoRecord(database.getPerformer(performer.id)!)).toBe(false);
     expect(service.autoRecordTargets()).toHaveLength(0);
-    expect(service.setFavoriteAutoRecord("test.live", "nobody", true)).toBeUndefined();
+    expect(    service.setFavoriteAutoRecord("test.live", "nobody", true)).toBeUndefined();
+  });
+
+  it("materializes the performer on demand when arming a favorite that has none", async () => {
+    const { database, plugins, service } = await fixture(); plugins.install("test.live");
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice" };
+    // A favorite is a bookmark and owns no performer until it is armed for auto-record.
+    await service.setFavorite("test.live", cam, true);
+    expect(database.getPerformerByName("alice")).toBeUndefined();
+    expect(service.setFavoriteAutoRecord("test.live", "alice", true)).toMatchObject({ autoRecord: true });
+    const performer = database.getPerformerByName("alice");
+    expect(performer).toBeDefined();
+    expect(service.performerAutoRecord(performer!)).toBe(true);
+    expect(service.autoRecordTargets()).toMatchObject([{ providerId: "test.live", username: "alice" }]);
+    // Disabling the switch must NOT delete the performer -- the two entities stay independent.
+    service.setFavoriteAutoRecord("test.live", "alice", false);
+    expect(database.getPerformerByName("alice")).toBeDefined();
+    expect(service.performerAutoRecord(database.getPerformerByName("alice")!)).toBe(false);
   });
 
   it("adopts a favorite that was armed before auto-record moved to the performer", async () => {

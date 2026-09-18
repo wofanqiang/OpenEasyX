@@ -400,7 +400,19 @@ export class LiveCamService {
     const owner = this.db.listPerformers().find((performer) => this.performerFavoriteMatches(performer)
       .some((favorite) => `${favorite.providerId}:${favorite.username.trim().toLowerCase()}` === key));
     const item = this.db.setLiveCamFavoriteAutoRecord(providerId, username, autoRecord);
-    if (item && owner) this.db.setPerformerAutoRecord(owner.id, autoRecord);
+    if (item && owner) {
+      this.db.setPerformerAutoRecord(owner.id, autoRecord);
+    } else if (item && autoRecord) {
+      // Arming a favorite that has no performer yet: create the performer on demand so auto-record can
+      // actually run (autoRecordTargets polls performers, never favorites). This keeps the two entities
+      // independent otherwise -- deleting a performer never touches its favorite, and there is no
+      // boot-time seeding to resurrect one -- while still letting "arm this favorite" mean "record it".
+      const favorite = this.db.listLiveCamFavorites(providerId).find((f) => f.username.trim().toLowerCase() === username.trim().toLowerCase());
+      if (favorite) {
+        const { performer } = this.createPerformer(providerId, { ...favorite, id: favorite.camId, online: false });
+        this.db.setPerformerAutoRecord(performer.id, true);
+      }
+    }
     return item;
   }
 
