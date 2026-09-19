@@ -25,14 +25,24 @@ function inside(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
-export function deletePerformerFiles(mediaRoot: string, performer: Performer, items: DownloadItem[]): number {
+// otherPerformerDirs: resolved directories of every other performer. When two performer names
+// collapse to the same safeSegment (safeSegment() maps "/ \ : * ? ..." -> "-"), their media
+// directories coincide. In that case we must NOT wipe the shared directory — we only remove this
+// performer's own managed files (the item storagePaths) so we never destroy another performer's
+// media. See audit P2-2.
+export function deletePerformerFiles(mediaRoot: string, performer: Performer, items: DownloadItem[], otherPerformerDirs: Iterable<string> = []): number {
   const root = path.resolve(mediaRoot);
-  const targets = new Set<string>([performerDirectory(root, performer.name)]);
+  const ownDir = performerDirectory(root, performer.name);
+  const others = new Set<string>([...otherPerformerDirs].map((d) => path.resolve(d)));
+  const dirShared = others.has(ownDir);
+  const targets = new Set<string>();
   for (const item of items) {
     if (!item.storagePath) continue;
     const target = path.resolve(root, item.storagePath);
     if (inside(root, target)) targets.add(target);
   }
+  // Only delete the whole performer directory when it is not also another performer's directory.
+  if (!dirShared) targets.add(ownDir);
   let removed = 0;
   for (const target of [...targets].sort((a, b) => b.length - a.length)) {
     if (!inside(root, target) || !fs.existsSync(target)) continue;

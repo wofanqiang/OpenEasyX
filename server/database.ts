@@ -48,6 +48,8 @@ export type LiveCamFavorite = {
 export type LiveCamFavoriteInput = Pick<LiveCamFavorite, "camId" | "username" | "pageUrl"> & Partial<Pick<LiveCamFavorite, "title" | "thumbnailUrl">>;
 export type LiveCamFavoriteChange = { providerId: string; cam: LiveCamFavoriteInput; favorite: boolean; revision: string; state: "pending" | "sent" | "local" | "failed"; error?: string };
 
+export const ACTIVE_ITEM_STATUSES: string[] = ["queued", "downloading", "paused", "stopping", "cancelling"];
+
 export class Database {
   readonly sqlite: DatabaseSync;
 
@@ -450,6 +452,14 @@ export class Database {
 
   listItems(limit = 100): DownloadItem[] {
     return (this.sqlite.prepare("SELECT * FROM items ORDER BY updated_at DESC LIMIT ?").all(limit) as any[]).map(this.mapItem);
+  }
+
+  listItemsByPerformer(performerId: string): DownloadItem[] {
+    return (this.sqlite.prepare("SELECT * FROM items WHERE performer_id=?").all(performerId) as any[]).map(this.mapItem);
+  }
+
+  listItemsBySource(sourceId: string): DownloadItem[] {
+    return (this.sqlite.prepare("SELECT * FROM items WHERE source_id=?").all(sourceId) as any[]).map(this.mapItem);
   }
 
   listItemsPage(options: ItemPageOptions = {}): ItemPage {

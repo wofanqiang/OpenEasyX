@@ -543,7 +543,7 @@ app.get<{ Params: { id: string } }>("/api/performers/:id/image", async (request,
 app.get<{ Params: { id: string } }>("/api/performers/:id", async (request) => {
   const performer = db.getPerformer(request.params.id);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
-  return { performer: publicPerformer(performer), sources: db.listSources(performer.id), items: db.listItems(10000).filter((item) => item.performerId === performer.id) };
+  return { performer: publicPerformer(performer), sources: db.listSources(performer.id), items: db.listItemsByPerformer(performer.id) };
 });
 app.patch<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/auto-record", async (request) => {
   const body = z.object({ autoRecord: z.boolean() }).parse(request.body);

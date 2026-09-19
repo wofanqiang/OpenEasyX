@@ -509,7 +509,7 @@ export class LiveCamService {
     for (const favorite of armed) {
       const key = `${favorite.providerId}:${favorite.username.trim().toLowerCase()}`;
       const owner = owners.get(key);
-      if (!owner) { orphaned.push(key); continue; }
+      if (!owner) { orphaned.push(key); this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, false); continue; }
       if (!owner.autoRecord && this.db.setPerformerAutoRecord(owner.id, true)) performers.push(owner.name);
       this.db.setLiveCamFavoriteAutoRecord(favorite.providerId, favorite.username, false);
     }
