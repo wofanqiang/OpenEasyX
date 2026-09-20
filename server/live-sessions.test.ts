@@ -266,6 +266,32 @@ describe("spliceLiveSessions", () => {
     expect(fs.readdirSync(path.join(library.mediaDir, "alice")).sort()).toEqual(["one.mp4", "two.mp4"]);
   });
 
+  it("refuses to splice captures whose geometry drifts mid-broadcast", async () => {
+    const library = seedLibrary();
+    addCapture(library, { externalId: "auto-live:alice:1", startedAt: at(0), finishedAt: at(4), relativePath: "alice/one.mp4" });
+    addCapture(library, { externalId: "auto-live:alice:2", startedAt: at(6), finishedAt: at(10), relativePath: "alice/two.mp4" });
+
+    // The second segment was pulled at a different HLS variant -- a different resolution here. A
+    // concat `-c copy` would keep the first input's geometry and produce a broken merge, so the
+    // splice must hold the originals instead of folding them.
+    const report = await spliceLiveSessions({
+      db: library.db, mediaRoot: library.mediaDir,
+      concat: async () => { throw new Error("must not run"); },
+      freeSpace: async () => 100 * 1024 ** 3,
+      probe: async (file) => ({
+        duration: 240,
+        signature: file.endsWith("one.mp4")
+          ? "audio:aac:44100:stereo,video:h264:1280x720"
+          : "audio:aac:44100:stereo,video:h264:640x360",
+      }),
+      now: () => BASE + 60 * 60_000,
+    });
+
+    expect(report).toMatchObject({ spliced: 0 });
+    expect(report.skipped[0].reason).toContain("stream layout");
+    expect(fs.readdirSync(path.join(library.mediaDir, "alice")).sort()).toEqual(["one.mp4", "two.mp4"]);
+  });
+
   it("keeps the originals when the splice comes out short", async () => {
     const library = seedLibrary();
     const original = addCapture(library, { externalId: "auto-live:alice:1", startedAt: at(0), finishedAt: at(4), relativePath: "alice/one.mp4" });

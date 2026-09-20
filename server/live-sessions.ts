@@ -200,11 +200,14 @@ const lastEnd = (group: SessionGroup): number => Math.max(...group.segments.map(
  * Duration plus stream layout of a finished recording. The layout is not decoration: the concat
  * demuxer keeps the FIRST input's streams, so splicing a segment that was captured without audio
  * (the audio resolve is best-effort at capture time) would silently drop that track from the join
- * onwards. Comparing layouts keeps the splice to segments that provably fit together.
+ * onwards, and splicing a segment whose resolution / sample rate / channel layout differs from the
+ * others would yield a broken merge. The signature therefore pins codec AND geometry (width x
+ * height for video, sample rate + channel layout for audio), so any mid-broadcast variant switch is
+ * refused rather than folded into a mixed-geometry file.
  */
 export async function probeSignature(file: string): Promise<MediaSignature | undefined> {
   return new Promise((resolve) => {
-    const child = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name", "-of", "json", file], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,sample_rate,channel_layout,channels", "-of", "json", file], { stdio: ["ignore", "pipe", "ignore"] });
     const chunks: Buffer[] = [];
     const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(undefined); }, PROBE_TIMEOUT_MS);
     timer.unref?.();
@@ -216,11 +219,22 @@ export async function probeSignature(file: string): Promise<MediaSignature | und
       try {
         const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
           format?: { duration?: string };
-          streams?: Array<{ codec_type?: string; codec_name?: string }>;
+          streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number; sample_rate?: string; channel_layout?: string; channels?: number }>;
         };
         const duration = Number(parsed.format?.duration ?? 0);
         const signature = (parsed.streams ?? [])
-          .map((stream) => `${stream.codec_type ?? "?"}:${stream.codec_name ?? "?"}`)
+          // Geometry for video, sample rate + channel layout for audio. A mid-broadcast switch of
+          // HLS variant (resolution, sample rate, or channel count) would otherwise splice into a
+          // file whose first input dictates the container layout, breaking every segment after it.
+          .map((stream) => {
+            const dims = stream.width != null && stream.height != null ? `${stream.width}x${stream.height}` : "";
+            const rate = stream.sample_rate != null ? `${stream.sample_rate}` : "";
+            const layout = stream.channel_layout
+              ? `${stream.channel_layout}`
+              : stream.channels != null ? `ch${stream.channels}` : "";
+            const geom = [dims, rate, layout].filter(Boolean).join(":");
+            return `${stream.codec_type ?? "?"}:${stream.codec_name ?? "?"}:${geom}`;
+          })
           .filter((entry) => !entry.startsWith("data:") && !entry.startsWith("attachment:"))
           .sort()
           .join(",");
