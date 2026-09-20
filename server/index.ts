@@ -26,6 +26,7 @@ import { registerLibraryRoutes, parseMediaRange } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
 import { retentionPlan } from "./retention.js";
+import { spliceLiveSessions } from "./live-sessions.js";
 import { runDiagnostics } from "./diagnostics.js";
 import { isLiveCandidate } from "../packages/live-capture.js";
 import { AuthService } from "./auth.js";
@@ -835,6 +836,39 @@ const runRetention = () => {
 const retentionTimer = setInterval(runRetention, 60 * 60_000); retentionTimer.unref();
 setTimeout(runRetention, 60_000).unref();
 
+// A broadcast that flaps -- the upstream playlist disappears for a minute, ffmpeg exits, the
+// watcher opens a fresh capture once its cooldown lapses -- arrives as one library entry per
+// capture, so a single five-hour show reads as eight separate short recordings. Once a room has
+// gone quiet long enough that the show is over, its finished captures are spliced back into one
+// file (see live-sessions.ts). EASYX_LIVE_SESSION_SPLICE=false turns the pass off.
+const liveSessionSpliceEnabled = process.env.EASYX_LIVE_SESSION_SPLICE !== "false";
+// A group can stay unfolded for many passes (not enough free space, a capture that cannot be
+// measured), so the reason is logged when it changes instead of on every pass.
+const sessionSkipReasons = new Map<string, string>();
+const runLiveSessionSplice = async () => {
+  if (!liveSessionSpliceEnabled) return;
+  try {
+    const report = await spliceLiveSessions({
+      db, mediaRoot: mediaDir,
+      concat: (listPath, output) => queue.concatFinishedFiles(listPath, output),
+      log: (message, fields) => app.log.info({ scope: "live-session", ...(fields ?? {}) }, message),
+    });
+    for (const entry of report.skipped) {
+      if (sessionSkipReasons.get(entry.roomKey) === entry.reason) continue;
+      sessionSkipReasons.set(entry.roomKey, entry.reason);
+      app.log.info({ scope: "live-session", ...entry }, "Live session left unfolded");
+    }
+    for (const entry of report.failed) app.log.warn({ scope: "live-session", ...entry }, "Live session splice failed");
+    // The splice replaced one path and removed the rest, so the library has to re-measure the
+    // survivor and drop the rows whose files are gone.
+    if (report.spliced) await catalog.scan();
+  } catch (error) {
+    app.log.error(error, "Live session splice pass failed");
+  }
+};
+const liveSessionTimer = setInterval(() => void runLiveSessionSplice(), 10 * 60_000); liveSessionTimer.unref();
+setTimeout(() => void runLiveSessionSplice(), 2 * 60_000).unref();
+
 // P2: both SQLite files run in WAL mode, and a long-lived reader (an open SSE stream or a library
 // scan) stops SQLite from checkpointing on its own - which is why a 139KB database sat next to a
 // 4MB -wal sidecar. Truncate hourly so the sidecars stay bounded.
@@ -888,7 +922,7 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; await queue.stop(); systemStats.stop(); autoRecorder.stop(); clearInterval(retentionTimer); clearInterval(checkpointTimer); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  shuttingDown = true; await queue.stop(); systemStats.stop(); autoRecorder.stop(); clearInterval(retentionTimer); clearInterval(checkpointTimer); clearInterval(liveSessionTimer); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);

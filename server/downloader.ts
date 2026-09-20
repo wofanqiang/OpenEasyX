@@ -322,6 +322,18 @@ export class DownloadQueue {
     return { deleted: true, id: itemId, ...(mediaDeletion && typeof mediaDeletion === "object" ? mediaDeletion : {}) };
   }
 
+  /**
+   * Join already-finished recordings listed in `listPath` into `output`, under the same contract
+   * as every other post-process command: one shared, load-gated slot (so a splice never runs beside
+   * a remux) and the lowest CPU/I/O priority. A splice of a multi-hour session is a full read and
+   * write, and a live capture that misses the HLS edge because of it cannot be recovered.
+   * `-c copy` through the concat demuxer re-encodes nothing and adds no A/V gap.
+   */
+  concatFinishedFiles(listPath: string, output: string): Promise<void> {
+    return this.postProcessGate.run("Session concat", () => this.runPostProcessCommand(
+      "ffmpeg", concatCaptureArgs(listPath, output), path.dirname(output), { paused: false, live: false } as ActiveDownload));
+  }
+
   outputPath(itemId: string) {
     const item = this.requiredItem(itemId); if (item.storagePath) return item.storagePath;
     const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);

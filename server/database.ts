@@ -462,6 +462,18 @@ export class Database {
     return (this.sqlite.prepare("SELECT * FROM items WHERE source_id=?").all(sourceId) as any[]).map(this.mapItem);
   }
 
+  /**
+   * Every live capture in the given statuses, oldest capture first. The session splicer needs the
+   * whole set at once -- which captures belong to one broadcast, and whether any of them is still
+   * on the air -- so `listItems(limit)` is not good enough: it orders by updated_at and would drop
+   * a quiet room's rows behind unrelated recent traffic.
+   */
+  listLiveItems(statuses: string[], limit = 2000): DownloadItem[] {
+    if (!statuses.length) return [];
+    return (this.sqlite.prepare(`SELECT * FROM items WHERE is_live=1 AND status IN (${statuses.map(() => "?").join(",")})
+      ORDER BY COALESCE(download_started_at,published_at,created_at) ASC LIMIT ?`).all(...statuses, limit) as any[]).map(this.mapItem);
+  }
+
   listItemsPage(options: ItemPageOptions = {}): ItemPage {
     const pageSize = Math.min(100, Math.max(1, Math.floor(options.pageSize ?? 50)));
     const requestedPage = Math.max(1, Math.floor(options.page ?? 1));
@@ -613,6 +625,25 @@ export class Database {
 
   supersedeDownload(itemId: string, betterItemId: string) {
     this.sqlite.prepare("UPDATE items SET status='superseded',duplicate_of=?,storage_path=NULL,updated_at=? WHERE id=?").run(betterItemId, now(), itemId);
+  }
+
+  /**
+   * The session splicer folded the captures around this item into its file. Two recorded facts go
+   * stale at once and both would be read as truth later:
+   *  - the checksum and visual hash describe the bytes finalize hashed, which are no longer the
+   *    bytes at this item's storage path, so a later download could match a fingerprint that
+   *    belongs to a different file;
+   *  - the recording really ended with the LAST segment of the broadcast, not with this one, and
+   *    that timestamp is what the splicer uses to decide whether the room went quiet.
+   */
+  markSessionCollapsed(itemId: string, values: { finishedAt?: string; segmentIds: string[] }) {
+    const item = this.getItem(itemId);
+    if (!item) return undefined;
+    const metadata = { ...item.metadata, sessionSegments: values.segmentIds };
+    this.sqlite.prepare(`UPDATE items SET checksum_sha256=NULL,visual_hash=NULL,
+      download_finished_at=COALESCE(?,download_finished_at),metadata_json=?,updated_at=? WHERE id=?`)
+      .run(values.finishedAt ?? null, JSON.stringify(metadata), now(), itemId);
+    return this.getItem(itemId);
   }
 
   deleteItem(itemId: string) {
