@@ -6,12 +6,12 @@ import fastifyHttpProxy from "@fastify/http-proxy";
 import fastifyStatic from "@fastify/static";
 import pino from "pino";
 import { z } from "zod";
-import { Database } from "./database.js";
+import { Database, ACTIVE_ITEM_STATUSES } from "./database.js";
 import type { Performer } from "./database.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 import { DownloadQueue } from "./downloader.js";
 import { discoverPeople } from "./discovery.js";
-import { deletePerformerFiles, ensurePerformerDirectory, renamePerformerDirectory } from "./performer-files.js";
+import { deletePerformerFiles, performerDirectory, ensurePerformerDirectory, renamePerformerDirectory } from "./performer-files.js";
 import { domainFromUrl } from "./utils.js";
 import { BrowserLoginManager } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
@@ -653,14 +653,15 @@ app.delete<{ Params: { id: string }; Body: unknown }>("/api/performers/:id", asy
   const performer = db.getPerformer(request.params.id);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
   const body = z.object({ deleteFiles: z.boolean().default(true) }).parse(request.body ?? {});
-  const items = db.listItems(10000).filter((item) => item.performerId === performer.id);
-  if (items.some((item) => ["queued", "downloading"].includes(item.status))) {
+  const items = db.listItemsByPerformer(performer.id);
+  if (items.some((item) => ACTIVE_ITEM_STATUSES.includes(item.status))) {
     throw Object.assign(new Error("Wait for active downloads to finish before deleting this performer"), { statusCode: 409 });
   }
-  const deletedFiles = body.deleteFiles ? deletePerformerFiles(mediaDir, performer, items) : 0;
-  db.deletePerformer(performer.id);
+  const otherPerformerDirs = db.listPerformers().filter((p) => p.id !== performer.id).map((p) => performerDirectory(mediaDir, p.name));
+  const deletedFiles = body.deleteFiles ? deletePerformerFiles(mediaDir, performer, items, otherPerformerDirs) : 0;
+  const deleted = db.deletePerformer(performer.id);
   fs.rmSync(performerImageFile(performer.id), { force: true });
-  return { deleted: true, deletedFiles, filesKept: !body.deleteFiles };
+  return { deleted, deletedFiles, filesKept: !body.deleteFiles };
 });
 
 app.patch<{ Params: { id: string }; Body: unknown }>("/api/sources/:id", async (request) => {
@@ -691,10 +692,10 @@ app.patch<{ Params: { id: string }; Body: unknown }>("/api/sources/:id", async (
 app.delete<{ Params: { id: string } }>("/api/sources/:id", async (request) => {
   const source = db.getSource(request.params.id);
   if (!source) throw Object.assign(new Error("Source not found"), { statusCode: 404 });
-  const active = db.listItems(10000).some((item) => item.sourceId === source.id && ["queued", "downloading"].includes(item.status));
+  const active = db.listItemsBySource(source.id).some((item) => ACTIVE_ITEM_STATUSES.includes(item.status));
   if (active) throw Object.assign(new Error("Wait for active downloads to finish before deleting this URL"), { statusCode: 409 });
-  db.deleteSource(source.id);
-  return { deleted: true };
+  const deleted = db.deleteSource(source.id);
+  return { deleted };
 });
 
 async function syncSource(sourceId: string) {
