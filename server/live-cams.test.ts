@@ -154,6 +154,29 @@ describe("Open EasyX live cams", () => {
     expect(service.autoRecordTargets()).toHaveLength(0);
   });
 
+  it("does not re-ask an armed room that is confirmed offline on every watcher pass", async () => {
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    const plugin = plugins.get("test.live");
+    // Offline rooms are the bulk of the watcher's work and barely change: re-asking every minute
+    // for every armed room spent the provider's shared per-IP budget for nothing.
+    const lookup = vi.fn(async () => ({ id: "dana", username: "dana", pageUrl: "https://live.test/dana", online: false, viewers: 0 }));
+    plugin.getLiveCam = lookup;
+    const targets = [{ username: "dana", pageUrl: "https://live.test/dana" }];
+    vi.useFakeTimers();
+    try {
+      await expect(service.autoRecordStatuses("test.live", targets)).resolves.toMatchObject({ cams: [{ username: "dana", online: false }] });
+      expect(lookup).toHaveBeenCalledTimes(1);
+      await service.autoRecordStatuses("test.live", targets);
+      expect(lookup).toHaveBeenCalledTimes(1);
+      // ...but a verdict is not trusted forever: once it ages out the room is asked again, and a
+      // room that has come back online is reported live instead of staying stale.
+      await vi.advanceTimersByTimeAsync(120_001);
+      lookup.mockImplementation(async () => ({ id: "dana", username: "dana", pageUrl: "https://live.test/dana", online: true, viewers: 5 }));
+      await expect(service.autoRecordStatuses("test.live", targets)).resolves.toMatchObject({ cams: [{ username: "dana", online: true }] });
+      expect(lookup).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("uses the reconnected account immediately instead of its cached login failure", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
     const followed = vi.fn().mockResolvedValueOnce({ authoritative: false, cams: [], skippedReason: "Session expired" })

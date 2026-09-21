@@ -57,6 +57,36 @@ describe("Chaturbate plugin", () => {
     expect(page).toMatchObject({ total: 1, cams: [{ username: "alice" }] });
   });
 
+  it("shares one upstream catalogue fetch across every consumer instead of one per caller", async () => {
+    // The public room list is rate-limited per source IP, so N callers (browse page, each gender
+    // tab, the auto-record watcher) must collapse onto a single upstream request per TTL.
+    // NB: room names must match Chaturbate's own /^[a-z0-9_]+$/ rule or the parser drops them.
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      rooms: [{ username: "sharingprobe_model", current_show: "public" }], total_count: 1,
+    }), { status: 200 }));
+    const context = { config: {}, fetch: fetchMock as typeof fetch, runCommand: vi.fn(), log: vi.fn() };
+    const query = { page: 1, pageSize: 24, search: "sharingprobe" };
+    const [first, second] = await Promise.all([
+      chaturbate.listLiveCams!(context as never, query),
+      chaturbate.listLiveCams!(context as never, query),
+    ]);
+    expect(first.cams).toMatchObject([{ username: "sharingprobe_model" }]);
+    expect(second.cams).toMatchObject([{ username: "sharingprobe_model" }]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await chaturbate.listLiveCams!(context as never, query);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never fans a search out over the whole catalogue", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      rooms: [{ username: "deep_model", current_show: "public" }], total_count: 5_000,
+    }), { status: 200 }));
+    const context = { config: {}, fetch: fetchMock as typeof fetch, runCommand: vi.fn(), log: vi.fn() };
+    await chaturbate.listLiveCams!(context as never, { page: 1, pageSize: 24, search: "fanout-probe" });
+    // 5,000 rooms would otherwise mean ~50 parallel room-list requests on one shared IP limit.
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
   it("loads both online and offline followed creators from a connected account", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
       const url = String(input);

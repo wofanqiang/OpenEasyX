@@ -93,6 +93,8 @@ const performerRefreshStatus = { running: false, completed: 0, total: 0, progres
 const adoptedAutoRecord = liveCams.adoptLegacyFavoriteAutoRecord();
 if (adoptedAutoRecord.adopted) app.log.info({ scope: "auto-record", adopted: adoptedAutoRecord.adopted, performers: adoptedAutoRecord.performers }, `Adopted ${adoptedAutoRecord.adopted} performer(s) that were armed at the favorite level`);
 if (adoptedAutoRecord.orphaned.length) app.log.warn({ scope: "auto-record", orphaned: adoptedAutoRecord.orphaned }, "Auto-record was armed for favorites with no performer; add them as performers to keep recording");
+const raisedIntervals = enforcePollingFloors();
+if (raisedIntervals) app.log.info({ scope: "sources", count: raisedIntervals }, `Raised ${raisedIntervals} source(s) to their provider's minimum polling interval`);
 const autoRecorder = startAutoRecorder({ db, liveCams, mediaRoot: mediaDir, log: (message) => app.log.info({ scope: "auto-record" }, message) });
 
 function ensureBrowserLoginEnabled() {
@@ -501,6 +503,29 @@ function validateScraperInterval(pluginId: string, intervalSeconds: number): num
   const minimum = manifest?.polling?.minimumIntervalSeconds ?? 300;
   if (intervalSeconds < minimum) throw Object.assign(new Error(`${manifest?.name ?? pluginId} requires an interval of at least ${minimum} seconds`), { statusCode: 409 });
   return intervalSeconds;
+}
+
+// Raising a plugin's declared minimum only affects sources created afterwards: an existing source
+// keeps whatever cadence it was saved with, so sources created under the old 10s Chaturbate
+// schedule would keep spending that provider's shared per-IP budget forever. Clamp once at boot so
+// every live provider's floor is honoured by the sources already in the database too.
+function enforcePollingFloors(): number {
+  const floors = new Map<string, number>();
+  for (const entry of plugins.list()) {
+    const polling = entry.manifest.polling;
+    if (polling?.mode !== "live") continue;
+    floors.set(entry.manifest.id, polling.minimumIntervalSeconds);
+  }
+  if (!floors.size) return 0;
+  let raised = 0;
+  for (const source of db.listSources()) {
+    if (!source.scraperPluginId || !source.scrapeEnabled) continue;
+    const floor = floors.get(source.scraperPluginId);
+    if (floor === undefined || source.syncIntervalSeconds >= floor) continue;
+    db.updateSource(source.id, { syncIntervalSeconds: floor });
+    raised += 1;
+  }
+  return raised;
 }
 
 app.post<{ Body: unknown }>("/api/performers/import", async (request) => {

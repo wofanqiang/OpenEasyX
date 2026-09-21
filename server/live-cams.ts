@@ -28,6 +28,30 @@ type LiveCamListQuery = LiveCamQuery & { providerId?: string; favoritesOnly?: bo
 // the cap simply stop paginating past it (rare for live-cam rooms and far better than dupes).
 const AGGREGATE_PREVIEW_LIMIT = 200;
 
+// How long the BACKGROUND auto-record watcher trusts a resolved live status. A room that IS live
+// changes quickly, so its verdict ages out in about a minute. A room that is NOT live barely
+// changes, and re-asking every minute for every armed room was pure upstream cost: on a provider
+// that rate-limits per source IP (Chaturbate) it starved the shared budget until the browse page
+// reported "unavailable". Offline verdicts are therefore trusted longer -- 2 minutes, which halves
+// the offline polling rate while bounding how much of a broadcast could be missed at ~2 minutes.
+// (Deliberately NOT applied to the favorites list, which the user reads as "live right now".)
+const ONLINE_STATUS_TTL_MS = 60_000;
+const OFFLINE_STATUS_TTL_MS = 120_000;
+// Without an exact-room lookup the verdict comes from a bounded catalogue search, which is less
+// precise, so it ages out sooner.
+const SEARCH_STATUS_TTL_MS = 30_000;
+function statusTtlMs(exactLookup: boolean, cam: LiveCam): number {
+  if (cam.online === false) return OFFLINE_STATUS_TTL_MS;
+  return exactLookup ? ONLINE_STATUS_TTL_MS : SEARCH_STATUS_TTL_MS;
+}
+
+// Cap how many exact room lookups one auto-record pass may spend. Every one costs the provider's
+// shared per-IP budget, so an unbounded pass scales with the number of armed rooms and eventually
+// starves the browse page. Rooms resolved from the followed snapshot or from the status cache cost
+// nothing and are NOT counted; with the graded offline TTL above, almost every armed room lands in
+// that free category, so a full sweep still completes within a pass or two.
+const MAX_EXACT_STATUS_CHECKS_PER_PASS = 8;
+
 function text(value: unknown): string | undefined { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
 function whole(value: unknown): number { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0; }
 // Compare usernames so that embedded numbers sort numerically (cam-2 < cam-10) instead of
@@ -248,6 +272,9 @@ export class LiveCamService {
                     const match = result.cams.find((cam) => cam.username.toLowerCase() === saved.username.toLowerCase() || cam.id.toLowerCase() === saved.camId.toLowerCase());
                     cam = match ? { ...match, online: match.online !== false } : offline;
                   }
+                  // The favorites list is a "who is live right now" surface, so it keeps the
+                  // original short TTL: a stale "offline" here would be visible to the user. The
+                  // graded offline TTL below applies only to the background auto-record watcher.
                   if (epoch === this.favoriteEpoch.get(entry.manifest.id)) this.favoriteStatuses.set(key, { cam, expiresAt: Date.now() + (plugin.getLiveCam ? 60_000 : 30_000) });
                   return cam;
                 } catch (error) {
@@ -578,7 +605,7 @@ export class LiveCamService {
         if (cached && cached.expiresAt > Date.now()) return cached.cam;
         const offline: LiveCam = { id: username, username, pageUrl: target.pageUrl, online: false };
         // Never auto-start from an uncertain status; a missing check is better than a false live.
-        if (transientFailure || checks >= 24) return { ...(cached?.cam ?? offline), statusUnavailable: true };
+        if (transientFailure || checks >= MAX_EXACT_STATUS_CHECKS_PER_PASS) return { ...(cached?.cam ?? offline), statusUnavailable: true };
         checks += 1;
         try {
           let cam: LiveCam;
@@ -589,7 +616,7 @@ export class LiveCamService {
             const match = result.cams.find((candidate) => candidate.username.toLowerCase() === username.toLowerCase());
             cam = match ? { ...match, online: match.online !== false } : offline;
           }
-          this.favoriteStatuses.set(key, { cam, expiresAt: Date.now() + (plugin.getLiveCam ? 60_000 : 30_000) });
+          this.favoriteStatuses.set(key, { cam, expiresAt: Date.now() + statusTtlMs(Boolean(plugin.getLiveCam), cam) });
           return cam;
         } catch {
           return { ...(cached?.cam ?? offline), statusUnavailable: true };

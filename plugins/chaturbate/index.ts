@@ -7,8 +7,25 @@ import { configuredArgs, runYtDlpJson, testYtDlp, ytDlpDownload, ytDlpLiveStream
 const OFFLINE = ["offline", "not currently broadcasting", "room is currently away", "no videos found", "not live"];
 const FOLLOW_PAGE_SIZE = 90;
 const MAX_FOLLOWED_CAMS = 5_000;
+const GENDERS: Record<string, string> = { female: "f", male: "m", couple: "c", trans: "t" };
 const verifiedAccountSessions = new Set<string>();
-let liveSearchCache: { key: string; expiresAt: number; cams: LiveCam[] } | undefined;
+
+// Chaturbate rate-limits the public room list per source IP, and every live-cam surface used to
+// pull its own copy: the browse page, each gender tab, search, the auto-record watcher and the
+// favorites page. Cache each (genders, keywords, offset, limit) upstream fetch for a bounded TTL
+// and collapse concurrent callers onto a single in-flight request, so N consumers share one
+// upstream response instead of N. 75s is deliberately longer than the server's 30s provider
+// cache: the point is to outlive it, so a re-render cannot turn into an upstream call.
+const CATALOGUE_TTL_MS = 75_000;
+const CATALOGUE_MAX_ENTRIES = 64;
+const catalogueCache = new Map<string, { expiresAt: number; payload: LiveCamPage }>();
+const catalogueFlights = new Map<string, Promise<LiveCamPage>>();
+
+// A search must never fan out over the whole catalogue. `keywords` filters server-side, so the
+// first page or two is the relevant set; without a cap, a catalogue `total_count` of a few
+// thousand rooms turns ONE search into dozens of parallel upstream requests on a shared IP limit
+// -- the single biggest amplifier behind the intermittent HTTP 429s.
+const SEARCH_MAX_PAGES = 2;
 
 function text(value: unknown): string | undefined { return typeof value === "string" && value.trim() ? value.trim() : undefined; }
 function stamp(value: unknown): number | undefined { const parsed = Number(value); return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined; }
@@ -254,7 +271,12 @@ export default definePlugin({
     description: "Check a public Chaturbate room and record a live session with yt-dlp and FFmpeg only when the room is broadcasting.",
     capabilities: ["media-listing", "download-resolver", "live-cam"],
     sourceUrlPatterns: ["http://chaturbate.com/*", "https://chaturbate.com/*", "http://www.chaturbate.com/*", "https://www.chaturbate.com/*"],
-    polling: { mode: "live", defaultIntervalSeconds: 10, minimumIntervalSeconds: 5 },
+    // A live check runs yt-dlp against the room page, and every one of them spends the SAME
+    // per-IP budget as the public room list. At the old 10s cadence a handful of Chaturbate
+    // sources alone could starve the browse page into HTTP 429. 30s is both the default and a
+    // hard floor: auto-record already re-checks status on its own schedule, so the source scan
+    // only has to be frequent enough to notice a room going live.
+    polling: { mode: "live", defaultIntervalSeconds: 30, minimumIntervalSeconds: 30 },
     browserAuth: { loginUrl: "https://chaturbate.com/auth/login/", sessionSetting: "cookiesFile" },
     settings: [
       { key: "cookiesFile", label: "Account session", type: "session", cookieDomains: ["chaturbate.com"], help: "Optional. Public rooms normally do not require an account session." },
@@ -285,34 +307,53 @@ export default definePlugin({
     }
   },
   async listLiveCams(context, query) {
-    const load = async (offset: number, limit: number) => {
+    const genders = query.gender ? GENDERS[query.gender] : undefined;
+    const fetchPage = async (offset: number, limit: number): Promise<LiveCamPage> => {
       const params = new URLSearchParams({ limit: String(Math.min(100, limit)), offset: String(offset) });
-      if (query.gender) params.set("genders", { female: "f", male: "m", couple: "c", trans: "t" }[query.gender]);
+      if (genders) params.set("genders", genders);
       if (query.search) params.set("keywords", query.search);
+      // The shared fetch deliberately ignores the caller's signal: one browser tab closing must not
+      // abort an upstream request that other consumers are already waiting on. It keeps its own
+      // timeout instead, and a caller that has already gone away fails fast in `load` below.
       const response = await chaturbateRequest(context, `https://chaturbate.com/api/ts/roomlist/room-list/?${params}`, {
         headers: {
           accept: "application/json", "x-requested-with": "XMLHttpRequest", referer: "https://chaturbate.com/",
           "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36",
-        }, signal: context.signal ?? AbortSignal.timeout(15_000),
+        }, signal: AbortSignal.timeout(15_000),
       });
       if (!response.ok) throw new Error(`Chaturbate live rooms returned HTTP ${response.status}`);
       const page = chaturbateLiveCamPage(await response.json(), 1, limit);
       return { ...page, cams: page.cams.slice(0, limit) };
     };
 
+    // Every consumer of the public catalogue goes through here, so the whole app shares one
+    // upstream fetch per (genders, keywords, offset, limit) window per TTL instead of one each.
+    const load = async (offset: number, limit: number): Promise<LiveCamPage> => {
+      context.signal?.throwIfAborted();
+      const key = `${genders ?? ""}|${query.search?.toLowerCase() ?? ""}|${offset}|${limit}`;
+      const cached = catalogueCache.get(key);
+      if (cached && cached.expiresAt > Date.now()) return cached.payload;
+      const flight = catalogueFlights.get(key);
+      if (flight) return flight;
+      const task = fetchPage(offset, limit).then((payload) => {
+        catalogueCache.set(key, { payload, expiresAt: Date.now() + CATALOGUE_TTL_MS });
+        if (catalogueCache.size > CATALOGUE_MAX_ENTRIES) catalogueCache.delete(catalogueCache.keys().next().value!);
+        return payload;
+      }).finally(() => { catalogueFlights.delete(key); });
+      catalogueFlights.set(key, task);
+      return task;
+    };
+
     if (query.search) {
-      const cacheKey = `${query.gender ?? ""}:${query.search.toLowerCase()}`;
-      let matching = liveSearchCache?.key === cacheKey && liveSearchCache.expiresAt > Date.now() ? liveSearchCache.cams : undefined;
-      if (!matching) {
-        const first = await load(0, 100);
-        const offsets = Array.from({ length: Math.max(0, Math.ceil(first.total / 100) - 1) }, (_, index) => (index + 1) * 100);
-        const rest = await Promise.all(offsets.map((offset) => load(offset, 100)));
-        const unique = new Map<string, LiveCam>();
-        for (const cam of [first, ...rest].flatMap((page) => page.cams)) unique.set(cam.id, cam);
-        const needle = query.search.toLowerCase();
-        matching = [...unique.values()].filter((cam) => `${cam.username} ${cam.title ?? ""} ${(cam.tags ?? []).join(" ")}`.toLowerCase().includes(needle));
-        liveSearchCache = { key: cacheKey, expiresAt: Date.now() + 10_000, cams: matching };
-      }
+      const first = await load(0, 100);
+      // Bounded fan-out: at most SEARCH_MAX_PAGES pages, never the whole catalogue.
+      const extra = Math.min(Math.max(0, Math.ceil(first.total / 100) - 1), SEARCH_MAX_PAGES - 1);
+      const offsets = Array.from({ length: extra }, (_, index) => (index + 1) * 100);
+      const rest = await Promise.all(offsets.map((offset) => load(offset, 100)));
+      const unique = new Map<string, LiveCam>();
+      for (const cam of [first, ...rest].flatMap((page) => page.cams)) unique.set(cam.id, cam);
+      const needle = query.search.toLowerCase();
+      const matching = [...unique.values()].filter((cam) => `${cam.username} ${cam.title ?? ""} ${(cam.tags ?? []).join(" ")}`.toLowerCase().includes(needle));
       const start = (query.page - 1) * query.pageSize;
       return { cams: matching.slice(start, start + query.pageSize), total: matching.length, page: query.page, pageSize: query.pageSize, pages: Math.max(1, Math.ceil(matching.length / query.pageSize)) };
     }
