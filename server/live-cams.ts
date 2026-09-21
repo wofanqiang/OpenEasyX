@@ -156,10 +156,18 @@ export class LiveCamService {
     if (running) return running;
     const epoch = this.favoriteEpoch.get(entry.manifest.id);
     const operation = this.loadProvider(entry, query, AbortSignal.timeout(providerEnvelopeMs(this.db.getSettings())), favoritesOnly).then((result) => {
-      if (!result.status.ok && cached?.result.items.length) result = {
-        ...cached.result, items: cached.result.items.map((cam) => ({ ...cam, statusUnavailable: true })),
-        status: { ...cached.result.status, warning: result.status.error },
-      };
+      if (!result.status.ok) {
+        // A transient provider outage (e.g. an upstream 429 on a shared IP) can make a freshly
+        // opened query key fail. Rather than surfacing "(unavailable)", reuse this provider's
+        // cache from any other query key that loaded successfully, filtered in-memory to the
+        // requested gender/search, and mark the borrowed cams as statusUnavailable. Switching
+        // tabs therefore shows live rooms (albeit stale) instead of flickering to "unavailable".
+        const fallback = cached?.result.items.length ? cached.result : this.borrowProviderCache(entry, query, favoritesOnly);
+        if (fallback?.items.length) {
+          const items = fallback.items.map((cam) => ({ ...this.linkPerformer({ ...cam, favorite: this.db.isLiveCamFavorite(cam.providerId, cam.username) }), statusUnavailable: true }));
+          result = { ...fallback, items, total: items.length, status: { ...fallback.status, ok: true, warning: result.status.error } };
+        }
+      }
       // Failed provider results are cached briefly (30s, same as successes): a longer
       // window kept a single timeout on the UI as "unavailable" for minutes.
       if (epoch === this.favoriteEpoch.get(entry.manifest.id)) this.providerResults.set(key, { result, expiresAt: Math.min(Date.now() + 30_000, favoritesOnly ? this.favoriteSnapshots.get(entry.manifest.id)?.expiresAt ?? Infinity : Infinity) });
@@ -169,6 +177,32 @@ export class LiveCamService {
     }).finally(() => { if (this.providerLoads.get(key) === operation) this.providerLoads.delete(key); });
     this.providerLoads.set(key, operation);
     return operation;
+  }
+
+  // Borrow cached cams for a provider from ANY other query key that loaded successfully.
+  // Used as a fallback when a specific query key (e.g. a freshly opened gender tab) fails:
+  // rather than report "unavailable", we reuse rooms we already fetched and filter them to the
+  // requested gender/search in memory. Returns undefined when no usable cache exists.
+  private borrowProviderCache(entry: ReturnType<PluginManager["list"]>[number], query: LiveCamQuery, favoritesOnly: boolean): ProviderResult | undefined {
+    const borrowed: PublicLiveCam[] = [];
+    const requestedGender = query.gender;
+    const needle = query.search?.toLowerCase();
+    for (const [key, value] of this.providerResults) {
+      let parsed: [string, LiveCamQuery, boolean];
+      try { parsed = JSON.parse(key); } catch { continue; }
+      if (parsed[0] !== entry.manifest.id || parsed[2] !== favoritesOnly) continue;
+      if (Date.now() > value.expiresAt) continue;
+      for (const cam of value.result.items) {
+        if (requestedGender && !(cam.gender === requestedGender || cam.gender === requestedGender[0])) continue;
+        if (needle && !`${cam.username} ${cam.title ?? ""} ${(cam.tags ?? []).join(" ")}`.toLowerCase().includes(needle)) continue;
+        borrowed.push(cam);
+      }
+    }
+    if (!borrowed.length) return undefined;
+    const unique = new Map<string, PublicLiveCam>();
+    for (const cam of borrowed) unique.set(`${cam.providerId}:${cam.username.toLowerCase()}`, cam);
+    const items = [...unique.values()];
+    return { items, total: items.length, status: { id: entry.manifest.id, name: entry.manifest.name, ok: true, count: items.length } };
   }
 
   private async loadProvider(entry: ReturnType<PluginManager["list"]>[number], query: LiveCamQuery, signal?: AbortSignal, favoritesOnly = false): Promise<ProviderResult> {

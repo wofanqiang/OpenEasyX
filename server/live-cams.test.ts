@@ -787,3 +787,46 @@ describe("Open EasyX live cams", () => {
     }
   });
 });
+
+describe("live-cam provider cache borrow fallback (per-query-key outage)", () => {
+  // A freshly opened query key (e.g. a gender tab) has no same-key cache yet. When that key's
+  // fetch fails because the provider rate-limited a shared IP, the UI used to flip the whole
+  // provider to "(unavailable)". It should instead borrow the same provider's cache from any
+  // other query key that loaded successfully, filter it in memory to the requested
+  // gender/search, and mark the borrowed rooms as statusUnavailable.
+  it("reuses another query key's cache (filtered by gender) when a query key fails, instead of 'unavailable'", async () => {
+    const { plugins, service } = await fixture();
+    plugins.install("test.live");
+    // The unfiltered tab succeeds with a mixed-gender catalogue; the male tab fails upstream.
+    plugins.get("test.live").listLiveCams = async (_ctx: any, query: any) => {
+      if (query.gender === "male") throw new Error("Chaturbate is temporarily limiting requests (HTTP 429)");
+      const cams = [
+        { id: "alice", username: "alice", pageUrl: "https://live.test/alice", gender: "female", viewers: 30 },
+        { id: "bob", username: "bob", pageUrl: "https://live.test/bob", gender: "male", viewers: 20 },
+        { id: "carol", username: "carol", pageUrl: "https://live.test/carol", gender: "female", viewers: 10 },
+      ];
+      return { cams, total: cams.length, page: query.page, pageSize: query.pageSize, pages: 1 };
+    };
+    // Load the unfiltered tab first so its cache is populated.
+    const all = await service.list({ page: 1, pageSize: 50 });
+    expect(all.providers[0].ok).toBe(true);
+    expect(all.items.map((c) => c.username).sort()).toEqual(["alice", "bob", "carol"]);
+    // Switch to the male tab, which fails upstream.
+    const male = await service.list({ gender: "male", page: 1, pageSize: 50 });
+    // The provider must NOT report "unavailable" — it borrows the cached rooms instead.
+    expect(male.providers[0].ok).toBe(true);
+    expect(male.providers[0].warning).toBeTruthy();
+    // Only male rooms survive the in-memory gender filter, and they are marked stale.
+    expect(male.items.map((c) => c.username)).toEqual(["bob"]);
+    expect(male.items.every((c) => c.statusUnavailable === true)).toBe(true);
+  });
+
+  it("still reports 'unavailable' when no usable cache can be borrowed", async () => {
+    const { plugins, service } = await fixture();
+    plugins.install("test.live");
+    plugins.get("test.live").listLiveCams = async () => { throw new Error("upstream down"); };
+    const result = await service.list({ page: 1, pageSize: 50 });
+    expect(result.providers[0].ok).toBe(false);
+    expect(result.items).toEqual([]);
+  });
+});
