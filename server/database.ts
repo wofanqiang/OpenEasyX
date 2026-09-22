@@ -650,6 +650,24 @@ export class Database {
     return Number(this.sqlite.prepare("DELETE FROM items WHERE id=?").run(itemId).changes) > 0;
   }
 
+  /**
+   * Register a library row for footage rescued into `.recording-recovery` whose original item row is
+   * gone. Deleting a queue entry removes its row outright, so a rescue folder can outlive its owner:
+   * `getItem` then answers undefined, and the Recovery page's archive action had nothing to file the
+   * bytes under and answered 404 for every click. The row is inserted as `completed` so the queue can
+   * never mistake salvaged footage for something still to be downloaded.
+   */
+  adoptRecoveredItem(values: { performerId: string; sourceId: string; pluginId: string; externalId: string;
+    title?: string; filename?: string; mediaType: string; publishedAt?: string; metadata?: Record<string, unknown> }): DownloadItem {
+    const itemId = id("item"); const stamp = now();
+    this.sqlite.prepare(`INSERT INTO items(id,performer_id,source_id,plugin_id,external_id,identity_key,title,page_url,media_type,filename,quality_score,expected_bytes,published_at,metadata_json,is_live,status,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(itemId, values.performerId, values.sourceId, values.pluginId, values.externalId, null,
+        values.title ?? null, null, values.mediaType, values.filename ?? null, 0, null,
+        values.publishedAt ?? null, JSON.stringify(values.metadata ?? {}), 0, "completed", stamp, stamp);
+    return this.getItem(itemId)!;
+  }
+
   stats() {
     const scalar = (sql: string) => Number((this.sqlite.prepare(sql).get() as any).value);
     return { performers: scalar("SELECT count(*) value FROM performers"), sources: scalar("SELECT count(*) value FROM sources"),

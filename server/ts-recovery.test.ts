@@ -294,4 +294,72 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     expect(report.items).toEqual([{ itemId: item.id, action: "failed" }]);
     expect(fs.existsSync(path.join(dir, "recovered.mp4"))).toBe(true);
   });
+
+  it("archives a rescue whose item row was deleted, rebuilding the owner from the sidecar", async () => {
+    const env = await harness();
+    const rescued = env.item("orphan");
+    writePlayableCapture(path.join(env.captureDir(rescued.id), "capture.ts"));
+    await env.queue.recoverResidualTs({ execute: true });
+    const dir = env.recoveryDir(rescued.id);
+    fs.writeFileSync(path.join(dir, "recovered.json"), JSON.stringify({
+      itemId: rescued.id, title: "Orphaned broadcast", performer: "Recovery Performer", source: "example.test",
+      duration: 60, recoveredAt: "2026-09-21T23:11:11.076Z",
+    }));
+
+    // Deleting a queue entry removes its row outright, so the folder outlives its owner and the
+    // archive action used to answer 404 for every click on an entry the page keeps listing.
+    expect(env.db.deleteItem(rescued.id)).toBe(true);
+    expect(env.db.getItem(rescued.id)).toBeUndefined();
+    expect((await env.queue.listRecovered()).map((entry) => entry.itemId)).toEqual([rescued.id]);
+
+    const result = await env.queue.catalogRecovered(rescued.id);
+    expect(result.cataloged).toBe(true);
+    const stored = path.join(env.mediaDir, result.storagePath!);
+    expect(fs.existsSync(stored)).toBe(true);
+    expect(fs.statSync(stored).size).toBeGreaterThan(0);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(await env.queue.listRecovered()).toEqual([]);
+
+    // A fresh completed row owns the file, filed under the performer and source the sidecar named.
+    const adopted = env.db.listItems().find((entry) => entry.externalId === `recovered:${rescued.id}`);
+    expect(adopted?.status).toBe("completed");
+    expect(env.db.getPerformer(adopted!.performerId)?.name).toBe("Recovery Performer");
+    expect(path.dirname(stored).endsWith(path.join("Recovery Performer", "example.test"))).toBe(true);
+    // The rebuild reuses the existing owner instead of duplicating it.
+    expect(env.db.listPerformers().filter((entry) => entry.name === "Recovery Performer")).toHaveLength(1);
+  });
+
+  it("files a rescue with no sidecar at all under a neutral owner instead of refusing it", async () => {
+    const env = await harness();
+    const rescued = env.item("no-sidecar");
+    writePlayableMp4(path.join(env.recoveryDir(rescued.id), "recovered.mp4"));
+    env.db.deleteItem(rescued.id);
+
+    // Nothing on disk names an owner. Footage the operator can see must still be archivable, so it
+    // lands in the neutral bucket rather than an action that can never succeed.
+    const result = await env.queue.catalogRecovered(rescued.id);
+    expect(result.cataloged).toBe(true);
+    const stored = path.join(env.mediaDir, result.storagePath!);
+    expect(fs.existsSync(stored)).toBe(true);
+    expect(path.dirname(stored).endsWith(path.join("Unsorted", "recovered"))).toBe(true);
+    expect(env.db.listItems().find((entry) => entry.externalId === `recovered:${rescued.id}`)?.status).toBe("completed");
+  });
+
+  it("does not keep a rebuilt row when the rescue cannot be moved", async () => {
+    const env = await harness();
+    const rescued = env.item("adopt-fail");
+    writePlayableMp4(path.join(env.recoveryDir(rescued.id), "recovered.mp4"));
+    fs.writeFileSync(path.join(env.recoveryDir(rescued.id), "recovered.json"), JSON.stringify({ performer: "Recovery Performer", source: "example.test" }));
+    env.db.deleteItem(rescued.id);
+    // A plain file sitting where the destination folder has to be: the move cannot succeed.
+    const blocked = path.join(env.mediaDir, "Recovery Performer");
+    fs.mkdirSync(blocked, { recursive: true });
+    fs.writeFileSync(path.join(blocked, "example.test"), "not a directory");
+
+    await expect(env.queue.catalogRecovered(rescued.id)).rejects.toThrow();
+    // The row exists only because this call created it, so a failed move must not leave a completed
+    // library entry pointing at a file that never arrived; the footage stays where it can be seen.
+    expect(env.db.listItems().some((entry) => entry.externalId === `recovered:${rescued.id}`)).toBe(false);
+    expect(fs.existsSync(path.join(env.recoveryDir(rescued.id), "recovered.mp4"))).toBe(true);
+  });
 });

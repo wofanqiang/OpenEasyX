@@ -46,6 +46,10 @@ const MEDIA_EXTENSIONS = new Set([".ts", ".mp4", ".mkv", ".webm", ".mov", ".m4v"
 // the oldest directories first when a move would exceed either.
 const RECOVERY_MAX_ENTRIES = 50;
 const RECOVERY_MAX_BYTES = 20 * 1024 ** 3;
+// Performer/source rows rebuilt from a salvage sidecar are attributed to this plugin id. It is
+// deliberately not a real downloader: `dueSources()` only sweeps sources that carry a
+// `scraper_plugin_id`, so an owner reconstructed here is never handed back to a plugin.
+const RECOVERED_PLUGIN_ID = "org.easyx.recovery";
 
 /** Clamp a configured concurrency value into the range the pool can serve. */
 export function concurrentLimit(value: unknown, fallback: number, max: number): number {
@@ -318,6 +322,7 @@ export class DownloadQueue {
       if (!this.onDeleteCompleted) throw Object.assign(new Error("Completed media deletion is not configured"), { statusCode: 409 });
       mediaDeletion = this.onDeleteCompleted(item);
     }
+    this.noteOrphanedRecovery(itemId);
     this.db.deleteItem(itemId);
     return { deleted: true, id: itemId, ...(mediaDeletion && typeof mediaDeletion === "object" ? mediaDeletion : {}) };
   }
@@ -939,7 +944,7 @@ export class DownloadQueue {
       if (stallTimer) clearInterval(stallTimer);
       avWatcher?.dispose();
       if (temporaryDirectory && !preserveTemporary) fs.rmSync(temporaryDirectory, { recursive: true, force: true });
-      if (control.action === "delete") this.db.deleteItem(item.id);
+      if (control.action === "delete") { this.noteOrphanedRecovery(item.id); this.db.deleteItem(item.id); }
     }
   }
 
@@ -1636,39 +1641,86 @@ export class DownloadQueue {
   async catalogRecovered(itemId: string): Promise<{ cataloged: boolean; reason?: string; storagePath?: string; leftovers?: string[] }> {
     const mp4 = path.join(this.recoveryRoot, safeSegment(itemId), "recovered.mp4");
     if (!fs.existsSync(mp4) || !fs.statSync(mp4).size) throw Object.assign(new Error("No recovered file for this item"), { statusCode: 404 });
-    const item = this.db.getItem(itemId);
-    if (!item) throw Object.assign(new Error("Recording item not found"), { statusCode: 404 });
-    // Guard: the item is already a completed library entry with its file on disk — never overwrite it.
-    // The recovered file is deliberately KEPT: there is no safe place to file it, and deleting
-    // footage on the user's behalf is not ours to decide. The explicit delete action removes it.
-    if (item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
-      this.writeLog?.("warn", "download", "Recovered recording left in place: the item already has a library file", { itemId, file: mp4 });
-      return { cataloged: false, reason: "already-completed" };
-    }
-    const performer = this.db.getPerformer(item.performerId);
-    const source = this.db.getSource(item.sourceId);
-    const settings = outputSettings(this.db.getSettings());
-    const filename = safeSegment(item.filename ?? `${item.externalId}.mp4`, `${item.externalId}.mp4`);
-    const destination = path.join(this.mediaRoot, downloadOutputPath(settings, item, performer?.name ?? "Unsorted", source?.domain ?? "recovered", filename));
-    this.prepareOutputDirectory(path.dirname(destination));
-    const finalPath = this.availableDestination(destination, item.id);
-    const canonicalDate = this.db.setCanonicalMediaDate(item.id, item.publishedAt);
-    return this.withFinalizeLock(`output:${itemId}`, async () => {
-      await this.applyMediaDate(mp4, item.mediaType, canonicalDate);
-      fs.renameSync(mp4, finalPath);
-      const relativePath = path.relative(this.mediaRoot, finalPath);
-      const checksum = await this.hashFile(finalPath);
-      const duplicate = this.db.findByChecksum(checksum, item.id, item.performerId);
-      if (duplicate && duplicate.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
-        fs.unlinkSync(finalPath);
-        this.db.setItemStatus(item.id, "duplicate", { progress: 1, checksum, duplicateOf: duplicate.id });
-        const leftovers = this.consumeRecovered(itemId);
-        return { cataloged: false, reason: "duplicate", leftovers };
+    // A rescue outlives its row when the queue entry was deleted: the bytes are still here, but
+    // there is no owner to file them under, and this action used to answer 404 for every click on
+    // an entry the Recovery page keeps listing. The salvage wrote a sidecar naming the performer and
+    // the source domain, which is enough to rebuild the owner and file the footage as intended.
+    let adopted = false;
+    let item = this.db.getItem(itemId);
+    if (!item) { item = this.adoptRecovered(itemId); adopted = true; }
+    try {
+      // Guard: the item is already a completed library entry with its file on disk — never overwrite it.
+      // The recovered file is deliberately KEPT: there is no safe place to file it, and deleting
+      // footage on the user's behalf is not ours to decide. The explicit delete action removes it.
+      if (item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
+        this.writeLog?.("warn", "download", "Recovered recording left in place: the item already has a library file", { itemId, file: mp4 });
+        return { cataloged: false, reason: "already-completed" };
       }
-      this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
-      const leftovers = this.consumeRecovered(itemId);
-      return { cataloged: true, storagePath: relativePath, leftovers };
+      const performer = this.db.getPerformer(item.performerId);
+      const source = this.db.getSource(item.sourceId);
+      const settings = outputSettings(this.db.getSettings());
+      const filename = safeSegment(item.filename ?? `${item.externalId}.mp4`, `${item.externalId}.mp4`);
+      const destination = path.join(this.mediaRoot, downloadOutputPath(settings, item, performer?.name ?? "Unsorted", source?.domain ?? "recovered", filename));
+      this.prepareOutputDirectory(path.dirname(destination));
+      const finalPath = this.availableDestination(destination, item.id);
+      const canonicalDate = this.db.setCanonicalMediaDate(item.id, item.publishedAt);
+      return await this.withFinalizeLock(`output:${itemId}`, async () => {
+        await this.applyMediaDate(mp4, item.mediaType, canonicalDate);
+        fs.renameSync(mp4, finalPath);
+        const relativePath = path.relative(this.mediaRoot, finalPath);
+        const checksum = await this.hashFile(finalPath);
+        const duplicate = this.db.findByChecksum(checksum, item.id, item.performerId);
+        if (duplicate && duplicate.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
+          fs.unlinkSync(finalPath);
+          this.db.setItemStatus(item.id, "duplicate", { progress: 1, checksum, duplicateOf: duplicate.id });
+          const leftovers = this.consumeRecovered(itemId);
+          return { cataloged: false, reason: "duplicate", leftovers };
+        }
+        this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+        const leftovers = this.consumeRecovered(itemId);
+        return { cataloged: true, storagePath: relativePath, leftovers };
+      });
+    } catch (error) {
+      // Undo the rebuilt row only while the footage is still in the recovery folder: the row exists
+      // solely because this call created it, and leaving a completed entry behind would point at a
+      // file that never arrived. Once the bytes are in the library the row must stay, even if the
+      // bookkeeping after the move failed — hiding a file the operator can see is the worse outcome.
+      if (adopted && fs.existsSync(mp4)) { try { this.db.deleteItem(item.id); } catch { /* best-effort rollback */ } }
+      throw error;
+    }
+  }
+
+  /**
+   * Rebuild the owner of a rescue whose item row is gone, from the sidecar the salvage wrote. The
+   * performer name and source domain are matched against the library first, so an existing owner is
+   * reused instead of duplicated; rows are created only for a name the library has never seen.
+   */
+  private adoptRecovered(itemId: string): DownloadItem {
+    const dir = path.join(this.recoveryRoot, safeSegment(itemId));
+    let sidecar: Record<string, unknown> = {};
+    try { sidecar = JSON.parse(fs.readFileSync(path.join(dir, "recovered.json"), "utf8")); } catch { /* sidecar missing or unreadable */ }
+    const performerName = typeof sidecar.performer === "string" && sidecar.performer.trim() ? sidecar.performer.trim() : "Unsorted";
+    const domain = typeof sidecar.source === "string" && sidecar.source.trim() ? sidecar.source.trim() : "recovered";
+    const performer = this.db.listPerformers().find((entry) => entry.name.toLowerCase() === performerName.toLowerCase())
+      ?? this.db.upsertPerformer({ externalId: performerName, name: performerName }, RECOVERED_PLUGIN_ID);
+    const source = this.db.listSources(performer.id).find((entry) => entry.domain.toLowerCase() === domain.toLowerCase())
+      ?? this.db.addSource(performer.id, RECOVERED_PLUGIN_ID, { externalId: domain, label: domain, profileUrl: `https://${domain}`, domain });
+    const duration = Number(sidecar.duration ?? 0);
+    const rescuedAt = typeof sidecar.recoveredAt === "string" ? Date.parse(sidecar.recoveredAt) : Number.NaN;
+    // A rescue runs seconds after the capture ends, so the broadcast start is the only honest
+    // canonical date left once the original row — and the plugin that could re-derive it — is gone.
+    const startedAt = new Date(Number.isFinite(rescuedAt) ? (duration > 0 ? rescuedAt - duration * 1000 : rescuedAt) : Date.now());
+    const safeName = performerName.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "recovered";
+    const item = this.db.adoptRecoveredItem({
+      performerId: performer.id, sourceId: source.id, pluginId: source.pluginId,
+      externalId: `recovered:${itemId}`,
+      title: typeof sidecar.title === "string" && sidecar.title.trim() ? sidecar.title : undefined,
+      filename: `${safeName}-${startedAt.toISOString().replace(/[:.]/g, "-")}.mp4`,
+      mediaType: "video", publishedAt: startedAt.toISOString(),
+      metadata: { recovered: true, recoveredItemId: itemId },
     });
+    this.writeLog?.("warn", "download", "Recovered recording had no library record; rebuilt its owner from the sidecar", { itemId, performer: performer.name, source: domain });
+    return item;
   }
 
   /**
@@ -1693,6 +1745,18 @@ export class DownloadQueue {
     // it is the whole point, so report it and let the operator decide.
     this.writeLog?.("warn", "download", "Recovery folder still holds earlier captures; they were kept", { itemId, leftovers });
     return leftovers;
+  }
+
+  /**
+   * A hard delete takes the item row with it. When a salvage folder is still sitting there, say so:
+   * the footage now has no owner, and only an explicit Recovery action (archive, or delete) can
+   * settle it. Silence here is what leaves an operator with a full recovery folder and no idea why.
+   */
+  private noteOrphanedRecovery(itemId: string) {
+    try {
+      const entries = fs.readdirSync(path.join(this.recoveryRoot, safeSegment(itemId)));
+      if (entries.length) this.writeLog?.("warn", "download", "Item deleted while a recovery folder still holds captures; they stay in Recovery until archived or deleted", { itemId, entries });
+    } catch { /* no recovery folder for this item */ }
   }
 
   /** Explicit, user-initiated removal (the delete action). Logs what disappears — never silent. */
