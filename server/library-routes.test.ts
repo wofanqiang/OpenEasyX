@@ -65,3 +65,37 @@ describe("media thumbnails", () => {
     db.close();
   });
 });
+
+describe("media deletion while a merge is running", () => {
+  it("refuses to delete a video a running merge is still streaming from", async () => {
+    const { data, media, db } = libraryFixture();
+    fs.writeFileSync(path.join(media, "Example Performer", "example.com", "clip.mp4"), "video");
+    await new Catalog(db, media, data, false).scan();
+    const item = db.listMedia().items[0];
+
+    let deletions = 0;
+    const catalog = { deleteMedia: () => { deletions += 1; return { bytes: 6 }; } } as unknown as Catalog;
+    const downloadDb = { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3];
+    // The Library page stays clickable while a merge runs, so Delete has to know what the job holds.
+    const merging: string[] = [item.id];
+    const app = Fastify();
+    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => merging);
+
+    const refused = await app.inject({ method: "POST", url: "/api/media/delete", payload: { ids: [item.id] } });
+    expect(refused.statusCode).toBe(200);
+    expect(refused.json().deleted).toEqual([]);
+    expect(refused.json().failed[0].error).toContain("merge");
+    expect(deletions).toBe(0);
+    // Nothing was unlinked, so the item is still exactly where it was.
+    expect(db.getMedia(item.id)).toBeDefined();
+
+    // The refusal ends when the job does: the same request then goes through.
+    merging.length = 0;
+    const allowed = await app.inject({ method: "POST", url: "/api/media/delete", payload: { ids: [item.id] } });
+    expect(allowed.json().deleted).toHaveLength(1);
+    expect(deletions).toBe(1);
+
+    await app.close();
+    db.close();
+  });
+});

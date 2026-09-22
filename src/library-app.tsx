@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Aperture, BarChart3, ChevronLeft, ChevronRight, Clock3, Eye, Film, FolderSearch2, HardDrive, Heart, History, Image as ImageIcon,
-  Library as LibraryIcon, ListChecks, LoaderCircle, Play, Search, SlidersHorizontal, Sparkles,
+  Layers, Library as LibraryIcon, ListChecks, LoaderCircle, Play, Search, SlidersHorizontal, Sparkles,
   Radio, Settings as SettingsIcon, Square, CheckSquare, Trash2, UserRound, Users, X,
 } from "lucide-react";
 import { api } from "./api";
@@ -35,6 +35,9 @@ type Page = "home" | "live-cam" | "library" | "performers" | "favorites" | "hist
 type OpenMedia = (media: Media, context?: PlaybackContext) => void;
 type DeletionResult = { deleted: Array<{ id: string; bytes: number; downloaderTracked: boolean }>; failed: Array<{ id: string; error: string }> };
 type DeleteMedia = (ids: string[]) => Promise<DeletionResult>;
+/** Submits a merge as a background job; the Activity page is where its progress lives. */
+type MergeMedia = (ids: string[], removeSources: boolean) => Promise<{ taskId: string }>;
+type MergeTask = { status: string; error?: string; result?: Record<string, unknown> };
 type Selection = { media: Media; context: PlaybackContext; autoStart: boolean };
 type LocationState = { pathname: string; search: string; state: EasyXLocationState | null };
 
@@ -139,6 +142,9 @@ export function LibraryApp() {
   const [selected, setSelected] = useState<Selection | null>(null);
   const [notice, setNotice] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
+  /** Media ids a running merge is streaming from. Deleting one would fail the join halfway and
+   *  merging it again would duplicate the work, so those controls stay locked until the job ends. */
+  const [mergeLocks, setMergeLocks] = useState<Set<string>>(() => new Set());
   const routeMedia = mediaRoute(location.pathname);
   const routeLiveCam = liveCamRoute(location.pathname);
   const page = routeMedia ? pageFromPath(location.state?.easyx?.from?.split("?")[0] ?? "/library") : pageFromPath(location.pathname);
@@ -219,6 +225,46 @@ export function LibraryApp() {
     }
   };
 
+  /**
+   * Follow a submitted merge to its end so the library and the dashboard show the new file the
+   * moment it exists. The progress itself lives on the Activity page (the job is server-side), so
+   * this polls quietly and reports only the outcome. A 404 means the job's record already expired,
+   * which is the normal end of a fast merge.
+   */
+  const watchMerge = async (taskId: string) => {
+    for (let attempt = 0; attempt < 900; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      let task: MergeTask;
+      try { ({ task } = await api<{ task: MergeTask }>(`/api/tasks/${taskId}`)); }
+      catch (error) {
+        // An expired record means the job finished faster than the first poll: the merged file is
+        // already in the library, so there is no outcome left to announce. Anything else is a blip
+        // worth another look.
+        if (error instanceof Error && /not found/i.test(error.message)) { setMergeLocks(new Set()); await refresh(); return; }
+        continue;
+      }
+      if (task.status === "running" || task.status === "queued") continue;
+      setMergeLocks(new Set());
+      if (task.status === "done") {
+        const target = String(task.result?.targetName ?? "the merged file");
+        const removed = Number(task.result?.removed ?? 0);
+        const kept = Number(task.result?.removeFailed ?? 0);
+        setNotice(`Merge finished — ${target} is in your library${removed ? ` · ${removed} source${removed === 1 ? "" : "s"} removed` : ""}${kept ? ` · ${kept} source${kept === 1 ? "" : "s"} could not be removed` : ""}`);
+        setRefreshToken((token) => token + 1);
+      } else if (task.status === "failed") setNotice(`Merge failed — ${task.error ?? "unknown error"}`);
+      else setNotice("Merge cancelled.");
+      await refresh();
+      return;
+    }
+  };
+  const mergeMedia: MergeMedia = async (ids, removeSources) => {
+    const result = await api<{ taskId: string }>("/api/media/merge", { method: "POST", body: JSON.stringify({ ids, removeSources }) });
+    setMergeLocks(new Set(ids));
+    setNotice(`Merging ${ids.length} videos in the background — follow the progress on the Activity page.`);
+    void watchMerge(result.taskId);
+    return result;
+  };
+
   useEffect(() => {
     if (!routeMedia) { setSelected(null); return; }
     if (selected?.media.id === routeMedia.id) return;
@@ -236,10 +282,10 @@ export function LibraryApp() {
       {routeMedia ? selected ? <PlayerViewer media={selected.media} context={selected.context} autoStart={selected.autoStart} close={() => { const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); void refresh(); }} favorite={updateFavorite} advance={(media) => { const from = location.state?.easyx?.from ?? "/library"; setSelected({ media, context: selected.context, autoStart: true }); navigate(mediaUrl(media), { state: playbackLocationState(from, selected.context, true) }); }} setNotice={setNotice}/> : <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : routeLiveCam ? <LiveCamViewer providerId={routeLiveCam.providerId} camId={routeLiveCam.camId} close={() => navigate(location.state?.easyx?.from ?? "/live-cam", { replace: true })}/> : <div className="content">
         {page === "home" && <Home dashboard={dashboard} open={openMedia} go={go} favorite={updateFavorite}/>}
         {page === "live-cam" && <LiveCamPage preset={liveCamPreset} open={openLiveCam} route={(preset) => navigate(liveCamListUrl(preset), { replace: true })}/>}
-        {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("library", preset), { replace: true })} refreshToken={refreshToken}/>}
+        {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("library", preset), { replace: true })} refreshToken={refreshToken}/>}
         {page === "performers" && <Performers performers={performers} go={go} query={routePreset.query ?? ""} route={(query) => navigate(pageUrl("performers", { query }), { replace: true })}/>}
-        {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })} refreshToken={refreshToken}/>}
-        {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} route={(preset) => navigate(pageUrl("history", preset), { replace: true })} refreshToken={refreshToken}/>}
+        {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })} refreshToken={refreshToken}/>}
+        {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("history", preset), { replace: true })} refreshToken={refreshToken}/>}
         {page === "statistics" && <Statistics stats={dashboard.stats}/>}
         {page === "settings" && <SettingsPage setNotice={setNotice}/>}
       </div>}
@@ -315,7 +361,7 @@ function Shelf({ title, subtitle, items, open, favorite, all }: { title: string;
   return <section className="shelf"><div className="section-head"><div><h2>{title}</h2><p>{subtitle}</p></div><button onClick={all}>View all</button></div><div className="media-row">{items.map((media) => <MediaCard key={media.id} media={media} open={(item) => open(item, { ids: items.map((entry) => entry.id) })} favorite={favorite}/>)}</div></section>;
 }
 
-function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open, favorite, remove, route, refreshToken = 0 }: { preset?: LibraryPreset; favoriteOnly?: boolean; historyOnly?: boolean; open: OpenMedia; favorite: (media: Media, value: boolean) => void; remove: DeleteMedia; route: (preset: LibraryPreset) => void; refreshToken?: number }) {
+function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open, favorite, remove, merge, mergeLocks, route, refreshToken = 0 }: { preset?: LibraryPreset; favoriteOnly?: boolean; historyOnly?: boolean; open: OpenMedia; favorite: (media: Media, value: boolean) => void; remove: DeleteMedia; merge: MergeMedia; mergeLocks: Set<string>; route: (preset: LibraryPreset) => void; refreshToken?: number }) {
   const [query, setQuery] = useState(preset.query ?? "");
   const [kind, setKind] = useState(preset.kind ?? "");
   const [performer, setPerformer] = useState(preset.performer ?? "");
@@ -326,6 +372,7 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
   const [result, setResult] = useState<LibraryResult | null>(null);
   const [page, setPage] = useState(preset.page ?? 1); const [loading, setLoading] = useState(true);
   const [selectionMode, setSelectionMode] = useState(false); const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set()); const [deleting, setDeleting] = useState(false);
+  const [mergeOpen, setMergeOpen] = useState(false); const [merging, setMerging] = useState(false);
   const params = useMemo(() => new URLSearchParams({
     q: query, kind, performer, source, watched, sort, page: String(page), pageSize: "48",
     favorite: favoriteOnly ? "true" : "", history: historyOnly ? "true" : "",
@@ -376,7 +423,21 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
     } catch { /* The app-level notice reports request failures. */ }
     finally { setDeleting(false); }
   };
-  return <section className="library-page"><div className="library-intro"><div><p>COLLECTION</p><h2>{title}</h2><span>{result?.total ?? 0} matching items</span></div><div className="selection-actions">{selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectPage}>{result?.items.every((item) => selectedIds.has(item.id)) ? "Clear page" : "Select page"}</button><button className="delete-selection" disabled={!selectedIds.size || deleting} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!result?.items.length} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}</div></div>
+  // Only videos can be concatenated, so the merge works off the selected video subset while Delete
+  // keeps meaning "everything selected". Two videos is the minimum that can be joined into one, and
+  // a video a running merge is already streaming from is held out of both: deleting it would fail
+  // that join halfway, and merging it again would duplicate the work.
+  const selectedVideos = (result?.items ?? []).filter((item) => selectedIds.has(item.id) && item.kind === "video" && !mergeLocks.has(item.id));
+  const lockedSelection = [...selectedIds].some((id) => mergeLocks.has(id));
+  const submitMerge = async (removeSources: boolean) => {
+    setMerging(true);
+    try {
+      await merge(selectedVideos.map((item) => item.id), removeSources);
+      setMergeOpen(false); setSelectionMode(false); setSelectedIds(new Set());
+    } catch { /* the app-level notice reports the failure; the dialog and the selection stay put */ }
+    finally { setMerging(false); }
+  };
+  return <section className="library-page"><div className="library-intro"><div><p>COLLECTION</p><h2>{title}</h2><span>{result?.total ?? 0} matching items</span></div><div className="selection-actions">{selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectPage}>{result?.items.every((item) => selectedIds.has(item.id)) ? "Clear page" : "Select page"}</button><button className="merge-selection" disabled={selectedVideos.length < 2 || deleting || merging} title={selectedVideos.length < 2 ? "Select at least two videos to merge" : `Merge ${selectedVideos.length} videos into one file`} onClick={() => setMergeOpen(true)}><Layers/>Merge{selectedVideos.length >= 2 ? ` (${selectedVideos.length})` : ""}</button><button className="delete-selection" disabled={!selectedIds.size || deleting || lockedSelection} title={lockedSelection ? "A merge is still running over one of these files — wait for it to finish" : undefined} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!result?.items.length} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}</div></div>
     <div className="filters">
       <label><Search/><input value={query} onChange={(event) => resetPage(setQuery, event.target.value)} placeholder="Search titles, performers, or sources…"/></label>
       <div className="filter-buttons"><button className={!kind ? "active" : ""} onClick={() => resetPage(setKind, "")}>All</button><button className={kind === "video" ? "active" : ""} onClick={() => resetPage(setKind, "video")}><Film/>Videos</button><button className={kind === "image" ? "active" : ""} onClick={() => resetPage(setKind, "image")}><ImageIcon/>Photos</button></div>
@@ -390,7 +451,38 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
     </div>
     {loading ? <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : result?.items.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{result.items.map((media) => <MediaCard key={media.id} media={media} open={(item) => open(item, { query: playlistQuery })} favorite={favorite} selectionMode={selectionMode} selected={selectedIds.has(media.id)} toggleSelected={toggleSelected}/>)}</div> : <div className="empty-state"><FolderSearch2/><h3>No media found</h3><p>Try another filter or scan the mounted media folder.</p></div>}
     {result && result.pages > 1 && <div className="pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {result.pages}</span><button disabled={page >= result.pages} onClick={() => setPage(page + 1)}>Next</button></div>}
+    {mergeOpen && <MergeDialog items={selectedVideos} busy={merging} close={() => setMergeOpen(false)} submit={submitMerge}/>}
   </section>;
+}
+
+/** h:mm:ss / m:ss. Merge totals are exact clip lengths, so a whole-minute label would lie. */
+function clockDuration(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds || 0));
+  const hours = Math.floor(whole / 3600); const minutes = Math.floor((whole % 3600) / 60);
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}` : `${minutes}:${String(whole % 60).padStart(2, "0")}`;
+}
+
+/**
+ * The merge confirmation. It shows the order that will be used (the library orders by ingest time,
+ * so the operator can see what comes first), the total runtime, the exact target file name, and the
+ * one irreversible choice: whether the originals go once the merged copy is safely in the library.
+ */
+function MergeDialog({ items, busy, close, submit }: { items: Media[]; busy: boolean; close: () => void; submit: (removeSources: boolean) => Promise<void> }) {
+  const [removeSources, setRemoveSources] = useState(false);
+  const ordered = [...items].sort((left, right) => (Date.parse(left.addedAt ?? "") || 0) - (Date.parse(right.addedAt ?? "") || 0) || left.relativePath.localeCompare(right.relativePath));
+  const totalSeconds = ordered.reduce((sum, item) => sum + (Number(item.duration) || 0), 0);
+  const first = ordered[0];
+  const extension = first ? first.relativePath.slice(first.relativePath.lastIndexOf(".")) || ".mp4" : ".mp4";
+  const stem = first ? first.relativePath.slice(first.relativePath.lastIndexOf("/") + 1).replace(/\.[^.]+$/, "") : "merged";
+  return <div className="modal-backdrop elevated" onMouseDown={(event) => event.target === event.currentTarget && !busy && close()}><div className="modal merge-modal">
+    <div className="modal-head"><div><p>MERGE VIDEOS</p><h2>Join {ordered.length} videos into one</h2></div><button className="icon-button" aria-label="Close" disabled={busy} onClick={close}><X/></button></div>
+    <div className="form-stack">
+      <ol className="merge-order">{ordered.map((item, index) => <li key={item.id}><span>{index + 1}</span><div><strong>{item.title || item.relativePath}</strong><small>{item.performer}{item.duration ? ` · ${clockDuration(item.duration)}` : ""}</small></div></li>)}</ol>
+      <p className="merge-summary">Total <strong>{clockDuration(totalSeconds)}</strong>. Written next to the first video as <code>{stem}_merged{extension}</code>. The join is a stream copy: nothing is re-encoded and no audio or video is re-timed.</p>
+      <label className="toggle-row"><span><b>Delete the originals after merging</b><small>Off by default. They are removed only once the merged file is on disk and in your library.</small></span><input type="checkbox" checked={removeSources} onChange={(event) => setRemoveSources(event.target.checked)}/></label>
+    </div>
+    <div className="modal-actions"><button className="secondary" disabled={busy} onClick={close}>Cancel</button><button className="primary" disabled={busy} onClick={() => void submit(removeSources)}>{busy ? <LoaderCircle className="spin"/> : <Layers/>}Start merge</button></div>
+  </div></div>;
 }
 
 function Performers({ performers, go, query, route }: { performers: Performer[]; go: (page: Page, preset?: LibraryPreset) => void; query: string; route: (query: string) => void }) {

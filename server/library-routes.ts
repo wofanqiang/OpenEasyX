@@ -47,7 +47,7 @@ export function parseMediaRange(value: string, size: number): { start: number; e
   return { start, end: Math.min(requestedEnd, size - 1) };
 }
 
-export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, libraryDb: LibraryDatabase, catalog: Catalog, downloadDb: Database, dataDir: string) {
+export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, libraryDb: LibraryDatabase, catalog: Catalog, downloadDb: Database, dataDir: string, mergingIds: () => string[] = () => []) {
   const requiredMedia = (id: string) => {
     const media = libraryDb.getMedia(id);
     if (!media) throw Object.assign(new Error("Media not found"), { statusCode: 404 });
@@ -126,7 +126,12 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
     const ids = request.body?.ids;
     if (!Array.isArray(ids) || ids.length < 1 || ids.length > 100 || ids.some((id) => typeof id !== "string" || !/^[a-f0-9]{24}$/.test(id))) throw Object.assign(new Error("ids must contain between 1 and 100 media IDs"), { statusCode: 400 });
     const deleted: Array<{ id: string; bytes: number; downloaderTracked: boolean }> = []; const failed: Array<{ id: string; error: string }> = [];
+    // A merge streams its sources for minutes while the Library page stays fully clickable, so
+    // deleting one out from under it would fail the concat halfway through. Refuse instead, and let
+    // the job finish first.
+    const merging = new Set(mergingIds());
     for (const id of [...new Set(ids as string[])]) {
+      if (merging.has(id)) { failed.push({ id, error: "This video is part of a merge that is still running — wait for it to finish" }); continue; }
       try {
         const media = requiredMedia(id); const result = catalog.deleteMedia(media); const tracked = Boolean(downloadDb.markStoredItemDeleted(media.relativePath));
         deleted.push({ id, bytes: result.bytes, downloaderTracked: tracked });

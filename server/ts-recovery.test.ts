@@ -6,6 +6,7 @@ import path from "node:path";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
 import { DownloadQueue } from "./downloader.js";
+import { TaskRegistry, type TaskSnapshot } from "./tasks.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -60,6 +61,17 @@ async function harness() {
     return created;
   };
   return { db, queue, mediaDir, item, captureDir: (id: string) => path.join(mediaDir, ".downloads", id), recoveryDir: (id: string) => path.join(mediaDir, ".recording-recovery", id) };
+}
+
+/** Polls the registry until the job leaves the queued/running pair, the way the Activity page does. */
+async function settle(registry: TaskRegistry, taskId: string): Promise<TaskSnapshot> {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    const task = registry.get(taskId);
+    if (!task) throw new Error(`task ${taskId} vanished`);
+    if (task.status !== "queued" && task.status !== "running") return task;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`task ${taskId} never settled`);
 }
 
 describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
@@ -361,5 +373,57 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     // library entry pointing at a file that never arrived; the footage stays where it can be seen.
     expect(env.db.listItems().some((entry) => entry.externalId === `recovered:${rescued.id}`)).toBe(false);
     expect(fs.existsSync(path.join(env.recoveryDir(rescued.id), "recovered.mp4"))).toBe(true);
+  });
+
+  it("runs the sweep as a background task whose progress climbs to its total", async () => {
+    const env = await harness();
+    const first = env.item("sweep-one"); const second = env.item("sweep-two");
+    writePlayableCapture(path.join(env.captureDir(first.id), "capture.ts"));
+    writePlayableCapture(path.join(env.captureDir(second.id), "capture.ts"));
+    const registry = new TaskRegistry();
+
+    const started = env.queue.startRecovery(registry);
+    // The request answers with an id at once: the sweep has registered, not finished. That is the
+    // whole point of the rewrite -- the Recovery page no longer holds an HTTP request open.
+    expect(started.taskId).toBeTruthy();
+    expect(started.reused).toBeUndefined();
+    expect(["queued", "running"]).toContain(registry.get(started.taskId)!.status);
+
+    const settled = await settle(registry, started.taskId);
+    expect(settled.kind).toBe("recover");
+    expect(settled.status).toBe("done");
+    expect(settled.total).toBe(2);
+    expect(settled.done).toBe(2);
+    // A sweep reports per-item progress, so it ends measured: the Activity row can retire its bar.
+    expect(settled.progress).toBe(1);
+    // `detail` is only ever set by the item-level progress callback, so a folder name here proves the
+    // sweep's per-item updates reached the record rather than only its summary.
+    expect([first.id, second.id]).toContain(settled.detail);
+    expect(settled.result).toMatchObject({ scanned: 2, rescued: 2, failed: 0, leftover: 0 });
+    expect(fs.existsSync(path.join(env.recoveryDir(first.id), "recovered.mp4"))).toBe(true);
+    expect(fs.existsSync(path.join(env.recoveryDir(second.id), "recovered.mp4"))).toBe(true);
+  });
+
+  it("joins a sweep that is already running instead of starting a rival over the same folders", async () => {
+    const env = await harness();
+    const item = env.item("sweep-exclusive");
+    writePlayableCapture(path.join(env.captureDir(item.id), "capture.ts"));
+    const registry = new TaskRegistry();
+
+    const first = env.queue.startRecovery(registry);
+    const second = env.queue.startRecovery(registry);
+    // The registry is checked and populated in a single tick, so a double click can only ever see the
+    // first job. Two overlapping sweeps would remux the same bytes and race each other's cleanup.
+    expect(second.taskId).toBe(first.taskId);
+    expect(second.reused).toBe(true);
+    expect(registry.list()).toHaveLength(1);
+
+    await settle(registry, first.taskId);
+    // Once the sweep is terminal a fresh run is allowed again.
+    const third = env.queue.startRecovery(registry);
+    expect(third.taskId).not.toBe(first.taskId);
+    expect(third.reused).toBeUndefined();
+    await settle(registry, third.taskId);
+    expect(registry.list()).toHaveLength(2);
   });
 });

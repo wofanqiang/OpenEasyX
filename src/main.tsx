@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { Activity, Box, Captions, Check, ChevronLeft, ChevronRight, CircleAlert, ClipboardPaste, CloudDownload, Database, Download, ExternalLink, FolderOpen, Gauge, Globe2, HardDrive, LayoutDashboard, LifeBuoy, Link2, LoaderCircle, PackagePlus, Pause, Pencil, Play, Plug, Plus, RefreshCw, Search, Settings, ShieldCheck, Sparkles, Square, Terminal, Trash2, UserRound, Users, X } from "lucide-react";
 import { api } from "./api.js";
-import { activitySourceDomains, confirmItemDeletion, downloadTime } from "./activity.js";
+import { activitySourceDomains, confirmItemDeletion, downloadTime, formatElapsed } from "./activity.js";
 import { pluginFaviconUrl } from "./plugin-icon.js";
 import { canonicalEntryPath, pageFromPath, pagePath, type PageKey } from "./routes.js";
 import { LogsPage } from "./logs.js";
@@ -337,8 +337,59 @@ function DeletePerformer({ performer, fileCount, close, deleted, run }: { perfor
   return <div className="modal-backdrop elevated"><div className="modal delete-modal"><span className="delete-icon"><Trash2/></span><h2>Delete {performer.name}?</h2><p>Choose exactly what EasyX should remove. Plugin URLs, provider references, and download history are removed with the local performer record in both cases. Media files are deleted by default — pick “Delete performer only” if you want to keep them on disk.</p><div className="delete-choices"><button className="danger-choice" onClick={() => remove(true)}><Trash2/><span><strong>Delete performer and files</strong><small>Default. Permanently remove the performer folder and {fileCount} tracked file{fileCount === 1 ? "" : "s"} from disk.</small></span></button><button className="secondary" onClick={() => remove(false)}><Database/><span><strong>Delete performer only</strong><small>Keep every media file and folder on disk.</small></span></button></div><button className="text-button wide" onClick={close}>Cancel</button></div></div>;
 }
 
+/** A background job (Library merge, Recovery sweep) as `/api/tasks` reports it. */
+type PipelineTask = {
+  id: string; kind: "merge" | "recover"; status: string; phase: string; label: string; detail: string;
+  progress: number | null; done: number; total: number; createdAt: number; finishedAt?: number;
+  error?: string; result?: Record<string, unknown>;
+};
+
+/** The existing badge styles already cover these states; a running job reads as a download. */
+const taskBadge = (status: string) => status === "running" ? "downloading" : status === "done" ? "completed" : status === "failed" ? "failed" : status === "cancelled" ? "cancelled" : "queued";
+
+function taskOutcome(task: PipelineTask): string {
+  if (task.status === "cancelled") return "Cancelled";
+  if (task.status !== "done") return "";
+  const result = task.result ?? {};
+  if (task.kind === "merge") {
+    const removed = Number(result.removed ?? 0);
+    const failed = Number(result.removeFailed ?? 0);
+    return `${Number(result.sources ?? 0)} videos → 1 file${removed ? ` · ${removed} source${removed === 1 ? "" : "s"} removed` : ""}${failed ? ` · ${failed} kept` : ""}`;
+  }
+  const rescued = Number(result.rescued ?? 0); const deleted = Number(result.deleted ?? 0); const failed = Number(result.failed ?? 0);
+  return `${rescued} rescued · ${deleted} cleaned${failed ? ` · ${failed} failed` : ""}`;
+}
+
+/**
+ * A merge or recovery job, rendered with the same column layout as a download row so the pipeline
+ * reads as one list. It carries the progress bar the recordings already use; `progress === null`
+ * means the current phase has no measurable end (indexing a scan), which the indeterminate style
+ * already expresses.
+ */
+function PipelineTaskRow({ task, clock, cancel }: { task: PipelineTask; clock: number; cancel: (task: PipelineTask) => void }) {
+  const percent = task.progress === null ? 0 : Math.max(0, Math.min(100, Math.round(task.progress * 100)));
+  const active = task.status === "running" || task.status === "queued";
+  return <div className="table-row task-row">
+    <div><strong>{task.label}</strong><small className="task-kind">{task.kind === "merge" ? "Library merge" : "Recovery sweep"}</small>{task.detail && <small className="output-path" title={task.detail}>{task.detail}</small>}</div>
+    <span className="activity-source"><span>{task.kind === "merge" ? "Media library" : "Residual captures"}</span><small>background job</small></span>
+    <span className="capitalize">{task.kind}</span>
+    <span className="activity-status">
+      <span className={`badge ${taskBadge(task.status)}`}>{task.status === "running" ? task.phase : task.status}</span>
+      {active && <span className="progress-wrap">
+        <span className={`download-progress ${task.progress === null ? "indeterminate" : ""}`} role="progressbar" aria-label={`${task.label} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={task.progress === null ? undefined : percent}><i style={task.progress === null ? undefined : { width: `${percent}%` }}/></span>
+        <small>{task.total ? `${task.done}/${task.total}${task.progress === null ? "" : ` · ${percent}%`}` : "Starting…"}</small>
+      </span>}
+      {task.status === "failed" && task.error && <small className="task-error">{task.error}</small>}
+    </span>
+    <span className="download-time">{formatElapsed(clock - task.createdAt)}</span>
+    <span>{timeAgo(new Date(task.finishedAt ?? task.createdAt).toISOString())}</span>
+    <span className="activity-actions">{active ? <button className="icon-button danger" title="Cancel this job" aria-label={`Cancel ${task.label}`} onClick={() => cancel(task)}><X size={15}/></button> : <span className="task-outcome">{taskOutcome(task)}</span>}</span>
+  </div>;
+}
+
 function ActivityPage({ performers, sources, run }: { performers: Performer[]; sources: Source[]; run: (op: () => Promise<unknown>, msg: string | ((result: unknown) => string)) => Promise<void> }) {
   const [data, setData] = useState<ActivityData | null>(null);
+  const [tasks, setTasks] = useState<PipelineTask[]>([]);
   const [category, setCategory] = useState("all"); const [status, setStatus] = useState(""); const [mediaType, setMediaType] = useState("");
   const [performerId, setPerformerId] = useState(""); const [sourceDomain, setSourceDomain] = useState(""); const [search, setSearch] = useState(() => new URLSearchParams(window.location.search).get("search") ?? "");
   const [page, setPage] = useState(1); const [pageSize, setPageSize] = useState(50); const [clock, setClock] = useState(Date.now());
@@ -353,6 +404,12 @@ function ActivityPage({ performers, sources, run }: { performers: Performer[]; s
   }, [category, status, mediaType, performerId, sourceDomain, search, page, pageSize]);
   useEffect(() => { setLoading(true); void loadActivity(); const timer = window.setInterval(() => void loadActivity(), 1_500); return () => window.clearInterval(timer); }, [loadActivity]);
   useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
+  // Background jobs (Library merge, Recovery sweep) run server-side on their own schedule; this
+  // page only mirrors them beside the download rows. A failure here must not disturb the item list.
+  const loadTasks = useCallback(async () => {
+    try { setTasks((await api<{ tasks: PipelineTask[] }>("/api/tasks")).tasks); } catch { /* the item poll already reports errors */ }
+  }, []);
+  useEffect(() => { void loadTasks(); const timer = window.setInterval(() => void loadTasks(), 1_500); return () => window.clearInterval(timer); }, [loadTasks]);
   const changeFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(1); };
   const counts = data?.statusCounts ?? {}; const totalTracked = Object.values(counts).reduce((sum, count) => sum + count, 0); const failedCount = counts.failed ?? 0;
   const categories = [
@@ -362,6 +419,10 @@ function ActivityPage({ performers, sources, run }: { performers: Performer[]; s
   const sourceDomains = useMemo(() => activitySourceDomains(sources), [sources]);
   const resetFilters = () => { setCategory("all"); setStatus(""); setMediaType(""); setPerformerId(""); setSourceDomain(""); setSearch(""); setPage(1); };
   const retryAll = async () => { await run(() => api("/api/items/retry-failed", { method: "POST" }), `${failedCount} failed download${failedCount === 1 ? "" : "s"} queued again`); setPage(1); await loadActivity(); };
+  const cancelTask = async (task: PipelineTask) => {
+    await run(() => api(`/api/tasks/${task.id}/cancel`, { method: "POST" }), `${task.label} cancelled`);
+    await loadTasks();
+  };
   const itemAction = async (item: Item, action: "pause" | "resume" | "stop" | "cancel" | "delete") => {
     if (action === "delete" && !confirmItemDeletion(item.status, (message) => window.confirm(message))) return;
     const effectiveAction = action === "resume" && ["available", "failed"].includes(item.status) ? "queue" : action;
@@ -382,8 +443,8 @@ function ActivityPage({ performers, sources, run }: { performers: Performer[]; s
       <button className="text-button" onClick={resetFilters}>Clear filters</button>
     </div>
     {loadError && <div className="activity-load-error"><CircleAlert size={15}/>{loadError}</div>}
-    {loading && !data ? <div className="activity-loading"><LoaderCircle className="spin"/>Loading activity…</div> : data?.items.length ? <>
-      <div className="activity-table"><div className="table-head"><span>Item &amp; output</span><span>Source</span><span>Type</span><span>Status &amp; progress</span><span>Download time</span><span>Updated</span><span>Controls</span></div>{data.items.map((item) => { const source = sources.find((entry) => entry.id === item.sourceId); const performer = performers.find((p) => p.id === item.performerId); const percent = Math.max(0, Math.min(100, Math.round(item.progress * 100))); const downloadedBytes = Number(item.downloadedBytes ?? 0); return <div className="table-row" key={item.id}><div><strong>{item.title || item.id}</strong><small>{performer?.name}</small>{item.outputPath && <small className="output-path" title={item.outputPath}><FolderOpen size={11}/>{item.outputPath}</small>}</div><span className="activity-source"><span>{source?.label || source?.domain || "Unknown source"}</span>{source?.domain && source.label !== source.domain && <small>{source.domain}</small>}</span><span className="capitalize">{item.mediaType}</span><span className="activity-status"><span className={`badge ${item.status}`}>{item.status}</span>{["downloading", "paused", "stopping", "cancelling"].includes(item.status) && <span className="progress-wrap"><span className={`download-progress ${percent === 0 && item.status === "downloading" ? "indeterminate" : ""}`} role="progressbar" aria-label={`Download progress for ${item.title || item.id}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent || undefined}><i style={percent ? { width: `${percent}%` } : undefined}/></span><small>{item.status === "paused" ? "Paused" : percent ? downloadedBytes ? `${percent}% · ${formatBytes(downloadedBytes)}` : `Preparing · ${percent}%` : downloadedBytes ? formatBytes(downloadedBytes) : "Preparing extractor…"}</small></span>}</span><span className="download-time">{downloadTime(item, clock)}</span><span>{timeAgo(item.updatedAt)}</span><span className="activity-actions">{["available", "failed"].includes(item.status) && <button className="icon-button" title={item.status === "failed" ? "Retry download" : "Queue download"} onClick={() => void itemAction(item, "resume").catch(async () => { await run(() => api(`/api/items/${item.id}/queue`, { method: "POST" }), "Download queued"); await loadActivity(); })}><Download size={16}/></button>}{item.status === "failed" && <button className="danger-soft activity-delete-error" title="Delete error" aria-label={`Delete error for ${item.title || item.id}`} onClick={() => void itemAction(item, "delete")}><Trash2 size={14}/>Delete error</button>}{item.status === "downloading" && <button className="icon-button" title="Pause recording" onClick={() => void itemAction(item, "pause")}><Pause size={15}/></button>}{item.status === "paused" && <button className="icon-button" title="Resume recording" onClick={() => void itemAction(item, "resume")}><Play size={15}/></button>}{["downloading", "paused"].includes(item.status) && <button className="icon-button" title="Stop and save recording" onClick={() => void itemAction(item, "stop")}><Square size={14}/></button>}{["queued", "downloading", "paused"].includes(item.status) && <button className="icon-button" title="Cancel recording" onClick={() => void itemAction(item, "cancel")}><X size={15}/></button>}{["queued", "downloading", "paused", "cancelled"].includes(item.status) && <button className="icon-button danger" title="Delete item" onClick={() => void itemAction(item, "delete")}><Trash2 size={15}/></button>}{item.status === "completed" && <><a className="icon-button" title="Open in library" href={`/library?performer=${encodeURIComponent(performer?.name ?? "")}&kind=${item.mediaType === "video" ? "video" : "image"}`}><FolderOpen size={15}/></a><button className="icon-button danger" title="Delete completed recording" aria-label={`Delete completed recording ${item.title || item.id}`} onClick={() => void itemAction(item, "delete")}><Trash2 size={15}/></button></>}</span>{item.error && <p className="row-error">{item.error}</p>}</div>; })}</div>
+    {loading && !data ? <div className="activity-loading"><LoaderCircle className="spin"/>Loading activity…</div> : (data && (data.items.length || tasks.length)) ? <>
+      <div className="activity-table"><div className="table-head"><span>Item &amp; output</span><span>Source</span><span>Type</span><span>Status &amp; progress</span><span>Download time</span><span>Updated</span><span>Controls</span></div>{tasks.map((task) => <PipelineTaskRow key={task.id} task={task} clock={clock} cancel={(target) => void cancelTask(target)}/>)}{(data?.items ?? []).map((item) => { const source = sources.find((entry) => entry.id === item.sourceId); const performer = performers.find((p) => p.id === item.performerId); const percent = Math.max(0, Math.min(100, Math.round(item.progress * 100))); const downloadedBytes = Number(item.downloadedBytes ?? 0); return <div className="table-row" key={item.id}><div><strong>{item.title || item.id}</strong><small>{performer?.name}</small>{item.outputPath && <small className="output-path" title={item.outputPath}><FolderOpen size={11}/>{item.outputPath}</small>}</div><span className="activity-source"><span>{source?.label || source?.domain || "Unknown source"}</span>{source?.domain && source.label !== source.domain && <small>{source.domain}</small>}</span><span className="capitalize">{item.mediaType}</span><span className="activity-status"><span className={`badge ${item.status}`}>{item.status}</span>{["downloading", "paused", "stopping", "cancelling"].includes(item.status) && <span className="progress-wrap"><span className={`download-progress ${percent === 0 && item.status === "downloading" ? "indeterminate" : ""}`} role="progressbar" aria-label={`Download progress for ${item.title || item.id}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent || undefined}><i style={percent ? { width: `${percent}%` } : undefined}/></span><small>{item.status === "paused" ? "Paused" : percent ? downloadedBytes ? `${percent}% · ${formatBytes(downloadedBytes)}` : `Preparing · ${percent}%` : downloadedBytes ? formatBytes(downloadedBytes) : "Preparing extractor…"}</small></span>}</span><span className="download-time">{downloadTime(item, clock)}</span><span>{timeAgo(item.updatedAt)}</span><span className="activity-actions">{["available", "failed"].includes(item.status) && <button className="icon-button" title={item.status === "failed" ? "Retry download" : "Queue download"} onClick={() => void itemAction(item, "resume").catch(async () => { await run(() => api(`/api/items/${item.id}/queue`, { method: "POST" }), "Download queued"); await loadActivity(); })}><Download size={16}/></button>}{item.status === "failed" && <button className="danger-soft activity-delete-error" title="Delete error" aria-label={`Delete error for ${item.title || item.id}`} onClick={() => void itemAction(item, "delete")}><Trash2 size={14}/>Delete error</button>}{item.status === "downloading" && <button className="icon-button" title="Pause recording" onClick={() => void itemAction(item, "pause")}><Pause size={15}/></button>}{item.status === "paused" && <button className="icon-button" title="Resume recording" onClick={() => void itemAction(item, "resume")}><Play size={15}/></button>}{["downloading", "paused"].includes(item.status) && <button className="icon-button" title="Stop and save recording" onClick={() => void itemAction(item, "stop")}><Square size={14}/></button>}{["queued", "downloading", "paused"].includes(item.status) && <button className="icon-button" title="Cancel recording" onClick={() => void itemAction(item, "cancel")}><X size={15}/></button>}{["queued", "downloading", "paused", "cancelled"].includes(item.status) && <button className="icon-button danger" title="Delete item" onClick={() => void itemAction(item, "delete")}><Trash2 size={15}/></button>}{item.status === "completed" && <><a className="icon-button" title="Open in library" href={`/library?performer=${encodeURIComponent(performer?.name ?? "")}&kind=${item.mediaType === "video" ? "video" : "image"}`}><FolderOpen size={15}/></a><button className="icon-button danger" title="Delete completed recording" aria-label={`Delete completed recording ${item.title || item.id}`} onClick={() => void itemAction(item, "delete")}><Trash2 size={15}/></button></>}</span>{item.error && <p className="row-error">{item.error}</p>}</div>; })}</div>
       <div className="activity-pagination"><span>Showing <strong>{(data.page - 1) * data.pageSize + 1}–{Math.min(data.page * data.pageSize, data.total)}</strong> of <strong>{data.total}</strong></span><label>Per page <select value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value)); setPage(1); }}><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><div><button className="icon-button" aria-label="Previous page" disabled={data.page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}><ChevronLeft size={17}/></button><span>Page <strong>{data.page}</strong> / {data.totalPages}</span><button className="icon-button" aria-label="Next page" disabled={data.page >= data.totalPages} onClick={() => setPage((value) => value + 1)}><ChevronRight size={17}/></button></div></div>
     </> : <Empty icon={Activity} title={totalTracked ? "No items match these filters" : "No activity yet"} text={totalTracked ? "Change or clear the filters to see more items." : "Items discovered by source plugins will appear in this pipeline."}/>}
   </section>;

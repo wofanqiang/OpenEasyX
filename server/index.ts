@@ -27,6 +27,8 @@ import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
 import { retentionPlan } from "./retention.js";
 import { spliceLiveSessions } from "./live-sessions.js";
+import { startMerge } from "./media-merge.js";
+import { TaskRegistry } from "./tasks.js";
 import { runDiagnostics } from "./diagnostics.js";
 import { isLiveCandidate } from "../packages/live-capture.js";
 import { AuthService } from "./auth.js";
@@ -69,6 +71,9 @@ const queue = new DownloadQueue(
   // stops re-queueing a room whose provider page says it is offline.
   (item, message) => liveCams.reportLiveFailure(item, message),
 );
+// Long-running background jobs (Library merge, Recovery sweep) live in their own registry and are
+// surfaced to the Activity page by /api/tasks, rather than being faked as download items.
+const tasks = new TaskRegistry();
 const browserLogin = new BrowserLoginManager(dataDir);
 // The /browser proxy is deliberately outside the session gate (the hook above only
 // guards /api/), and x11vnc runs without a password, so enabling this exposes a remote
@@ -166,7 +171,7 @@ app.addHook("onRequest", (request, reply, done) => {
 });
 
 await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
-const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir);
+const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds());
 
 app.get("/api/health", async () => ({ ok: true, product: "Open EasyX", version: appVersion, plugins: plugins.list().length, library: libraryDb.stats().total, scan: catalog.status }));
 app.get("/api/version", async () => ({ version: appVersion }));
@@ -762,6 +767,19 @@ app.get<{ Querystring: Record<string, string | undefined> }>("/api/items", async
   return { ...result, items: result.items.map((item) => ({ ...item, outputPath: queue.outputPath(item.id) })) };
 });
 app.post("/api/items/retry-failed", async () => ({ queued: db.retryFailedItems() }));
+// Background jobs (Library merge, Recovery sweep). The Activity page polls these beside the
+// download rows, so long work never has to be held open inside a request.
+app.get("/api/tasks", async () => ({ tasks: tasks.list() }));
+app.get<{ Params: { id: string } }>("/api/tasks/:id", async (request) => {
+  const task = tasks.get(request.params.id);
+  if (!task) throw Object.assign(new Error("Task not found"), { statusCode: 404 });
+  return { task };
+});
+app.post<{ Params: { id: string } }>("/api/tasks/:id/cancel", async (request) => {
+  const task = tasks.cancel(request.params.id);
+  if (!task) throw Object.assign(new Error("Task not found"), { statusCode: 404 });
+  return { task };
+});
 app.post<{ Params: { id: string } }>("/api/items/:id/queue", async (request) => {
   const item = db.getItem(request.params.id);
   if (!item) throw Object.assign(new Error("Item not found"), { statusCode: 404 });
@@ -780,10 +798,34 @@ app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) =>
 });
 app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queue.delete(request.params.id));
 
-// Residual TS recovery (Recovery page under COLLECT).
+// Merge several library videos into one file. The work runs as a background job (see
+// server/media-merge.ts) so the request returns immediately; progress shows up on the Activity page
+// beside the recordings. Everything that can be checked without ffprobe still answers as a 400 here.
+app.post<{ Body: { ids?: unknown; removeSources?: unknown } }>("/api/media/merge", async (request) => {
+  const body = z.object({
+    ids: z.array(z.string().regex(/^[a-f0-9]{24}$/)).min(2).max(100),
+    removeSources: z.boolean().optional(),
+  }).parse(request.body);
+  return startMerge({
+    mediaRoot: mediaDir,
+    library: libraryDb,
+    scan: () => catalog.scan(),
+    tasks,
+    concat: (listPath, output, totalSeconds, totalBytes, onProgress, signal) =>
+      queue.mergeMediaFiles(listPath, output, totalSeconds, totalBytes, onProgress, signal),
+    removeSource: (media) => { const result = catalog.deleteMedia(media); db.markStoredItemDeleted(media.relativePath); return result; },
+    minFreeDiskGb: Number(db.getSettings().minFreeDiskGb),
+    log: (message, fields) => app.log.info({ scope: "media-merge", ...fields }, message),
+  }, { ids: body.ids, removeSources: body.removeSources });
+});
+
+// Residual TS recovery (Recovery page under COLLECT). A dry run still answers synchronously because
+// it writes nothing; the real sweep runs as a background job whose progress the Activity page
+// renders, so the request no longer stays open for minutes on a 1-core box.
 app.post("/api/maintenance/cleanup-residual-ts", async (request) => {
   const body = (request.body ?? {}) as { dryRun?: boolean; execute?: boolean };
-  return queue.recoverResidualTs({ dryRun: body.dryRun, execute: body.execute });
+  if (body.execute !== true) return queue.recoverResidualTs({ dryRun: body.dryRun });
+  return queue.startRecovery(tasks, { execute: true });
 });
 app.get("/api/recovery", async () => queue.listRecovered());
 app.post<{ Params: { id: string } }>("/api/recovery/:id/catalog", async (request) => queue.catalogRecovered(request.params.id));

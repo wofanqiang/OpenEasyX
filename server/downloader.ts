@@ -17,8 +17,16 @@ import type { LogLevel } from "./log-store.js";
 import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
 import { PostProcessGate } from "./postprocess-gate.js";
 import type { HlsProxy } from "./hls-proxy.js";
+import type { TaskRegistry } from "./tasks.js";
 
 type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean; lastOutput?: string };
+
+/** Item-level progress of a residual sweep, so the Activity page can show a real bar. */
+export type RecoveryProgress = { total: number; done: number; detail?: string };
+export type RecoveryReport = {
+  scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; superseded: number; dryRun: boolean;
+  items: Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" | "superseded" }>;
+};
 
 // Concurrency lives in two independent pools. Downloads keep their historical range so the
 // setting keeps meaning what it always meant; recordings get their own, larger one because a
@@ -337,6 +345,79 @@ export class DownloadQueue {
   concatFinishedFiles(listPath: string, output: string): Promise<void> {
     return this.postProcessGate.run("Session concat", () => this.runPostProcessCommand(
       "ffmpeg", concatCaptureArgs(listPath, output), path.dirname(output), { paused: false, live: false } as ActiveDownload));
+  }
+
+  /**
+   * Join finished library videos into `output`, reporting real progress (Library merge).
+   *
+   * Same contract as `concatFinishedFiles` -- one shared, load-gated post-process slot and the
+   * lowest CPU/I/O priority, because a merge is a full read and write of every input and a live
+   * capture that misses the HLS edge cannot be recovered. Two differences: `-progress pipe:1`
+   * turns ffmpeg's own timeline into a percentage for the Activity page, and the AbortSignal lets
+   * the operator cancel the job. Cancelling SIGKILLs ffmpeg and leaves the partial output to the
+   * caller, which is the one that knows whether it has already been published.
+   *
+   * A job cancelled while it is still queued behind the gate is dropped when it reaches the front
+   * (the gate has no abort path); nothing is spawned and nothing is written.
+   */
+  mergeMediaFiles(listPath: string, output: string, totalSeconds: number, totalBytes: number, onProgress: (fraction: number) => void, signal: AbortSignal): Promise<void> {
+    return this.postProcessGate.run("Media merge", async () => {
+      if (signal.aborted) throw new Error("Merge cancelled");
+      const lowPriority = await this.lowPrioritySupported();
+      const args = [
+        "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        // Machine-readable timeline on stdout; `-nostats` keeps the human progress line off stderr
+        // so the only thing parsed below is our own protocol.
+        "-progress", "pipe:1", "-nostats",
+        "-f", "concat", "-safe", "0", "-i", listPath,
+        "-c", "copy", output,
+      ];
+      // nice(1) and ionice(1) exec() into ffmpeg, so the PID we signal is still the child.
+      const command = lowPriority ? "nice" : "ffmpeg";
+      const spawnArgs = lowPriority ? ["-n", "19", "ionice", "-c", "3", "ffmpeg", ...args] : args;
+      const control: ActiveDownload = { paused: false, live: false };
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(command, spawnArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+        control.child = child;
+        let stderr = "";
+        let timeline = "";
+        let settled = false;
+        let stopped: string | undefined;
+        const stop = (reason: string) => { stopped = stopped ?? reason; this.signal(control, "SIGKILL"); };
+        const budgetMs = postProcessDeadlineMs(totalBytes);
+        const deadline = setTimeout(() => stop(`Merge timed out after ${Math.round(budgetMs / 1000)}s`), budgetMs);
+        deadline.unref();
+        const onAbort = () => stop("Merge cancelled");
+        signal.addEventListener("abort", onAbort, { once: true });
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadline);
+          signal.removeEventListener("abort", onAbort);
+          control.child = undefined;
+          if (error) reject(error); else resolve();
+        };
+        child.stdout?.on("data", (chunk: Buffer) => {
+          if (!(totalSeconds > 0)) return;
+          timeline = `${timeline}${chunk.toString("utf8")}`.slice(-2000);
+          // `out_time=HH:MM:SS.ffffff` is the one `-progress` field whose meaning has stayed put
+          // across releases (`out_time_ms` is microseconds despite the name), and matching over a
+          // rolling buffer survives a line split across two chunks.
+          const matches = [...timeline.matchAll(/^out_time=(\d+):(\d\d):(\d\d(?:\.\d+)?)$/gm)];
+          const last = matches.at(-1);
+          if (!last) return;
+          const seconds = Number(last[1]) * 3600 + Number(last[2]) * 60 + Number(last[3]);
+          if (Number.isFinite(seconds)) onProgress(Math.max(0, Math.min(1, seconds / totalSeconds)));
+        });
+        child.stderr?.on("data", (chunk: Buffer) => { stderr = `${stderr}${String(chunk)}`.slice(-4000); });
+        child.once("error", (error) => finish(error));
+        child.once("close", (code) => {
+          if (stopped) return finish(new Error(stopped));
+          if (code === 0) return finish();
+          finish(new Error(`ffmpeg exited with code ${code}: ${stderr.trim() || "no error output"}`));
+        });
+      });
+    });
   }
 
   outputPath(itemId: string) {
@@ -1465,141 +1546,189 @@ export class DownloadQueue {
   }
 
   /** Scan both the active download staging area and the recovery folder for leftover captures. */
-  async recoverResidualTs(options: { dryRun?: boolean; execute?: boolean } = {}): Promise<{
-    scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; superseded: number; dryRun: boolean;
-    items: Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" | "superseded" }>;
-  }> {
+  /** Scan both the active download staging area and the recovery folder for leftover captures. */
+  async recoverResidualTs(options: { dryRun?: boolean; execute?: boolean; progress?: (update: RecoveryProgress) => void; shouldStop?: () => boolean } = {}): Promise<RecoveryReport> {
     const dryRun = options.dryRun === true || options.execute !== true;
     const execute = options.execute === true;
-    const report = {
+    const report: RecoveryReport = {
       scanned: 0, rescued: 0, deleted: 0, skipped: 0, failed: 0, leftover: 0, superseded: 0, dryRun,
-      items: [] as Array<{ itemId: string; action: "rescued" | "deleted" | "skipped" | "failed" | "superseded" }>,
+      items: [],
     };
     const roots = [this.downloadsRoot, this.recoveryRoot];
     const ACTIVE = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
+    // Enumerate every candidate folder up front: the sweep then reports a real "3 / 12 done" bar
+    // to whoever is watching the Activity page, and it can be stopped between items without
+    // abandoning a rescue that is already mid-remux.
+    const work: Array<{ root: string; name: string }> = [];
     for (const root of roots) {
       if (!fs.existsSync(root)) continue;
       let names: string[] = [];
       try {
         names = fs.readdirSync(root).filter((name) => { try { return fs.statSync(path.join(root, name)).isDirectory(); } catch { return false; } });
       } catch { continue; }
-      for (const name of names) {
-        const itemId = name;
-        const stagingDir = path.join(root, name);
-        // A recovery folder that already holds a rescued MP4 is a finished rescue, not a residual
-        // capture -- but it is still examined, because a rescue can itself leave an MP4 nothing can
-        // open: given no usable input the muxer writes a header-only file that the Recovery page
-        // lists as rescuable while no player can start it. This pass is the only place such a file
-        // disappears on its own, without the operator hunting for the one entry that will not play.
-        const rescued = root === this.recoveryRoot ? path.join(stagingDir, "recovered.mp4") : undefined;
-        // Existence only: a zero-byte or non-file `recovered.mp4` is just as unwatchable as a
-        // corrupted one, and `listRecovered` hides it anyway, so it is judged rather than skipped.
-        if (rescued && fs.existsSync(rescued)) {
-          report.scanned++;
-          if (await this.isPlayableMedia(rescued)) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
-          if (!execute) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
-          else if (this.discardUnplayableRecovered(stagingDir)) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
-          else {
-            report.failed++; report.items.push({ itemId, action: "failed" });
-            this.writeLog?.("warn", "download", "Unplayable recovered recording could not be deleted", { itemId });
-          }
-          if (execute) this.writeLog?.("warn", "download", "Unplayable recovered recording is no longer playable and was removed; any raw parts beside it were kept", { itemId });
-          continue;
-        }
-        report.scanned++;
-        const item = this.db.getItem(itemId);
-        if (this.active.has(itemId) || (item && ACTIVE.has(item.status))) {
-          report.skipped++; report.items.push({ itemId, action: "skipped" }); continue;
-        }
-        // The item already has its finished file in the library, so `catalogRecovered` will always
-        // answer `already-completed` — nothing folded here could ever be filed. Remuxing gigabytes
-        // to produce an unfillable file wastes the box and risks the very footage being rescued, so
-        // report these and leave the bytes exactly where they are for the operator to decide.
-        if (item && item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
-          report.superseded++; report.items.push({ itemId, action: "superseded" });
-          this.writeLog?.("warn", "download", "Residual capture left untouched: the item already has a library file", { itemId, root: path.basename(root), name });
-          continue;
-        }
-        // A10 segmented captures land as capture_partNNN.ts. The remux below folds them via the
-        // concat demuxer so a whole recording is rescued in ONE run; the old path saved only the
-        // alphabetically-first slice and needed one recovery run per 10-minute part.
-        const folded = this.findNamedCapture(stagingDir);
-        const parts = captureSegmentFiles(stagingDir, { skipEmpty: true });
-        const tsPath = folded ?? parts[0] ?? this.findLooseCapture(stagingDir);
-        if (!tsPath) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
-        const recoverable = await this.isPlayableCapture(tsPath);
-        if (!recoverable) {
-          if (execute) { try { fs.rmSync(path.join(root, name), { recursive: true, force: true }); report.deleted++; } catch { report.failed++; } }
-          else report.deleted++;
-          report.items.push({ itemId, action: "deleted" });
-          continue;
-        }
-        const recoveryDir = path.join(this.recoveryRoot, safeSegment(itemId));
-        const outPath = path.join(recoveryDir, "recovered.mp4");
-        // Nothing is written during a dry run, so the recovery folder is only created on execute.
-        if (dryRun) { report.rescued++; report.items.push({ itemId, action: "rescued" }); continue; }
-        try {
-          this.prepareOutputDirectory(recoveryDir);
-          // Multi-part captures go through the concat demuxer directly: an intermediate folded
-          // capture.ts would double the disk footprint of a multi-GB recording during the rescue.
-          let concatList: string | undefined;
-          if (!folded && parts.length >= 2) {
-            concatList = path.join(stagingDir, "capture.concat.txt");
-            fs.writeFileSync(concatList, parts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
-          }
-          const inputBytes = concatList
-            ? parts.reduce((total, part) => { try { return total + fs.statSync(part).size; } catch { return total; } }, 0)
-            : undefined;
-          await this.remuxCaptureToMp4(tsPath, outPath, { action: undefined, paused: false, encoding: false } as ActiveDownload, concatList, inputBytes);
-          // A remux that reported success can still have produced a file nothing can open: handed
-          // no usable input the muxer writes a header-only MP4, which would sit in the Recovery list
-          // looking rescuable while never being watchable. The capture passed `isPlayableCapture`
-          // above, so an unplayable output is not footage worth keeping alive -- drop it together
-          // with its capture rather than filing it, and let the summary report the deletion.
-          if (!(await this.isPlayableMedia(outPath))) {
-            const discarded = this.discardUnplayableRecovered(recoveryDir);
-            for (const doomed of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
-              try { fs.unlinkSync(doomed); }
-              catch { report.leftover++; this.writeLog?.("warn", "download", "Unplayable rescue could not be cleaned up", { itemId, path: doomed }); }
+      for (const name of names) work.push({ root, name });
+    }
+    let processed = 0;
+    options.progress?.({ total: work.length, done: 0 });
+    for (const { root, name } of work) {
+      if (options.shouldStop?.()) break;
+      try {
+          const itemId = name;
+          const stagingDir = path.join(root, name);
+          // A recovery folder that already holds a rescued MP4 is a finished rescue, not a residual
+          // capture -- but it is still examined, because a rescue can itself leave an MP4 nothing can
+          // open: given no usable input the muxer writes a header-only file that the Recovery page
+          // lists as rescuable while no player can start it. This pass is the only place such a file
+          // disappears on its own, without the operator hunting for the one entry that will not play.
+          const rescued = root === this.recoveryRoot ? path.join(stagingDir, "recovered.mp4") : undefined;
+          // Existence only: a zero-byte or non-file `recovered.mp4` is just as unwatchable as a
+          // corrupted one, and `listRecovered` hides it anyway, so it is judged rather than skipped.
+          if (rescued && fs.existsSync(rescued)) {
+            report.scanned++;
+            if (await this.isPlayableMedia(rescued)) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
+            if (!execute) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
+            else if (this.discardUnplayableRecovered(stagingDir)) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
+            else {
+              report.failed++; report.items.push({ itemId, action: "failed" });
+              this.writeLog?.("warn", "download", "Unplayable recovered recording could not be deleted", { itemId });
             }
-            if (discarded) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
-            else { report.failed++; report.items.push({ itemId, action: "failed" }); }
-            this.writeLog?.("warn", "download", "Rescue produced an unplayable MP4; it and its capture were dropped instead of filed", { itemId });
+            if (execute) this.writeLog?.("warn", "download", "Unplayable recovered recording is no longer playable and was removed; any raw parts beside it were kept", { itemId });
             continue;
           }
-          const probe = await this.probeVideo(outPath);
-          const sidecar = {
-            itemId, title: item?.title ?? itemId,
-            performer: item?.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
-            source: item?.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
-            duration: probe.duration, width: probe.width, height: probe.height,
-            size: fs.statSync(outPath).size, recoveredAt: new Date().toISOString(), avsyncDelta: 0,
-          };
-          fs.writeFileSync(path.join(recoveryDir, "recovered.json"), JSON.stringify(sidecar, null, 2));
-          await this.ensureRecoveredPoster(itemId, outPath);
-          if (path.resolve(tsPath) !== path.resolve(outPath)) {
-            // The rescue itself succeeded, so the item is still reported as rescued; only the
-            // leftover capture could not be removed (for example a staging folder the server
-            // user cannot write to). Count it instead of hiding a failed cleanup. Segmented
-            // captures delete every part: otherwise the next run would re-rescue the same
-            // recording from the remaining slices.
-            for (const leftoverFile of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
-              if (path.resolve(leftoverFile) === path.resolve(outPath)) continue;
-              try { fs.unlinkSync(leftoverFile); }
-              catch (error) {
-                report.leftover++;
-                this.writeLog?.("warn", "download", "Rescued capture could not be deleted", { itemId, path: leftoverFile, error: String(error) });
+          report.scanned++;
+          const item = this.db.getItem(itemId);
+          if (this.active.has(itemId) || (item && ACTIVE.has(item.status))) {
+            report.skipped++; report.items.push({ itemId, action: "skipped" }); continue;
+          }
+          // The item already has its finished file in the library, so `catalogRecovered` will always
+          // answer `already-completed` — nothing folded here could ever be filed. Remuxing gigabytes
+          // to produce an unfillable file wastes the box and risks the very footage being rescued, so
+          // report these and leave the bytes exactly where they are for the operator to decide.
+          if (item && item.status === "completed" && item.storagePath && fs.existsSync(path.join(this.mediaRoot, item.storagePath))) {
+            report.superseded++; report.items.push({ itemId, action: "superseded" });
+            this.writeLog?.("warn", "download", "Residual capture left untouched: the item already has a library file", { itemId, root: path.basename(root), name });
+            continue;
+          }
+          // A10 segmented captures land as capture_partNNN.ts. The remux below folds them via the
+          // concat demuxer so a whole recording is rescued in ONE run; the old path saved only the
+          // alphabetically-first slice and needed one recovery run per 10-minute part.
+          const folded = this.findNamedCapture(stagingDir);
+          const parts = captureSegmentFiles(stagingDir, { skipEmpty: true });
+          const tsPath = folded ?? parts[0] ?? this.findLooseCapture(stagingDir);
+          if (!tsPath) { report.skipped++; report.items.push({ itemId, action: "skipped" }); continue; }
+          const recoverable = await this.isPlayableCapture(tsPath);
+          if (!recoverable) {
+            if (execute) { try { fs.rmSync(path.join(root, name), { recursive: true, force: true }); report.deleted++; } catch { report.failed++; } }
+            else report.deleted++;
+            report.items.push({ itemId, action: "deleted" });
+            continue;
+          }
+          const recoveryDir = path.join(this.recoveryRoot, safeSegment(itemId));
+          const outPath = path.join(recoveryDir, "recovered.mp4");
+          // Nothing is written during a dry run, so the recovery folder is only created on execute.
+          if (dryRun) { report.rescued++; report.items.push({ itemId, action: "rescued" }); continue; }
+          try {
+            this.prepareOutputDirectory(recoveryDir);
+            // Multi-part captures go through the concat demuxer directly: an intermediate folded
+            // capture.ts would double the disk footprint of a multi-GB recording during the rescue.
+            let concatList: string | undefined;
+            if (!folded && parts.length >= 2) {
+              concatList = path.join(stagingDir, "capture.concat.txt");
+              fs.writeFileSync(concatList, parts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
+            }
+            const inputBytes = concatList
+              ? parts.reduce((total, part) => { try { return total + fs.statSync(part).size; } catch { return total; } }, 0)
+              : undefined;
+            await this.remuxCaptureToMp4(tsPath, outPath, { action: undefined, paused: false, encoding: false } as ActiveDownload, concatList, inputBytes);
+            // A remux that reported success can still have produced a file nothing can open: handed
+            // no usable input the muxer writes a header-only MP4, which would sit in the Recovery list
+            // looking rescuable while never being watchable. The capture passed `isPlayableCapture`
+            // above, so an unplayable output is not footage worth keeping alive -- drop it together
+            // with its capture rather than filing it, and let the summary report the deletion.
+            if (!(await this.isPlayableMedia(outPath))) {
+              const discarded = this.discardUnplayableRecovered(recoveryDir);
+              for (const doomed of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
+                try { fs.unlinkSync(doomed); }
+                catch { report.leftover++; this.writeLog?.("warn", "download", "Unplayable rescue could not be cleaned up", { itemId, path: doomed }); }
+              }
+              if (discarded) { report.deleted++; report.items.push({ itemId, action: "deleted" }); }
+              else { report.failed++; report.items.push({ itemId, action: "failed" }); }
+              this.writeLog?.("warn", "download", "Rescue produced an unplayable MP4; it and its capture were dropped instead of filed", { itemId });
+              continue;
+            }
+            const probe = await this.probeVideo(outPath);
+            const sidecar = {
+              itemId, title: item?.title ?? itemId,
+              performer: item?.performerId ? this.db.getPerformer(item.performerId)?.name ?? "" : "",
+              source: item?.sourceId ? this.db.getSource(item.sourceId)?.domain ?? "" : "",
+              duration: probe.duration, width: probe.width, height: probe.height,
+              size: fs.statSync(outPath).size, recoveredAt: new Date().toISOString(), avsyncDelta: 0,
+            };
+            fs.writeFileSync(path.join(recoveryDir, "recovered.json"), JSON.stringify(sidecar, null, 2));
+            await this.ensureRecoveredPoster(itemId, outPath);
+            if (path.resolve(tsPath) !== path.resolve(outPath)) {
+              // The rescue itself succeeded, so the item is still reported as rescued; only the
+              // leftover capture could not be removed (for example a staging folder the server
+              // user cannot write to). Count it instead of hiding a failed cleanup. Segmented
+              // captures delete every part: otherwise the next run would re-rescue the same
+              // recording from the remaining slices.
+              for (const leftoverFile of new Set([tsPath, ...parts, ...(concatList ? [concatList] : [])])) {
+                if (path.resolve(leftoverFile) === path.resolve(outPath)) continue;
+                try { fs.unlinkSync(leftoverFile); }
+                catch (error) {
+                  report.leftover++;
+                  this.writeLog?.("warn", "download", "Rescued capture could not be deleted", { itemId, path: leftoverFile, error: String(error) });
+                }
               }
             }
+            report.rescued++; report.items.push({ itemId, action: "rescued" });
+          } catch (error) {
+            report.failed++; report.items.push({ itemId, action: "failed" });
+            this.writeLog?.("warn", "download", "Residual TS remux failed", { itemId, error: String(error) });
           }
-          report.rescued++; report.items.push({ itemId, action: "rescued" });
-        } catch (error) {
-          report.failed++; report.items.push({ itemId, action: "failed" });
-          this.writeLog?.("warn", "download", "Residual TS remux failed", { itemId, error: String(error) });
-        }
+      } finally {
+        options.progress?.({ total: work.length, done: ++processed, detail: name });
       }
     }
     return report;
+  }
+
+  /**
+   * Run a residual sweep as a background task instead of inside the request. The Recovery page used
+   * to hold an HTTP request open for the whole sweep -- minutes on a 1-core box with a multi-GB
+   * rescue -- which the Activity page now shows as an ordinary job row with item-level progress.
+   *
+   * Cancelling stops the sweep between items only: a rescue that is already remuxing is always
+   * allowed to finish, because those bytes exist nowhere else.
+   */
+  startRecovery(tasks: TaskRegistry, options: { execute?: boolean } = {}): { taskId: string; reused?: boolean } {
+    // A sweep is exclusive. Two overlapping runs enumerate the same staging folders, remux the same
+    // bytes and race each other's cleanup, so a second click joins the job already running. The
+    // check and the registration happen in one tick, so no second sweep can slip in between them.
+    const running = tasks.list().find((task) => task.kind === "recover" && (task.status === "queued" || task.status === "running"));
+    if (running) return { taskId: running.id, reused: true };
+    const handle = tasks.create({ kind: "recover", label: "Recovering residual captures", detail: "Scanning staging and the recovery folder" });
+    void (async () => {
+      try {
+        const report = await this.recoverResidualTs({
+          execute: options.execute !== false,
+          shouldStop: () => handle.isCancelled(),
+          progress: (update) => handle.update({
+            phase: "merging",
+            total: update.total,
+            done: update.done,
+            detail: update.detail ?? `${update.total} candidate folder${update.total === 1 ? "" : "s"}`,
+            progress: update.total ? update.done / update.total : null,
+          }),
+        });
+        handle.finish({ ...report });
+        this.writeLog?.("info", "download", "Residual sweep finished", { scanned: report.scanned, rescued: report.rescued, deleted: report.deleted, failed: report.failed });
+      } catch (error) {
+        handle.fail(error instanceof Error ? error.message : String(error));
+        this.writeLog?.("warn", "download", "Residual sweep failed", { error: String(error) });
+      }
+    })();
+    return { taskId: handle.id };
   }
 
   async listRecovered(): Promise<Array<{

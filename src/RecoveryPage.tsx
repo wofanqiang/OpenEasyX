@@ -8,18 +8,19 @@ type Recovered = {
   itemId: string; title: string; performer: string; source: string;
   duration: number; width: number; height: number; size: number; recoveredAt: string; cataloged: boolean;
 };
-type RecoveryAction = "rescued" | "deleted" | "skipped" | "failed";
-type RecoveryReport = {
-  scanned: number; rescued: number; deleted: number; skipped: number; failed: number; leftover: number; dryRun: boolean;
-  items: Array<{ itemId: string; action: RecoveryAction }>;
-};
 type CatalogResult = { cataloged: boolean; reason?: string; storagePath?: string };
 type ArchiveOutcome = { id: string; cataloged: boolean; reason?: string; failed?: boolean };
 type RecoveryStatus = "" | "waiting" | "in-library";
 type RecoverySort = "recent" | "oldest" | "largest" | "title";
-/** A single in-flight task. While `job` is not null every action button is locked so two jobs can
- *  never overlap and corrupt the same staged files. */
-type Job = { kind: "recover" | "archive" | "delete"; label: string; total: number; done: number; current?: string; indeterminate: boolean; startedAt: number };
+/** A single in-flight page job (archive or delete on the rescued files). While `job` is not null the
+ *  action buttons are locked so two jobs can never overlap and corrupt the same staged files. The
+ *  Recovery sweep is deliberately not one of these: it runs in the background, so it is watched on
+ *  the Activity page rather than holding this page hostage. */
+type Job = { kind: "archive" | "delete"; label: string; total: number; done: number; current?: string; indeterminate: boolean; startedAt: number };
+/** A sweep can outlast a slow box's patience, so the watcher is generous: 900 polls at 2s. */
+const RECOVERY_WATCH_INTERVAL_MS = 2000;
+const RECOVERY_WATCH_ATTEMPTS = 900;
+type TaskSnapshot = { id: string; status: string; error?: string; result?: Record<string, unknown> };
 
 function formatBytes(bytes = 0) {
   if (!bytes) return "0 B";
@@ -76,6 +77,7 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const [items, setItems] = useState<Recovered[] | null>(null);
   const [search, setSearch] = useState(() => window.location.search);
   const [job, setJob] = useState<Job | null>(null);
+  const [recoveryTaskId, setRecoveryTaskId] = useState<string | null>(null);
   const busy = job !== null;
   const [elapsed, setElapsed] = useState(0);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -131,17 +133,50 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const refresh = async () => { setItems(await load()); };
   const titleOf = (id: string) => items?.find((item) => item.itemId === id)?.title ?? id;
 
-  const runRecovery = async () => {
-    if (busy) return;
-    setJob({ kind: "recover", label: "Recovering…", total: 1, done: 0, indeterminate: true, startedAt: Date.now() });
-    try {
-      const report = await api<RecoveryReport>("/api/maintenance/cleanup-residual-ts", { method: "POST", body: JSON.stringify({ execute: true }) });
+  /**
+   * Pick up whatever the sweep rescued once it reaches a terminal state. The sweep is minutes of
+   * ffmpeg work over possibly dozens of folders, so its real progress bar lives on the Activity page
+   * next to the recordings; all this page does is leave a notice and refresh the list afterwards.
+   */
+  const watchRecovery = async (taskId: string) => {
+    for (let attempt = 0; attempt < RECOVERY_WATCH_ATTEMPTS; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, RECOVERY_WATCH_INTERVAL_MS));
+      let task: TaskSnapshot;
+      try { ({ task } = await api<{ task: TaskSnapshot }>(`/api/tasks/${taskId}`)); }
+      catch (error) {
+        // An expired record means the sweep finished faster than the first poll; refresh so whatever
+        // it rescued shows up, and stop. Anything else is transient and worth another poll.
+        if (error instanceof Error && /not found/i.test(error.message)) { setRecoveryTaskId(null); await refresh(); return; }
+        continue;
+      }
+      if (task.status === "queued" || task.status === "running") continue;
+      setRecoveryTaskId(null);
       await refresh();
-      const leftover = report.leftover ? ` · ${report.leftover} rescued file${report.leftover === 1 ? "" : "s"} could not be removed from staging` : "";
-      if (!report.scanned) setNotice("Recovery finished — no leftover captures were found.");
-      else setNotice(`Recovery finished — ${report.rescued} recording${report.rescued === 1 ? "" : "s"} rescued, ${report.deleted} leftover${report.deleted === 1 ? "" : "s"} cleaned, ${report.skipped} skipped${report.failed ? `, ${report.failed} failed` : ""}${leftover} (scanned ${report.scanned}).`);
+      if (task.status === "failed") { setNotice(`Recovery failed — ${task.error ?? "unknown error"}`); return; }
+      if (task.status === "cancelled") { setNotice("Recovery stopped — anything already rescued is listed below."); return; }
+      const count = (key: string) => Number(task.result?.[key] ?? 0) || 0;
+      if (!count("scanned")) { setNotice("Recovery finished — no leftover captures were found."); return; }
+      const leftover = count("leftover") ? ` · ${count("leftover")} rescued file${count("leftover") === 1 ? "" : "s"} could not be removed from staging` : "";
+      const failed = count("failed") ? `, ${count("failed")} failed` : "";
+      setNotice(`Recovery finished — ${count("rescued")} recording${count("rescued") === 1 ? "" : "s"} rescued, ${count("deleted")} leftover${count("deleted") === 1 ? "" : "s"} cleaned, ${count("skipped")} skipped${failed}${leftover} (scanned ${count("scanned")}).`);
+      return;
+    }
+    setRecoveryTaskId(null);
+  };
+
+  /**
+   * The Recovery button only starts the sweep. The request answers as soon as the job is registered,
+   * which is what keeps this page responsive on a 1-core box: the remuxing shows up on the Activity
+   * page, and the finished files appear here when the sweep completes.
+   */
+  const runRecovery = async () => {
+    if (busy || recoveryTaskId) return;
+    try {
+      const { taskId } = await api<{ taskId: string }>("/api/maintenance/cleanup-residual-ts", { method: "POST", body: JSON.stringify({ execute: true }) });
+      setRecoveryTaskId(taskId);
+      setNotice("Recovery started — follow the progress on the Activity page.");
+      void watchRecovery(taskId);
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
-    finally { setJob(null); }
   };
 
   const archiveOne = async (itemId: string) => {
@@ -225,14 +260,14 @@ export function RecoveryPage({ setNotice }: { setNotice: (text: string) => void 
   const total = items?.length ?? 0;
   const allSelected = Boolean(visible.length) && visible.every((item) => selectedIds.has(item.itemId));
   const filteredOut = Boolean(total) && !visible.length;
-  const recovering = busy && job?.kind === "recover";
+  const recovering = recoveryTaskId !== null;
   const deleting = busy && job?.kind === "delete";
   return <div className={`library-mode recovery-shell${busy ? " recovery-busy" : ""}`}>
     <section className="library-page recovery-page">
       <div className="library-intro">
         <div><p>COLLECT</p><h2>Recovery</h2><span>{total} rescued {total === 1 ? "recording" : "recordings"} kept outside the library</span></div>
         <div className="selection-actions">
-          <button className="primary" disabled={busy} onClick={() => void runRecovery()}>{recovering ? <LoaderCircle className="spin"/> : <RotateCcw/>}{recovering ? "Recovering…" : "Recovery"}</button>
+          <button className="primary" disabled={busy || recovering} onClick={() => void runRecovery()}>{recovering ? <LoaderCircle className="spin"/> : <RotateCcw/>}{recovering ? "Recovering…" : "Recovery"}</button>
           <button className="quiet" disabled={busy || !selectedIds.size} onClick={() => void archiveSelected()}><Archive/>Archive{selectedIds.size ? ` (${selectedIds.size})` : ""}</button>
           {selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" disabled={busy} onClick={selectAll}>{allSelected ? "Clear" : "Select all"}</button><button className="delete-selection" disabled={busy || !selectedIds.size} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={busy} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={busy || !total} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}
         </div>

@@ -130,6 +130,13 @@
 .activity-pagination > div { gap: 9px; }
 .activity-pagination .icon-button { width: 31px; height: 31px; }
 
+/* Background jobs (Library merge, Recovery sweep) share the download grid but read as their own
+   kind of row: a tinted stripe, a kind label under the headline, and the failure reason inline. */
+.table-row.task-row { background: linear-gradient(90deg, rgba(84, 156, 255, .055), transparent 34%); }
+.table-row.task-row .task-kind { color: #79adff; font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.task-error { color: #ff8493; font-size: 8px; line-height: 1.35; }
+.task-outcome { color: #7d7d88; font-size: 9px; text-align: right; }
+
 @media (max-width: 1180px) {
   .activity-categories { grid-template-columns: repeat(3, 1fr); }
   .activity-filters { grid-template-columns: minmax(220px, 1.4fr) repeat(2, minmax(130px, .7fr)); }
