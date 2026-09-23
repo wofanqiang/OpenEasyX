@@ -205,6 +205,19 @@ async function runMerge(deps: MergeDeps, handle: TaskHandle, media: Media[], rem
     const date = new Date(ingestMs(media[0]) || (deps.now?.() ?? Date.now()));
     if (!Number.isNaN(date.valueOf())) { try { fs.utimesSync(target, date, date); } catch { /* mtime is cosmetic */ } }
 
+    // 5b. A merged file has no download job, so the library cannot recover its title from the
+    //     `items` table (titles live there, keyed by the original storage path). Carry the first
+    //     source's title into a sidecar so the scan below shows the original name instead of the
+    //     filename-derived fallback ("<stem>_merged"). The library already reads this sidecar for
+    //     yt-dlp-style metadata, so it is the lowest-risk place to keep the title. The file name
+    //     must match `readSidecar`, which strips the last extension before appending ".info.json".
+    const sidecarPath = target.replace(/\.[^.]+$/, ".info.json");
+    const firstTitle = media[0].title;
+    if (firstTitle && firstTitle.trim()) {
+      try { fs.writeFileSync(sidecarPath, JSON.stringify({ title: firstTitle.trim() }), "utf8"); }
+      catch (error) { deps.log?.("A merge title sidecar could not be written", { path: sidecarPath, error: String(error) }); }
+    }
+
     handle.update({ phase: "indexing", detail: path.basename(target), progress: null });
     await deps.scan();
     published = true;
@@ -240,7 +253,7 @@ async function runMerge(deps: MergeDeps, handle: TaskHandle, media: Media[], rem
     // Nothing here is a no-op: on success the list file is scratch, and on any failure the partial
     // output goes too. A cancelled merge leaves the sources exactly as they were.
     cleanup(
-      published ? [listPath] : [target, listPath],
+      published ? [listPath] : [target, listPath, target.replace(/\.[^.]+$/, ".info.json")],
       deps.log,
       handle.isCancelled() ? "cancelled" : undefined,
     );

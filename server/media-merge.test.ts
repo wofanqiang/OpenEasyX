@@ -58,14 +58,14 @@ function seed(): Env {
 }
 
 /** A library video row as the scan leaves it, with the file itself on disk. */
-function addVideo(env: Env, relativePath: string, addedAt: number, size = "64x64"): Media {
+function addVideo(env: Env, relativePath: string, addedAt: number, size = "64x64", title?: string): Media {
   const absolute = path.join(env.mediaDir, relativePath);
   fs.mkdirSync(path.dirname(absolute), { recursive: true });
   fs.writeFileSync(absolute, clipBytes(size));
   const stat = fs.statSync(absolute);
   const stamp = new Date(addedAt).toISOString();
   env.library.upsertMedia({
-    id: mediaId(relativePath), relativePath, kind: "video", title: path.basename(relativePath, path.extname(relativePath)),
+    id: mediaId(relativePath), relativePath, kind: "video", title: title ?? path.basename(relativePath, path.extname(relativePath)),
     performer: "Alice", source: "chat.test", extension: path.extname(relativePath), mimeType: "video/mp4",
     size: stat.size, modifiedAt: stamp, addedAt: stamp, duration: 0, width: 0, height: 0,
     metadata: {}, scanId: "test-scan",
@@ -262,5 +262,26 @@ describe("startMerge", () => {
 
     expect(fs.readdirSync(path.join(env.mediaDir, "alice")).sort()).toEqual(["one.mp4", "two.mp4"]);
     expect(env.tasks.get(taskId)?.status).toBe("cancelled");
+  });
+
+  it("carries the first source's title into a sidecar so the product keeps the original name", async () => {
+    const env = seed();
+    // The original's title comes from the download job, not the filename -- e.g. a live room name.
+    const one = addVideo(env, "alice/one.mp4", FIRST_AT, "64x64", "Welcome to Squirt Fireworks festival");
+    const two = addVideo(env, "alice/two.mp4", SECOND_AT, "64x64", "Second Clip");
+    const { deps } = await mergeDeps(env);
+
+    const { taskId } = startMerge(deps, { ids: [two.id, one.id] });
+    await settle(env.tasks, taskId);
+
+    const merged = path.join(env.mediaDir, "alice", "one_merged.mp4");
+    const sidecar = merged.replace(/\.[^.]+$/, ".info.json");
+    expect(fs.existsSync(sidecar)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(sidecar, "utf8")).title).toBe("Welcome to Squirt Fireworks festival");
+
+    // The sidecar is what the scan reads: the product is titled like the original, not "alice one merged".
+    await env.catalog.scan();
+    const mergedMedia = env.library.getMedia(mediaId("alice/one_merged.mp4"));
+    expect(mergedMedia?.title).toBe("Welcome to Squirt Fireworks festival");
   });
 });
