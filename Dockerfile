@@ -22,12 +22,15 @@ ENV NODE_ENV=production PORT=3210 EASYX_DATA_DIR=/data EASYX_MEDIA_DIR=/media EA
     APP_VERSION=${APP_VERSION}
 ENV PATH=/opt/easyx/bin:/opt/ofscraper/bin:$PATH
 WORKDIR /app
+# ofscraper 3.14.7 pins idna==3.7 and lxml~=5.1, which have known CVEs
+# (CVE-2026-45409, CVE-2026-41066); the fixed versions are installed over them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates chromium ffmpeg libimage-exiftool-perl novnc openbox python3 python3-venv python3-dev tini websockify x11vnc xvfb gcc g++ \
     && python3 -m venv /opt/easyx \
     && /opt/easyx/bin/pip install --no-cache-dir --upgrade pip "yt-dlp[default,curl-cffi]" gallery-dl \
     && python3 -m venv /opt/ofscraper \
     && /opt/ofscraper/bin/pip install --no-cache-dir --upgrade pip "ofscraper==3.14.7" \
+    && /opt/ofscraper/bin/pip install --no-cache-dir "idna==3.20" "lxml==6.1.3" \
     && python3 -m venv /opt/subtitles \
     && /opt/subtitles/bin/pip install --no-cache-dir --upgrade pip \
     && apt-get purge -y --auto-remove python3-dev gcc g++ \
