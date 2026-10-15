@@ -765,6 +765,9 @@ export class LiveCamService {
         camId: cam.id, username: cam.username, title: cam.title, pageUrl: cam.pageUrl, thumbnailUrl: cam.thumbnailUrl,
       }, true);
       previousKeys.delete(key);
+      // A synced favorite is a real creator: keep the performer directory in step with the
+      // followed list so the room is recordable and restored after a restart.
+      this.createPerformer(providerId, cam);
     }
     for (const favorite of previous) {
       if (previousKeys.has(favorite.username.toLowerCase())) this.db.setLiveCamFavorite(providerId, favorite, false);

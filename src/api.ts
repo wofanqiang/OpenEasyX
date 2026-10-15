@@ -9,10 +9,15 @@ export function apiHeaders(options?: RequestInit): Headers {
 
 export async function api<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...options, credentials: "include", headers: apiHeaders(options) });
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401) window.dispatchEvent(new Event("easyx:unauthorized"));
-    const payload = await response.json().catch(() => ({}));
-    throw new Error((payload as { error?: string }).error ?? `Request failed (${response.status})`);
+    throw new ApiError(payload.error ?? `Request failed (${response.status})`, response.status, payload.code, payload.conflict);
   }
-  return (await response.json().catch(() => ({}))) as T;
+  return payload as T;
+}
+import type { PerformerConflict } from "../packages/profile-identity.js";
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string, readonly conflict?: PerformerConflict) { super(message); }
 }

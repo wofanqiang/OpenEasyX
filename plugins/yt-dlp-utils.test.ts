@@ -26,6 +26,20 @@ describe("live stream selection", () => {
 });
 
 describe("live recording output", () => {
+  it("caps the native video resolution while retaining separate audio and captures both together", () => {
+    const request = ytDlpDownload({ externalId: "live:alice", mediaType: "video", pageUrl: "https://live.test/alice" }, {}, { live: true, maxHeight: 720 });
+    expect(request.args[request.args.indexOf("--format") + 1]).toBe("bestvideo[height<=720]+bestaudio/best[height<=720]");
+    expect(request.args).toEqual(expect.arrayContaining(["--downloader", "ffmpeg"]));
+    expect(request.args).not.toContain("--recode-video");
+  });
+
+  it("leaves ordinary downloads unchanged when given live recording options", () => {
+    const request = ytDlpDownload({ externalId: "video", mediaType: "video", pageUrl: "https://video.test/watch" }, {}, { maxHeight: 720 });
+    expect(request.args.join(" ")).not.toContain("height<=");
+    expect(request.args).not.toContain("--downloader");
+    expect(request.args).not.toContain("--force-ipv4");
+  });
+
   it("writes browser-playable MP4 instead of MPEG-TS bytes behind an .mp4 name", () => {
     const request = ytDlpDownload({ externalId: "live:alice", mediaType: "video", pageUrl: "https://live.test/alice", filename: "alice.mp4" }, {}, { live: true });
     expect(request.args).toContain("--no-hls-use-mpegts");

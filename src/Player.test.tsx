@@ -50,3 +50,18 @@ describe("video player", () => {
     expect(html).not.toContain('autoPlay=""');
   });
 });
+
+describe("delete from the player", () => {
+  it("offers a delete action when the library allows it", () => {
+    vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
+    const html = renderToStaticMarkup(<PlayerViewer media={video} context={{ ids: ["video-1"] }} close={vi.fn()} favorite={vi.fn()} advance={vi.fn()} setNotice={vi.fn()} remove={vi.fn()}/>);
+    expect(html).toContain("watch-delete");
+    expect(html).toContain(">Delete</button>");
+  });
+
+  it("hides the delete action when no delete handler is given", () => {
+    vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
+    const html = renderToStaticMarkup(<PlayerViewer media={video} context={{ ids: ["video-1"] }} close={vi.fn()} favorite={vi.fn()} advance={vi.fn()} setNotice={vi.fn()}/>);
+    expect(html).not.toContain("watch-delete");
+  });
+});

@@ -1,3 +1,4 @@
+import { oldestMediaDate as oldestDate } from "../packages/media-date.js";
 import type { CommandDownloadRequest, MediaCandidate, PluginContext } from "../packages/plugin-sdk/index.js";
 import { positiveInteger } from "./yt-dlp-utils.js";
 
@@ -67,18 +68,6 @@ function parseMessages(output: string): Array<{ url: string; metadata: GalleryRe
   }
   if (!records.length && errors.length) throw new Error(errors.join("; "));
   return records;
-}
-
-function dateIso(value: unknown): string | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return new Date(value > 10_000_000_000 ? value : value * 1000).toISOString();
-  const valueText = text(value);
-  if (!valueText) return undefined;
-  const parsed = new Date(valueText.includes("T") ? valueText : `${valueText.replace(" ", "T")}Z`);
-  return Number.isNaN(parsed.valueOf()) ? undefined : parsed.toISOString();
-}
-
-function oldestDate(...values: unknown[]): string | undefined {
-  return values.map(dateIso).filter((value): value is string => Boolean(value)).sort()[0];
 }
 
 function mediaType(extension: string, metadata: GalleryRecord): MediaCandidate["mediaType"] {

@@ -1,3 +1,5 @@
+import { maxConcurrentDownloadsLimit } from "./download-limits.js";
+import { firstMediaDate } from "../packages/media-date.js";
 import path from "node:path";
 import { z } from "zod";
 import type { DownloadItem } from "./database.js";
@@ -8,7 +10,7 @@ const template = (kind: "path" | "filename") => z.string().superRefine((value, c
   const message = validateOutputTemplate(value, kind); if (message) context.addIssue({ code: "custom", message });
 });
 export const settingsSchema = z.object({
-  retentionDays: z.number().int().min(0).max(36500).optional(), maxConcurrentDownloads: z.number().int().min(1).max(8).optional(),
+  retentionDays: z.number().int().min(0).max(36500).optional(), maxConcurrentDownloads: z.number().int().min(1).max(maxConcurrentDownloadsLimit).optional(),
   // Live recordings occupy their own pool, so a long broadcast no longer holds a download slot.
   maxConcurrentRecordings: z.number().int().min(1).max(32).optional(),
   // No upper bound on purpose: an archive volume may legitimately need a large floor.
@@ -27,8 +29,9 @@ export const settingsSchema = z.object({
 
 export function downloadOutputPath(settings: Record<string, unknown>, item: DownloadItem, performer: string, site: string, originalFilename: string): string {
   const options = outputSettings(settings); const original = path.parse(originalFilename);
-  const date = new Date(item.publishedAt || item.createdAt);
-  const stamp = Number.isNaN(date.valueOf()) ? "unknown" : date.toISOString();
+  const stamp = (item.metadata.live === true
+    ? firstMediaDate(item.downloadStartedAt, item.createdAt)
+    : firstMediaDate(item.publishedAt, item.createdAt)) ?? "unknown";
   const extension = item.metadata.live === true && item.mediaType === "video" && options.recordingPreset && options.recordingPreset !== "source" ? ".mp4" : original.ext;
   return renderOutputPath(options, {
     performer, site, filename: original.name, title: item.title || original.name, id: item.id,

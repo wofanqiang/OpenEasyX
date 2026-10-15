@@ -39,15 +39,34 @@ async function complete(db: Database, id: string) {
 }
 
 describe("custom download output", () => {
+  it("preserves captured parts when finalization fails after a manual stop", async () => {
+    const { root, db, plugins, source, queue, add } = await fixture();
+    const script = "const fs=require('node:fs'),path=require('node:path'),output=process.argv[1],parts=path.join(path.dirname(output),'live-parts');fs.mkdirSync(parts);fs.writeFileSync(path.join(parts,'part-001.ts'),'captured');process.on('SIGINT',()=>{fs.writeFileSync(output,'broken');process.exit(1)});setInterval(()=>{},1000)";
+    plugins.get("test.output").resolveDownload = async () => ({ kind: "command", command: process.execPath, args: ["-e", script, "{output}"], filename: "original.mp4", requireSuccessfulExit: true });
+    const item = add("failed-finalize", true); queue.start();
+    const part = path.join(root, "media", ".downloads", item.id, "live-parts", "part-001.ts");
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(part)) { if (Date.now() > deadline) throw new Error("Recorder did not start"); await new Promise((resolve) => setTimeout(resolve, 20)); }
+    queue.stopRecording(item.id);
+    while (db.getItem(item.id)?.status !== "failed") { if (Date.now() > deadline) throw new Error(JSON.stringify(db.getItem(item.id))); await new Promise((resolve) => setTimeout(resolve, 20)); }
+    queue.stop();
+    expect(fs.readFileSync(part, "utf8")).toBe("captured");
+    expect(db.getItem(item.id)?.error).toContain("Recording parts preserved");
+    expect(db.getItem(item.id)?.storagePath).toBeUndefined();
+    expect(db.liveScanCandidates(source, [{ externalId: item.externalId, mediaType: "video", metadata: { live: true } }])).toEqual([]);
+  });
+
   it("writes directly into a model folder and keeps the library's source metadata", async () => {
-    const { root, db, media, queue, add } = await fixture({ outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-{filename}" });
+    const { root, db, source, media, queue, add } = await fixture({ outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-{filename}" });
     const item = add("one"); expect(queue.outputPath(item.id)).toBe("Alice/example.test-original.mp4");
+    db.ingestItems(source, [{ externalId: "one", mediaType: "video", publishedAt: "2024-02-03T10:20:30Z" }]);
     queue.start(); const done = await complete(db, item.id); queue.stop();
     expect(done.storagePath).toBe("Alice/example.test-original.mp4");
     expect(fs.readFileSync(path.join(media, done.storagePath!), "utf8")).toBe("test bytes");
+    expect(fs.statSync(path.join(media, done.storagePath!)).mtime.toISOString()).toBe("2024-02-03T10:20:30.000Z");
     const library = new LibraryDatabase(path.join(root, "data")); cleanup.push(() => library.close());
     const catalog = new Catalog(library, media, path.join(root, "data"), false, (file) => db.storedMediaMetadata(file)); await catalog.scan();
-    expect(library.listMedia({}).items[0]).toMatchObject({ performer: "Alice", source: "example.test", title: "Recording" });
+    expect(library.listMedia({}).items[0]).toMatchObject({ performer: "Alice", source: "example.test", title: "Recording", mediaDate: "2024-02-03T10:20:30.000Z" });
   });
   it("does not overwrite colliding names, even when an old suffix is already occupied", async () => {
     const { db, media, queue, add } = await fixture({ outputPathTemplate: "", outputFilenameTemplate: "same" });
@@ -69,7 +88,9 @@ describe("custom download output", () => {
     const { db, plugins, media, queue, add } = await fixture({ recordingPreset, outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-live", autoRecordMinBytes: 0 });
     plugins.get("test.output").resolveDownload = async () => ({ kind: "command", command: "ffmpeg", filename: "live.webm", args: ["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1440x810:rate=10", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "0.3", "-c:v", "libvpx-vp9", "-cpu-used", "8", "-c:a", "libopus", "{output}"] });
     const item = add("one", true); queue.start(); const done = await complete(db, item.id); queue.stop();
+    expect(done.publishedAt).toBe(done.downloadStartedAt);
     const filename = path.join(media, done.storagePath!);
+    expect(Math.abs(fs.statSync(filename).mtimeMs - Date.parse(done.downloadStartedAt!))).toBeLessThan(2);
     const probe = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-show_streams", "-of", "json", filename], { encoding: "utf8" }));
     const video = probe.streams.find((stream: any) => stream.codec_type === "video"); const audio = probe.streams.find((stream: any) => stream.codec_type === "audio");
     expect(video.codec_name).toBe(recordingPreset === "source" ? "vp9" : recordingPreset === "h265" ? "hevc" : "h264");

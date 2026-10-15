@@ -17,6 +17,34 @@ function accountContext(fetchImpl: typeof fetch, cookieLines = ".chaturbate.com\
 }
 
 describe("Chaturbate plugin", () => {
+  it.each([undefined, true, false])("uses the IPv4 preference (%s) for polling, playback resolution and recording", async (forceIpv4) => {
+    const context: PluginContext = {
+      config: { cookiesFile: "/private/cookies.txt", ...(forceIpv4 === undefined ? {} : { forceIpv4 }) }, fetch, log: vi.fn(),
+      runCommand: vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: JSON.stringify({ id: "alice", is_live: true, url: "https://cdn.test/live.m3u8", vcodec: "h264", acodec: "aac" }) })),
+    };
+    await chaturbate.listMedia!(context, { id: "source", externalId: "alice", performerId: "alice", profileUrl: "https://chaturbate.com/alice/", domain: "chaturbate.com" });
+    await chaturbate.resolveLiveStream!(context, { id: "alice", username: "alice", pageUrl: "https://chaturbate.com/alice/" });
+    const request = await chaturbate.resolveDownload!(context, { externalId: "live", mediaType: "video", pageUrl: "https://chaturbate.com/alice/" });
+    if (request.kind !== "command") throw new Error("Expected yt-dlp recording");
+    for (const args of [...vi.mocked(context.runCommand).mock.calls.map((call) => call[1]), request.args]) {
+      expect(args.includes("--force-ipv4")).toBe(forceIpv4 !== false);
+      expect(args).toEqual(expect.arrayContaining(["--cookies", "/private/cookies.txt"]));
+    }
+  });
+
+  it("selects native 720p with audio for recordings without limiting live playback", async () => {
+    const context = { config: { recordingMaxHeight: 720 }, fetch, log: vi.fn(), runCommand: vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: '{"url":"https://cdn.test/master.m3u8"}' })) };
+    const request = await chaturbate.resolveDownload!(context, { externalId: "live", mediaType: "video", pageUrl: "https://chaturbate.com/alice/" });
+    if (request.kind !== "command") throw new Error("Expected yt-dlp recording");
+    expect(request.args[request.args.indexOf("--format") + 1]).toBe("bestvideo[height<=720]+bestaudio/best[height<=720]");
+    await chaturbate.resolveLiveStream!(context, { id: "alice", username: "alice", pageUrl: "https://chaturbate.com/alice/" });
+    expect(vi.mocked(context.runCommand).mock.calls.flat().join(" ")).not.toContain("height<=720");
+  });
+
+  it.each([-1, 720.5, "bad"])("rejects invalid recording height %s", async (recordingMaxHeight) => {
+    await expect(chaturbate.resolveDownload!({ config: { recordingMaxHeight }, fetch, runCommand: vi.fn(), log: vi.fn() }, { externalId: "live", mediaType: "video", pageUrl: "https://chaturbate.com/alice/" })).rejects.toThrow("Maximum recording height");
+  });
+
   it("creates one stable candidate for an active live session", () => {
     expect(chaturbateLiveCandidate({ id: "model", title: "Model live", is_live: true, timestamp: 1_700_000_000, formats: [{ url: "https://cdn.example/live.m3u8" }] }, "https://chaturbate.com/model/"))
       .toMatchObject({ externalId: "chaturbate:model:1700000000", mediaType: "video", filename: "model-1700000000.mp4" });

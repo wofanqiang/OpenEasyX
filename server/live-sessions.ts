@@ -312,10 +312,11 @@ async function spliceGroup(group: SessionGroup, deps: SpliceContext): Promise<Sp
     // The merged file now holds every byte, so the only irreversible step left is removing the
     // originals -- publish first, retire after.
     replaceFile(output, segments[0].file);
-    const date = new Date(segments[0].publishedAt ?? segments[0].startMs);
-    // Same contract as the downloader's applyMediaDate for video: the filesystem mtime IS the media
-    // date the library sorts by, so the spliced recording keeps the broadcast's date.
-    if (!Number.isNaN(date.valueOf())) fs.utimesSync(segments[0].file, date, date);
+    // Same contract as the downloader's applyMediaDate for video: the filesystem mtime IS the
+    // media date the library sorts by, so the spliced recording keeps the broadcast's date.
+    // The capture's own start (download_started_at) is the authority here -- `published_at`
+    // carries the ingest moment for live rows and may be newer than the broadcast.
+    fs.utimesSync(segments[0].file, new Date(segments[0].startMs), new Date(segments[0].startMs));
     const absorbed = segments.slice(1);
     for (const segment of absorbed) {
       // The file goes BEFORE the row leaves `completed`. A crash in between then leaves a finished

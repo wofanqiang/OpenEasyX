@@ -185,6 +185,22 @@ describe("Database", () => {
     expect(db.listItems().find((item) => item.status !== "superseded")?.publishedAt).toBe("2020-01-01T00:00:00.000Z");
   });
 
+  it("dates live recordings from capture start and preserves that date across progress and rediscovery", () => {
+    const db = createDb(); const person = db.createPerformer({ name: "Live" });
+    const source = db.addSource(person.id, "plugin.one", { externalId: "s", label: "Live", profileUrl: "https://example.test", domain: "example.test" });
+    const candidate = { externalId: "live", mediaType: "video" as const, publishedAt: "2020-01-01T00:00:00Z", metadata: { live: true } };
+    db.ingestItems(source, [candidate]);
+    const item = db.listItems()[0];
+    db.sqlite.prepare("UPDATE items SET created_at=?,published_at=? WHERE id=?").run("2021-01-01", "1970-01-01T00:00:00Z", item.id);
+    const started = db.setItemStatus(item.id, "downloading")!;
+    expect(started.publishedAt).toBe(started.downloadStartedAt);
+    expect(Date.parse(started.publishedAt!)).toBeGreaterThan(Date.parse("2021-01-01"));
+    db.setItemStatus(item.id, "downloading", { progress: 0.5 });
+    db.ingestItems(source, [candidate]);
+    expect(db.setCanonicalMediaDate(item.id, candidate.publishedAt)).toBe(started.downloadStartedAt);
+    expect(db.getItem(item.id)?.publishedAt).toBe(started.downloadStartedAt);
+  });
+
   it("reports an older date discovered for an already stored item", () => {
     const db = createDb(); const person = db.createPerformer({ name: "Stored" });
     const source = db.addSource(person.id, "plugin.one", { externalId: "s", label: "Feed", profileUrl: "https://example.test", domain: "example.test" });

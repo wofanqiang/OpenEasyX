@@ -1,3 +1,4 @@
+import { firstMediaDate, validMediaDate } from "../packages/media-date";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Aperture, BarChart3, ChevronLeft, ChevronRight, Clock3, Eye, Film, FolderSearch2, HardDrive, Heart, History, Image as ImageIcon,
@@ -17,7 +18,7 @@ import "./library.css";
 
 type Media = {
   id: string; relativePath: string; kind: "video" | "image"; title: string; performer: string; source: string;
-  extension: string; mimeType: string; size: number; modifiedAt: string; addedAt?: string; duration: number; width: number; height: number;
+  extension: string; mimeType: string; size: number; modifiedAt: string; addedAt?: string; mediaDate?: string; duration: number; width: number; height: number;
   favorite: boolean; progressSeconds: number; completed: boolean; viewCount: number; lastViewedAt?: string; thumbnailUrl: string; previewUrl: string; streamUrl: string;
 };
 type Stats = {
@@ -106,8 +107,9 @@ export function mediaQualityLabel(media: Pick<Media, "kind" | "width" | "height"
   return media.extension.replace(/^\./, "").toUpperCase() || (media.kind === "video" ? "Video" : "Photo");
 }
 export function mediaDateLabel(value?: string): string {
-  if (!value) return "Unknown date";
-  const date = new Date(value);
+  const normalized = validMediaDate(value);
+  if (!normalized) return "Unknown date";
+  const date = new Date(normalized);
   return Number.isNaN(date.getTime()) ? "Unknown date" : new Intl.DateTimeFormat("en-US", { day: "numeric", month: "short", year: "numeric" }).format(date);
 }
 function formatLongDuration(seconds = 0) {
@@ -279,7 +281,7 @@ export function LibraryApp() {
 
   if (!dashboard) return <div className="boot"><span className="logo">EX</span><LoaderCircle className="spin"/><p>Opening your private library…</p></div>;
   return <div className="library-mode"><AppChrome title={selected || routeLiveCam ? "Now playing" : pageTitle} scanningLibrary={dashboard.scan.running} onScanLibrary={() => void rescan()} onRefreshPerformers={() => void refreshAllPerformers()}>
-      {routeMedia ? selected ? <PlayerViewer media={selected.media} context={selected.context} autoStart={selected.autoStart} close={() => { const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); void refresh(); }} favorite={updateFavorite} advance={(media) => { const from = location.state?.easyx?.from ?? "/library"; setSelected({ media, context: selected.context, autoStart: true }); navigate(mediaUrl(media), { state: playbackLocationState(from, selected.context, true) }); }} setNotice={setNotice}/> : <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : routeLiveCam ? <LiveCamViewer providerId={routeLiveCam.providerId} camId={routeLiveCam.camId} close={() => navigate(location.state?.easyx?.from ?? "/live-cam", { replace: true })}/> : <div className="content">
+      {routeMedia ? selected ? <PlayerViewer media={selected.media} context={selected.context} autoStart={selected.autoStart} close={() => { const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); void refresh(); }} favorite={updateFavorite} advance={(media) => { const from = location.state?.easyx?.from ?? "/library"; setSelected({ media, context: selected.context, autoStart: true }); navigate(mediaUrl(media), { state: playbackLocationState(from, selected.context, true) }); }} setNotice={setNotice} remove={async (media) => { const response = await deleteMedia([media.id]); if (!response.deleted.some((item) => item.id === media.id)) return false; const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); return true; }}/> : <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : routeLiveCam ? <LiveCamViewer providerId={routeLiveCam.providerId} camId={routeLiveCam.camId} close={() => navigate(location.state?.easyx?.from ?? "/live-cam", { replace: true })}/> : <div className="content">
         {page === "home" && <Home dashboard={dashboard} open={openMedia} go={go} favorite={updateFavorite}/>}
         {page === "live-cam" && <LiveCamPage preset={liveCamPreset} open={openLiveCam} route={(preset) => navigate(liveCamListUrl(preset), { replace: true })}/>}
         {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("library", preset), { replace: true })} refreshToken={refreshToken}/>}
@@ -412,12 +414,26 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
   const toggleSelected = (id: string) => setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const selectPage = () => setSelectedIds((current) => result?.items.every((item) => current.has(item.id)) ? new Set() : new Set(result?.items.map((item) => item.id) ?? []));
   const cancelSelection = () => { setSelectionMode(false); setSelectedIds(new Set()); };
+  const dropFromResult = (removed: Set<string>) => {
+    if (!result) return;
+    const total = Math.max(0, result.total - removed.size); const pages = Math.max(1, Math.ceil(total / result.pageSize));
+    setResult({ ...result, items: result.items.filter((item) => !removed.has(item.id)), total, pages });
+    setSelectedIds((current) => new Set([...current].filter((id) => !removed.has(id))));
+    if (page > pages) setPage(pages);
+  };
+  const deleteOne = async (media: Media) => {
+    if (deleting || !window.confirm(`Permanently delete "${media.title}"? This cannot be undone.`)) return;
+    setDeleting(true);
+    try { const response = await remove([media.id]); dropFromResult(new Set(response.deleted.map((item) => item.id))); }
+    catch { /* The app-level notice reports request failures. */ }
+    finally { setDeleting(false); }
+  };
   const deleteSelected = async () => {
     if (!selectedIds.size || !window.confirm(`Permanently delete ${selectedIds.size} selected ${selectedIds.size === 1 ? "file" : "files"}? This cannot be undone.`)) return;
     setDeleting(true);
     try {
       const response = await remove([...selectedIds]); const removed = new Set(response.deleted.map((item) => item.id));
-      setResult((current) => current && ({ ...current, items: current.items.filter((item) => !removed.has(item.id)), total: Math.max(0, current.total - removed.size), pages: Math.max(1, Math.ceil((current.total - removed.size) / current.pageSize)) }));
+      dropFromResult(removed);
       setSelectedIds((current) => new Set([...current].filter((id) => !removed.has(id))));
       if (!response.failed.length) cancelSelection();
     } catch { /* The app-level notice reports request failures. */ }
@@ -449,7 +465,7 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
         <button className="clear-filters" onClick={clearFilters}>Clear filters</button>
       </div>
     </div>
-    {loading ? <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : result?.items.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{result.items.map((media) => <MediaCard key={media.id} media={media} open={(item) => open(item, { query: playlistQuery })} favorite={favorite} selectionMode={selectionMode} selected={selectedIds.has(media.id)} toggleSelected={toggleSelected}/>)}</div> : <div className="empty-state"><FolderSearch2/><h3>No media found</h3><p>Try another filter or scan the mounted media folder.</p></div>}
+    {loading ? <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : result?.items.length ? <div className={`media-grid ${selectionMode ? "selecting" : ""}`}>{result.items.map((media) => <MediaCard key={media.id} media={media} open={(item) => open(item, { query: playlistQuery })} favorite={favorite} selectionMode={selectionMode} selected={selectedIds.has(media.id)} toggleSelected={toggleSelected} remove={deleting ? undefined : deleteOne}/>)}</div> : <div className="empty-state"><FolderSearch2/><h3>No media found</h3><p>Try another filter or scan the mounted media folder.</p></div>}
     {result && result.pages > 1 && <div className="pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page} of {result.pages}</span><button disabled={page >= result.pages} onClick={() => setPage(page + 1)}>Next</button></div>}
     {mergeOpen && <MergeDialog items={selectedVideos} busy={merging} close={() => setMergeOpen(false)} submit={submitMerge}/>}
   </section>;
@@ -507,7 +523,7 @@ function LazyImage({ src, className, alt, onLoad, onError }: { src: string; clas
   return <img ref={image} className={className} src={visible ? src : undefined} loading="lazy" decoding="async" fetchPriority="low" alt={alt} onLoad={onLoad} onError={onError}/>;
 }
 
-function MediaCard({ media, open, favorite, selectionMode = false, selected = false, toggleSelected }: { media: Media; open: OpenMedia; favorite: (media: Media, value: boolean) => void; selectionMode?: boolean; selected?: boolean; toggleSelected?: (id: string) => void }) {
+function MediaCard({ media, open, favorite, selectionMode = false, selected = false, toggleSelected, remove }: { media: Media; open: OpenMedia; favorite: (media: Media, value: boolean) => void; selectionMode?: boolean; selected?: boolean; toggleSelected?: (id: string) => void; remove?: (media: Media) => void }) {
   const viewed = media.completed || (media.kind === "image" && media.viewCount > 0);
   const progress = viewed ? 100 : media.duration ? Math.min(100, media.progressSeconds / media.duration * 100) : 0;
   const timer = useRef<number | undefined>(undefined); const [preview, setPreview] = useState(false); const [previewReady, setPreviewReady] = useState(false); const [unavailable, setUnavailable] = useState(false);
@@ -524,7 +540,7 @@ function MediaCard({ media, open, favorite, selectionMode = false, selected = fa
   return <article className={`media-card ${selected ? "selected" : ""}`}>{selectionMode && <button className="selection-control" aria-label={selected ? `Deselect ${media.title}` : `Select ${media.title}`} aria-pressed={selected} onClick={() => toggleSelected?.(media.id)}>{selected ? <CheckSquare/> : <Square/>}</button>}<a className="poster" href={href} aria-label={selectionMode ? `${selected ? "Deselect" : "Select"} ${media.title}` : `Open ${media.kind}: ${media.title}`} onClick={(event) => internalLink(event, activate)} onMouseMove={startPreview} onMouseLeave={stopPreview} onFocus={startPreview} onBlur={stopPreview} onWheel={stopPreview}>
     <span className="media-art"><LazyImage className="poster-still" src={media.thumbnailUrl} alt="" onError={() => setUnavailable(true)}/>{preview && <img className={`poster-preview ${previewReady ? "ready" : ""}`} src={media.previewUrl} decoding="async" alt="" onLoad={() => setPreviewReady(true)} onError={stopPreview}/>}</span>
     <span className="play">{media.kind === "video" ? <Play/> : <Search/>}</span><span className="type">{media.kind === "video" ? <Film/> : <ImageIcon/>}</span>{media.duration > 0 && <time>{formatDuration(media.duration)}</time>}{progress > 0 && <span className={`watch-label ${viewed ? "complete" : ""}`}>{viewed ? "Completed" : `${Math.round(progress)}%`}</span>}{progress > 0 && <i className={viewed ? "completed" : ""} style={{ width: `${progress}%` }}></i>}</a>
-    <div className="media-copy"><a className="media-title" href={href} onClick={(event) => internalLink(event, activate)}>{media.title}</a><p>{media.performer || "Unsorted"}{media.source ? ` - ${sourceDomain(media.source)}` : ""}{media.viewCount ? ` · ${media.viewCount} ${media.viewCount === 1 ? "view" : "views"}` : ""}</p><div className="media-facts"><span>{mediaQualityLabel(media)}</span><i/><time dateTime={media.addedAt || media.modifiedAt}>{mediaDateLabel(media.addedAt || media.modifiedAt)}</time></div></div>{!selectionMode && <button className="heart-button" aria-label={media.favorite ? "Remove from favorites" : "Add to favorites"} onClick={() => void favorite(media, !media.favorite)}><Heart className={media.favorite ? "filled" : ""}/></button>}</article>;
+    <div className="media-copy"><a className="media-title" href={href} onClick={(event) => internalLink(event, activate)}>{media.title}</a><p>{media.performer || "Unsorted"}{media.source ? ` - ${sourceDomain(media.source)}` : ""}{media.viewCount ? ` · ${media.viewCount} ${media.viewCount === 1 ? "view" : "views"}` : ""}</p><div className="media-facts"><span>{mediaQualityLabel(media)}</span><i/><time dateTime={firstMediaDate(media.mediaDate, media.addedAt, media.modifiedAt)}>{mediaDateLabel(firstMediaDate(media.mediaDate, media.addedAt, media.modifiedAt))}</time></div></div>{!selectionMode && <button className="heart-button" aria-label={media.favorite ? "Remove from favorites" : "Add to favorites"} onClick={() => void favorite(media, !media.favorite)}><Heart className={media.favorite ? "filled" : ""}/></button>}{!selectionMode && remove && <button className="card-delete-button" aria-label={`Delete ${media.title}`} title="Delete" onClick={() => void remove(media)}><Trash2/></button>}</article>;
 }
 
 function EmptyLibrary({ scan }: { scan: Scan }) {

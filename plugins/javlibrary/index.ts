@@ -11,7 +11,7 @@ type FlareResponse = {
 };
 
 function flareUrl(context: PluginContext): string {
-  return String(context.config.flareSolverrUrl ?? "").replace(/\/+$/, "");
+  return String(context.config.flareSolverrUrl ?? "").trim().replace(/\/+$/, "").replace(/\/v1$/, "");
 }
 
 async function protectedHtml(context: PluginContext, url: string): Promise<string> {
@@ -50,7 +50,7 @@ export default definePlugin({
     capabilities: ["identity-search", "source-discovery"],
     settings: [{
       key: "flareSolverrUrl", label: "FlareSolverr URL", type: "text", required: true, placeholder: "http://flaresolverr:8191",
-      help: "URL reachable from the EasyX container. JavLibrary cannot be queried reliably without a real Cloudflare browser resolver.",
+      help: "Base URL reachable from Open EasyX, for example http://flaresolverr:8191 on the same Docker network, or http://192.168.1.10:8191 for an existing instance. Do not use localhost for a separate container. See docs/FLARESOLVERR.md.",
     }],
   },
   async testConnection(context) {

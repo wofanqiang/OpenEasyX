@@ -66,6 +66,12 @@ describe("Stripchat direct live playback", () => {
     expect(mock.runCommand).toHaveBeenCalledWith("easyx-browser-fetch", ["https://stripchat.com/Alice"], expect.any(Object));
   });
 
+  it.each(["private", "groupShow", "idle", "off"])("does not queue non-public %s rooms", async (status) => {
+    const mock = context("");
+    mock.runCommand.mockResolvedValue({ exitCode: 0, stderr: "", stdout: pageState().replace('"isLive":true', '"status":"' + status + '","isLive":true') });
+    expect(await listStripchatMedia(mock, { id: "s", externalId: "Alice", performerId: "p", profileUrl: "https://stripchat.com/Alice", domain: "stripchat.com" })).toEqual([]);
+  });
+
   it("extracts the public playback key from the current player module", () => {
     expect(stripchatPublicPlaybackKey('url.searchParams.set("pkey","B0p93vi8Uj6AYyZb")')).toBe("B0p93vi8Uj6AYyZb");
     expect(stripchatPublicPlaybackKey("no playback key here")).toBeUndefined();
@@ -91,10 +97,9 @@ describe("Stripchat direct live playback", () => {
     await expect(resolveStripchatDownload(mock, {
       externalId: "stripchat:alice:session", pageUrl: "https://stripchat.com/Alice", mediaType: "video", filename: "alice.mp4",
     })).resolves.toEqual({
-      kind: "command", command: "ffmpeg", filename: "alice.mp4",
+      kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: "alice.mp4",
       args: expect.arrayContaining([
-        "-i", "https://media-hls.doppiocdn.media/live/42.m3u8?pkey=PublicKey123456",
-        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "{output}",
+        "-e", "https://media-hls.doppiocdn.media/live/42.m3u8?pkey=PublicKey123456", "{output}",
       ]),
     });
     expect(mock.runCommand).toHaveBeenCalledWith("easyx-browser-fetch", ["https://stripchat.com/Alice"], expect.any(Object));

@@ -11,6 +11,7 @@ import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit,
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
+import { LiveCamService } from "./live-cams.js";
 
 const dirs: string[] = [];
 // Windows keeps a temp tree locked for a moment after SQLite handles and spawned children go
@@ -44,6 +45,45 @@ async function waitFor(check: () => boolean, timeoutMs = 4000) {
 }
 
 describe("DownloadQueue", () => {
+  it("keeps recording while live directories, favorites, stream URLs and source metadata refresh", async () => {
+    const dataDir = temp("easyx-refresh-data"); const mediaDir = temp("easyx-refresh-media"); const pluginDir = temp("easyx-refresh-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    const recorder = "const fs=require('node:fs'),file=process.argv[1];fs.writeFileSync(file,'start');const timer=setInterval(()=>fs.appendFileSync(file,'x'),25);process.on('SIGINT',()=>{clearInterval(timer);process.exit(0)})";
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default {
+      manifest: { id: "test.refresh", name: "Refresh", version: "1", description: "Test", author: "Test", capabilities: ["live-cam", "download-resolver"], sourceUrlPatterns: ["https://live.test/*"] },
+      listLiveCams: async () => ({ cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice" }], total: 1, page: 1, pageSize: 24, pages: 1 }),
+      listFollowedLiveCams: async () => ({ authoritative: true, cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice", online: true }] }),
+      // Throws on purpose (see performer-priority.test.ts): the fake stream URL is
+      // unrecordable, so TS-first live capture falls back to the mock command below.
+      resolveLiveStream: async () => { throw new Error("tests record through the plugin download path"); },
+      resolveDownload: async () => ({ kind: "command", command: process.execPath, args: ["-e", ${JSON.stringify(recorder)}, "{output}"], filename: "recording.mp4" })
+    };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load(); manager.install("test.refresh");
+    const service = new LiveCamService(db, manager);
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice" };
+    const { itemId } = await service.record("test.refresh", cam);
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    try {
+      const staged = path.join(mediaDir, ".downloads", itemId, "recording.mp4");
+      await waitFor(() => fs.existsSync(staged) && fs.statSync(staged).size > 5);
+      for (let i = 0; i < 3; i++) {
+        const before = fs.statSync(staged).size;
+        const controller = new AbortController();
+        for await (const _result of service.stream({ page: 1, pageSize: 24 }, controller.signal)) controller.abort();
+        service.resetProviderSession("test.refresh");
+        await service.list({ page: 1, pageSize: 24 });
+        await service.syncFavorites("test.refresh");
+        await service.resolve("test.refresh", cam).catch(() => undefined);
+        expect(db.getItem(itemId)?.status).toBe("downloading");
+        await waitFor(() => fs.statSync(staged).size > before);
+      }
+      expect(db.listItems()).toHaveLength(1);
+      queue.stopRecording(itemId);
+      await waitFor(() => db.getItem(itemId)?.status === "completed");
+      expect(fs.statSync(path.join(mediaDir, db.getItem(itemId)!.storagePath!)).size).toBeGreaterThan(5);
+    } finally { queue.stop(); db.close(); }
+  });
+
   it("keeps an active download under media/.downloads until it is complete", async () => {
     const dataDir = temp("easyx-staging-data"); const mediaDir = temp("easyx-staging-media"); const pluginDir = temp("easyx-staging-plugins");
     let finishResponse: (() => void) | undefined;
@@ -225,7 +265,6 @@ describe("DownloadQueue", () => {
     for (const item of db.listItems()) db.setItemStatus(item.id, "queued");
     const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
     await waitFor(() => db.listItems().every((item) => ["completed", "duplicate"].includes(item.status)));
-    queue.stop(); server.close();
     expect(db.listItems().filter((item) => item.status === "completed")).toHaveLength(1);
     expect(db.listItems().filter((item) => item.status === "duplicate")).toHaveLength(1);
     const completed = db.listItems().find((item) => item.status === "completed")!;
@@ -234,7 +273,16 @@ describe("DownloadQueue", () => {
     expect(files).toHaveLength(1);
     expect(fs.statSync(path.join(mediaDir, "A-B Performer", "example.test", files[0])).mtime.toISOString()).toBe("2020-01-01T00:00:00.000Z");
     expect(fs.readdirSync(path.join(mediaDir, ".downloads"))).toEqual([]);
+    // A stale completed row must not discard a replacement after a disk-side deletion.
+    fs.unlinkSync(path.join(mediaDir, completed.storagePath!));
+    db.ingestItems(source, [{ externalId: "replacement", mediaType: "image", filename: "replacement.jpg", metadata: { url } }]);
+    const replacement = db.getItemBySourceExternalId(source.id, "replacement")!;
+    await waitFor(() => ["completed", "duplicate", "failed"].includes(db.getItem(replacement.id)!.status));
+    queue.stop(); server.close();
+    expect(db.getItem(replacement.id)?.status).toBe("completed");
+    expect(fs.readFileSync(path.join(mediaDir, db.getItem(replacement.id)!.storagePath!), "utf8")).toBe("hello media");
   });
+
 
   it("accepts trusted command-based extractor downloads", async () => {
     const dataDir = temp("easyx-command-data"); const mediaDir = temp("easyx-command-media"); const pluginDir = temp("easyx-command-plugins");

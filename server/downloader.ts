@@ -1,3 +1,5 @@
+import { concurrentDownloads } from "./download-limits.js";
+import { validMediaDate } from "../packages/media-date.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -17,9 +19,13 @@ import type { LogLevel } from "./log-store.js";
 import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
 import { PostProcessGate } from "./postprocess-gate.js";
 import type { HlsProxy } from "./hls-proxy.js";
+import { canMatchVideoExcerpt, fingerprintVideo, verifyVideoContainment, videoFileStamp, type VideoFingerprint } from "./video-matching.js";
 import type { TaskRegistry } from "./tasks.js";
 
-type ActiveDownload = { child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean; lastOutput?: string };
+type ActiveDownload = {
+  child?: ChildProcess; closed?: Promise<void>; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete"; stalled?: boolean; live?: boolean; manualStop?: boolean; lastOutput?: string;
+  /** Live recording of a performer with this priority; preempted when a higher one has to wait for a slot. */
+  priority?: number; startedAt?: number; preempted?: boolean; matching?: boolean };
 
 /** Item-level progress of a residual sweep, so the Activity page can show a real bar. */
 export type RecoveryProgress = { total: number; done: number; detail?: string };
@@ -214,6 +220,7 @@ export function concatCaptureArgs(listPath: string, output: string): string[] {
   return ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", output];
 }
 
+
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
   private finalizers = new Map<string, Promise<void>>();
@@ -303,6 +310,7 @@ export class DownloadQueue {
     const item = this.requiredItem(itemId);
     if (item.status === "queued") return this.db.setItemStatus(itemId, "paused");
     const control = this.active.get(itemId);
+    if (control?.matching) throw Object.assign(new Error("Video comparison is finishing; the download can still be cancelled"), { statusCode: 409 });
     if (item.status !== "downloading" || !control) throw Object.assign(new Error(`Cannot pause an item with status '${item.status}'`), { statusCode: 409 });
     control.paused = true;
     if (control.child) this.signal(control, "SIGSTOP");
@@ -435,11 +443,13 @@ export class DownloadQueue {
 
   private interrupt(itemId: string, action: ActiveDownload["action"]) {
     const item = this.requiredItem(itemId); const control = this.active.get(itemId);
-    if (action === "stop" && control?.encoding) return item;
+    if (action === "stop" && (control?.encoding || control?.matching)) return item;
     if (!control) {
       if (!["queued", "paused"].includes(item.status)) throw Object.assign(new Error(`Cannot ${action} an item with status '${item.status}'`), { statusCode: 409 });
+      this.db.suppressLiveRecording(itemId);
       return this.db.setItemStatus(itemId, action === "delete" ? "deleted" : "cancelled");
     }
+    this.db.suppressLiveRecording(itemId);
     control.action = action; control.paused = false;
     if (action === "stop") control.manualStop = true;
     this.signal(control, "SIGCONT"); this.signal(control, action === "stop" ? "SIGINT" : "SIGTERM"); control.abort?.abort();
@@ -456,7 +466,7 @@ export class DownloadQueue {
   private startItem(item: DownloadItem) {
     // Read the live flag off the item itself, so slot accounting can never disagree with
     // the branch download() takes (both keyed on metadata.live).
-    const control: ActiveDownload = { paused: false, live: (item.metadata as Record<string, unknown> | undefined)?.live === true };
+    const control: ActiveDownload = { paused: false, live: (item.metadata as Record<string, unknown> | undefined)?.live === true, priority: this.db.itemPriority(item.id), startedAt: Date.now() };
     this.active.set(item.id, control);
     this.db.setItemStatus(item.id, "downloading", { progress: 0 });
     this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
@@ -474,8 +484,11 @@ export class DownloadQueue {
     // recordings pool is deliberately NOT scaled down by core count: see DEFAULT_MAX_RECORDINGS.
     const limits = {
       recordings: concurrentLimit(settings.maxConcurrentRecordings, DEFAULT_MAX_RECORDINGS, MAX_RECORDINGS),
-      downloads: concurrentLimit(settings.maxConcurrentDownloads, DEFAULT_MAX_DOWNLOADS, MAX_DOWNLOADS),
+      downloads: concurrentDownloads(settings.maxConcurrentDownloads),
     };
+    // A higher-priority live recording waiting for a slot preempts a lower one, but only when
+    // the recordings pool is actually full: with a free slot both recordings can run side by side.
+    if (this.activeCounts().recordings >= limits.recordings) this.preemptForPriority();
     // Each pool drains only its own queue, so a recording can never be blocked behind a
     // backfill and a backfill can never be blocked behind a broadcast. A pool whose queue
     // is empty yields nothing and the plan simply moves on to the other one.
@@ -497,6 +510,33 @@ export class DownloadQueue {
         }
       }
       this.startItem(item);
+
+    }
+  }
+
+  /**
+   * All slots are busy and a live recording of a higher-priority performer is waiting:
+   * stop the lowest-priority live recording (latest started first) so the waiting one
+   * gets its slot. The stopped recording is kept, and the room is not suppressed, so
+   * it is recorded again once a slot is free. Recordings already being stopped for a
+   * waiting item are counted, so one waiting item never stops two recordings.
+   */
+  private preemptForPriority() {
+    const waiting = this.db.queuedLivePriorities();
+    if (!waiting.length) return;
+    for (const [itemId, control] of this.active) control.priority = this.db.itemPriority(itemId);
+    let freeing = [...this.active.values()].filter((control) => control.preempted || control.action).length;
+    for (const priority of waiting) {
+      if (freeing > 0) { freeing -= 1; continue; }
+      const victim = [...this.active.entries()]
+        .filter(([, control]) => control.live && !control.preempted && !control.action && !control.paused && !control.encoding && !control.matching && (control.priority ?? 0) < priority)
+        .sort(([, left], [, right]) => (left.priority ?? 0) - (right.priority ?? 0) || (right.startedAt ?? 0) - (left.startedAt ?? 0))[0];
+      if (!victim) return;
+      const [itemId, control] = victim;
+      control.preempted = true; control.action = "stop";
+      this.signal(control, "SIGCONT"); this.signal(control, "SIGINT"); control.abort?.abort();
+      const item = this.db.setItemStatus(itemId, "stopping");
+      this.writeLog?.("info", "download", "Recording stopped for a higher-priority performer", { itemId, title: item?.title, priority: control.priority ?? 0, waitingPriority: priority });
     }
   }
 
@@ -561,12 +601,14 @@ export class DownloadQueue {
       const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
       if (!performer || !source) throw new Error("The performer or source no longer exists");
       const settings = outputSettings(this.db.getSettings());
-      const context = this.plugins.context(item.pluginId);
+      const resolutionController = new AbortController(); control.abort = resolutionController;
+      const context = this.plugins.context(item.pluginId, resolutionController.signal);
       const candidate: MediaCandidate = {
         externalId: item.externalId, identityKey: item.identityKey, title: item.title, pageUrl: item.pageUrl,
         mediaType: item.mediaType as MediaCandidate["mediaType"], filename: item.filename, qualityScore: item.qualityScore,
         expectedBytes: item.expectedBytes, publishedAt: item.publishedAt, metadata: item.metadata,
       };
+      resolutionController.signal.throwIfAborted();
       // TS-first live capture wins over the plugin's own download path: any live item
       // records as ffmpeg MPEG-TS (then the remux below turns it into MP4) no matter
       // which plugin resolved it. Non-live items and plugins without a live resolver
@@ -618,7 +660,7 @@ export class DownloadQueue {
         await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
-        }), temporaryDirectory, item.expectedBytes, reportProgress, control, avWatcher?.onStderr);
+        }), temporaryDirectory, item.expectedBytes, reportProgress, control, avWatcher?.onStderr, request.requireSuccessfulExit);
         // Live captures land as MPEG-TS (capture.ts); remux to MP4 in place and
         // delete the TS so every downstream step only ever sees a .mp4 file.
         // Gated on the TS file actually existing so non-TS captures are untouched.
@@ -761,8 +803,10 @@ export class DownloadQueue {
       // C3: a live recording that ended on its own with an almost-empty file is a fragment
       // (the stream blipped or the capture opened to nothing), not a real clip. It is moved
       // to recovery so the user can inspect it, and must NOT be cataloged as a finished
-      // download. A manual stop is intentional, so it is never treated as a fragment.
-      if (item.metadata.live === true && !control.manualStop) {
+      // download. A manual stop is intentional, so it is never treated as a fragment -- and
+      // neither is a preemption, which stops the capture on purpose ("the stopped recording
+      // is kept"), however few bytes it managed before the higher-priority room took over.
+      if (item.metadata.live === true && !control.manualStop && !control.preempted) {
         const minBytes = Number(this.db.getSettings().autoRecordMinBytes ?? 5 * 1024 * 1024);
         const size = fs.existsSync(temporary) ? fs.statSync(temporary).size : 0;
         if (minBytes > 0 && size > 0 && size < minBytes) {
@@ -828,13 +872,26 @@ export class DownloadQueue {
       }
 
       await this.withFinalizeLock(`output:${item.id}`, async () => {
+        if (["cancel", "delete"].includes(control.action ?? "")) throw new Error("Download cancelled");
+        const comparison = item.mediaType === "video" ? await this.checkVideoExcerpt(item, temporary, control) : undefined;
+        if (["cancel", "delete"].includes(control.action ?? "")) throw new Error("Download cancelled");
+        if (comparison?.original) {
+          // An excerpt must never replace the full video, even at higher resolution,
+          // and its publication date must not alter the original's date.
+          fs.unlinkSync(temporary); temporary = "";
+          this.db.markVideoExcerpt(item.id, comparison.original.id, checksum);
+          this.writeLog?.("info", "download", "Excerpt already contained in a full video", {
+            itemId: item.id, duplicateOf: comparison.original.id, ...comparison.match,
+          });
+          return;
+        }
         const visual = await this.visualFingerprint(temporary, item.mediaType);
         const qualityScore = Math.max(item.qualityScore, visual?.qualityScore ?? 0);
         this.db.setDownloadFingerprint(item.id, visual?.hash, qualityScore);
         const duplicate = (item.identityKey ? this.db.findByIdentity(item.identityKey, item.id, item.performerId) : undefined)
           ?? this.db.findByChecksum(checksum, item.id, item.performerId)
           ?? (visual ? this.db.findVisualDuplicate(visual.hash, item.id, item.performerId, item.mediaType) : undefined);
-        if (duplicate) {
+        if (duplicate?.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
           const canonicalDate = this.db.setCanonicalMediaDate(duplicate.id, item.publishedAt);
           if (qualityScore <= duplicate.qualityScore) {
             fs.unlinkSync(temporary); temporary = "";
@@ -852,6 +909,7 @@ export class DownloadQueue {
           if (oldPath && path.resolve(oldPath) !== path.resolve(finalPath) && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
           const relativePath = path.relative(this.mediaRoot, finalPath);
           this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+          if (comparison) this.db.setVideoFingerprint(item.id, videoFileStamp(finalPath), comparison.fingerprint);
           this.writeLog?.("info", "download", "Higher-quality download stored", { itemId: item.id, replacedItemId: duplicate.id, storagePath: relativePath });
           this.db.supersedeDownload(duplicate.id, item.id);
           if (plugin.afterDownload) await plugin.afterDownload(this.plugins.context(item.pluginId), { absolutePath: finalPath, relativePath, mediaType: item.mediaType, checksumSha256: checksum });
@@ -864,6 +922,7 @@ export class DownloadQueue {
         fs.renameSync(temporary, finalPath); temporary = "";
         const relativePath = path.relative(this.mediaRoot, finalPath);
         this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+        if (comparison) this.db.setVideoFingerprint(item.id, videoFileStamp(finalPath), comparison.fingerprint);
         this.writeLog?.("info", "download", "Download completed", { itemId: item.id, storagePath: relativePath, mediaType: item.mediaType });
         // A capture that "succeeded" while its extractor kept complaining (403s on evicted
         // segments, invalid data) is the signature of a truncated recording -- surface it.
@@ -873,6 +932,16 @@ export class DownloadQueue {
       });
     } catch (error) {
       let message = error instanceof Error ? error.message : String(error);
+      // A user-issued stop must never turn into an automatic retry: the capture ended because
+      // the user asked for it, so a failure while wrapping up is terminal (the parts stay in
+      // staging for recovery, exactly like the recordingFinalize branch below).
+      const manualStop = control.action === "stop";
+      const parts = temporaryDirectory && path.join(temporaryDirectory, "live-parts");
+      if (!["cancel", "delete"].includes(control.action ?? "") && parts && fs.existsSync(parts) && fs.readdirSync(parts).some((file) => file.endsWith(".ts") && fs.statSync(path.join(parts, file)).size > 0)) {
+        preserveTemporary = true;
+        if (control.action === "stop") control.action = undefined;
+        message += ` Recording parts preserved at ${temporaryDirectory}; recover them before retrying.`;
+      }
       // A failed post-processing step (remux / re-encode) must never throw the capture
       // away: prefer the finished MP4, but fall back to the TS capture. Before this
       // fallback existed a failed remux deleted the entire recording, because the
@@ -886,7 +955,7 @@ export class DownloadQueue {
       // recovery flow working; if even that fold fails, the raw parts are moved below so
       // no recorded minute is ever thrown away.
       let strayParts: string[] = [];
-      if (!recoverySource && isLiveRecording && !control.action && !control.paused && temporaryDirectory) {
+      if (!recoverySource && isLiveRecording && !manualStop && !control.action && !control.paused && temporaryDirectory) {
         strayParts = captureSegmentFiles(temporaryDirectory, { skipEmpty: true });
         if (strayParts.length && !control.encoding) {
           try {
@@ -999,12 +1068,16 @@ export class DownloadQueue {
           }
         }
       }
-      if (control.action) {
+      if (control.preempted && control.action === "stop") {
+        // Not a user action: keep the room eligible for a new session once a slot is free.
+        this.db.setItemStatus(item.id, "failed", { error: "Stopped for a higher-priority performer" });
+        this.writeLog?.("info", "download", "Recording stopped for a higher-priority performer", { itemId: item.id, title: item.title });
+      } else if (control.action) {
         if (control.action !== "delete") this.db.setItemStatus(item.id, "cancelled", { error: null });
         this.writeLog?.("info", "download", control.action === "stop" ? "Recording stopped" : "Download cancelled", { itemId: item.id, title: item.title });
       } else if (control.paused) {
         this.db.setItemStatus(item.id, "paused", { error: null });
-      } else if (recordingFinalize) {
+      } else if (recordingFinalize || (manualStop && isLiveRecording)) {
         // The capture already ended (user stop, or the stream going offline) and only
         // the post-processing failed. Retrying would silently restart a recording the
         // user asked to stop, so report the failure once instead.
@@ -1134,6 +1207,49 @@ export class DownloadQueue {
 
   private get downloadsRoot() { return path.join(this.mediaRoot, ".downloads"); }
 
+  private async checkVideoExcerpt(item: DownloadItem, file: string, control: ActiveDownload) {
+    const controller = new AbortController(); control.abort = controller; control.matching = true;
+    const timer = setTimeout(() => controller.abort(), 120_000); timer.unref();
+    let fingerprint: VideoFingerprint | undefined;
+    try {
+      this.writeLog?.("info", "download", "Checking video for an already stored full version", { itemId: item.id });
+      fingerprint = await fingerprintVideo(file, controller.signal);
+      if (!fingerprint || !canMatchVideoExcerpt(fingerprint)) return { fingerprint };
+      for (const original of this.db.completedVideos(item.performerId, item.id)) {
+        controller.signal.throwIfAborted();
+        const root = path.resolve(this.mediaRoot);
+        const originalFile = path.resolve(root, original.storagePath!);
+        if (!originalFile.startsWith(`${root}${path.sep}`)) continue;
+        try {
+          const stamp = videoFileStamp(originalFile);
+          let full = this.db.getVideoFingerprint(original.id, stamp);
+          if (full === undefined) {
+            full = await fingerprintVideo(originalFile, controller.signal) ?? null;
+            if (videoFileStamp(originalFile) !== stamp) continue;
+            this.db.setVideoFingerprint(original.id, stamp, full ?? undefined);
+          }
+          if (!full) continue;
+          const match = await verifyVideoContainment(file, fingerprint, originalFile, full, controller.signal);
+          if (match && videoFileStamp(originalFile) === stamp && this.db.getItem(original.id)?.status === "completed") {
+            return { fingerprint, original, match };
+          }
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          // Missing files, unsupported codecs or stale cache entries cannot
+          // justify discarding the new video.
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      return { fingerprint };
+    } catch (error) {
+      this.writeLog?.("warn", "download", "Video comparison unavailable; keeping the downloaded video", { itemId: item.id, error: error instanceof Error ? error.message : String(error) });
+      return fingerprint ? { fingerprint } : undefined;
+    } finally {
+      clearTimeout(timer); control.matching = false;
+      if (control.abort === controller) control.abort = undefined;
+    }
+  }
+
   private prepareOutputDirectory(directory: string) {
     const root = path.resolve(this.mediaRoot); const relative = path.relative(root, directory);
     if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Output path must stay inside the media volume");
@@ -1167,7 +1283,7 @@ export class DownloadQueue {
     try { child.kill(signal); } catch { /* Signal unsupported on this platform. */ }
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, options?: { lowPriority?: boolean }): Promise<void> {
+  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, requireSuccessfulExit = false, options?: { lowPriority?: boolean }): Promise<void> {
     return new Promise((resolve, reject) => {
       // Memory guard for live recordings on small VPS: cap yt-dlp fragment concurrency
       // and buffer so a single download cannot balloon the cgroup and trip OOM.
@@ -1216,7 +1332,7 @@ export class DownloadQueue {
         // Keep the extractor's own words around even on success: a truncated live capture
         // exits 0 with the whole story ("403 Forbidden", "Invalid data") in its stderr.
         control.lastOutput = output.trim();
-        if (code === 0 || (control.action === "stop" && receivedBytes(outputDirectory) > 0)) finish();
+        if (code === 0 || (!requireSuccessfulExit && control.action === "stop" && receivedBytes(outputDirectory) > 0)) finish();
         else finish(new Error(`${command} exited with code ${code}: ${output.trim() || "no error output"}`));
       });
     });
@@ -1266,9 +1382,9 @@ export class DownloadQueue {
   }
 
   private async applyMediaDate(file: string, mediaType: string, publishedAt?: string) {
-    if (!publishedAt || !fs.existsSync(file)) return;
-    const date = new Date(publishedAt);
-    if (Number.isNaN(date.valueOf())) return;
+    const normalized = validMediaDate(publishedAt);
+    if (!normalized || !fs.existsSync(file)) return;
+    const date = new Date(normalized);
     if (mediaType === "image") {
       // Embed the canonical date in EXIF too; the filesystem mtime below is the fallback.
       const exifDate = date.toISOString().slice(0, 19).replace(/-/g, ":").replace("T", " ");
@@ -1324,7 +1440,7 @@ export class DownloadQueue {
 
   private async runPostProcessCommand(command: string, args: string[], outputDirectory: string, control: ActiveDownload, onStderr?: (text: string) => void): Promise<void> {
     if (await this.lowPrioritySupported()) {
-      return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr, { lowPriority: true });
+      return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr, false, { lowPriority: true });
     }
     return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr);
   }

@@ -17,6 +17,7 @@ export type Media = {
   size: number;
   modifiedAt: string;
   addedAt: string;
+  mediaDate?: string;
   duration: number;
   width: number;
   height: number;
@@ -142,6 +143,8 @@ export class LibraryDatabase {
     const playbackColumns = new Set((this.sqlite.prepare("PRAGMA table_info(playback)").all() as Array<{ name: string }>).map((column) => column.name));
     const mediaColumns = new Set((this.sqlite.prepare("PRAGMA table_info(media)").all() as Array<{ name: string }>).map((column) => column.name));
     if (!mediaColumns.has("playable")) this.sqlite.exec("ALTER TABLE media ADD COLUMN playable INTEGER NOT NULL DEFAULT 1");
+    if (!mediaColumns.has("media_date")) this.sqlite.exec("ALTER TABLE media ADD COLUMN media_date TEXT");
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS media_date_idx ON media(missing,kind,COALESCE(media_date,modified_at) DESC)");
     const needsCompletionBackfill = !playbackColumns.has("completed");
     if (needsCompletionBackfill) this.sqlite.exec("ALTER TABLE playback ADD COLUMN completed INTEGER NOT NULL DEFAULT 0");
     if (!playbackColumns.has("last_counted_at")) this.sqlite.exec("ALTER TABLE playback ADD COLUMN last_counted_at TEXT");
@@ -157,6 +160,10 @@ export class LibraryDatabase {
 
   close() {
     this.sqlite.close();
+  }
+
+  mergePerformerNames(previousName: string, nextName: string) {
+    this.sqlite.prepare("UPDATE media SET performer=? WHERE performer=? COLLATE NOCASE").run(nextName, previousName);
   }
 
   upsertMedia(item: IndexedMedia) {
@@ -181,14 +188,18 @@ export class LibraryDatabase {
     this.sqlite.prepare(`
       INSERT INTO media(
         id,relative_path,kind,title,performer,source,extension,mime_type,size,modified_at,
-        added_at,duration,width,height,metadata_json,last_seen_scan,missing
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+        added_at,duration,width,height,metadata_json,last_seen_scan,media_date,missing
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
       ON CONFLICT(relative_path) DO UPDATE SET
         kind=excluded.kind,title=excluded.title,performer=excluded.performer,source=excluded.source,
         extension=excluded.extension,mime_type=excluded.mime_type,size=excluded.size,
-        modified_at=excluded.modified_at,metadata_json=excluded.metadata_json,
+        modified_at=excluded.modified_at,media_date=excluded.media_date,metadata_json=excluded.metadata_json,
         last_seen_scan=excluded.last_seen_scan,missing=0,
-        added_at=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at OR media.missing=1 THEN excluded.added_at ELSE media.added_at END,
+        -- One fused rule (SQLite keeps the last assignment for a duplicated column, so these
+        -- must stay a single CASE): a changed or returning file re-ingests with a fresh
+        -- timestamp, and a legacy epoch placeholder (a birthtime-less mount) is repaired from
+        -- the incoming value -- everything else keeps its original ingest time.
+        added_at=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at OR media.missing=1 OR julianday(media.added_at)<=julianday('1970-01-01') THEN excluded.added_at ELSE media.added_at END,
         duration=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.duration END,
         width=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.width END,
         height=CASE WHEN media.size<>excluded.size OR media.modified_at<>excluded.modified_at THEN 0 ELSE media.height END,
@@ -196,7 +207,7 @@ export class LibraryDatabase {
     `).run(
       item.id, item.relativePath, item.kind, item.title, item.performer, item.source,
       item.extension, item.mimeType, item.size, item.modifiedAt, item.addedAt,
-      item.duration, item.width, item.height, JSON.stringify(item.metadata), item.scanId,
+      item.duration, item.width, item.height, JSON.stringify(item.metadata), item.scanId, item.mediaDate ?? item.modifiedAt,
     );
   }
 
@@ -223,7 +234,7 @@ export class LibraryDatabase {
       id: String(row.id), relativePath: String(row.relative_path), kind: row.kind as MediaKind,
       title: String(row.title), performer: String(row.performer), source: String(row.source),
       extension: String(row.extension), mimeType: String(row.mime_type), size: Number(row.size),
-      modifiedAt: String(row.modified_at), addedAt: String(row.added_at), duration: Number(row.effective_duration ?? row.duration),
+      modifiedAt: String(row.modified_at), addedAt: String(row.added_at), mediaDate: row.media_date ? String(row.media_date) : undefined, duration: Number(row.effective_duration ?? row.duration),
       width: Number(row.width), height: Number(row.height), favorite: !!row.favorite,
       progressSeconds: Number(row.progress_seconds), completed: !!row.completed, viewCount: Number(row.view_count),
       lastViewedAt: row.last_viewed_at ? String(row.last_viewed_at) : undefined,
@@ -363,7 +374,7 @@ export class LibraryDatabase {
       SUM(CASE WHEN collection.kind='image' THEN 1 ELSE 0 END) images,
       (SELECT cover.id FROM media cover
         WHERE cover.missing=0 AND cover.playable=1 AND cover.performer=collection.performer COLLATE NOCASE
-        ORDER BY CASE cover.kind WHEN 'image' THEN 0 ELSE 1 END,cover.modified_at DESC,cover.id ASC LIMIT 1) cover_id
+        ORDER BY CASE cover.kind WHEN 'image' THEN 0 ELSE 1 END,COALESCE(cover.media_date,cover.modified_at) DESC,cover.id ASC LIMIT 1) cover_id
       FROM media collection WHERE collection.missing=0 AND collection.playable=1 AND collection.performer<>''
       GROUP BY collection.performer COLLATE NOCASE ORDER BY collection.performer COLLATE NOCASE`).all() as Record<string, unknown>[];
     return rows.map((row) => ({

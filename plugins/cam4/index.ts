@@ -1,6 +1,8 @@
+import { LIVE_RECORDER_SCRIPT, retryDelay } from "../live-recorder.js";
 import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
-import type { LiveCam, LiveCamFavoriteSnapshot, PluginContext } from "../../packages/plugin-sdk/index.js";
+import { browserHtml } from "../browser-html-utils.js";
+import type { CommandDownloadRequest, DownloadRequest, LiveCam, LiveCamFavoriteSnapshot, MediaCandidate, PerformerRecord, PersonCandidate, PluginContext, SourceCandidate } from "../../packages/plugin-sdk/index.js";
 
 const plugin = createLiveCamPlugin({
   id: "org.easyx.cam4", name: "CAM4 Live", prefix: "cam4", homepage: "https://www.cam4.com",
@@ -169,5 +171,244 @@ plugin.testConnection = async (context) => {
 };
 plugin.listFollowedLiveCams = cam4FollowedSnapshot;
 plugin.setLiveCamFavorite = setCam4Favorite;
+
+// --- Performer search ("Find a performer") --------------------------------------
+/*
+ * CAM4 has no public name search, so this looks up exact usernames: the text as
+ * typed and, for multi-word input, the words joined with nothing and "_"
+ * ("Jane Doe" -> JaneDoe, Jane_Doe). The profile API confirms the account; the user
+ * reviews and picks a result. Picking it stores the CAM4 username on the performer,
+ * and source discovery then adds exactly that room as a source.
+ */
+const CAM4_USERNAME = /^[a-z0-9_]{2,64}$/i;
+
+export function cam4SearchUsernames(query: string): string[] {
+  let text = query.trim();
+  try { if (/^https?:\/\//i.test(text)) text = new URL(text).pathname.split("/").filter(Boolean).at(-1) ?? ""; } catch { return []; }
+  text = text.replace(/^@/, "");
+  const words = text.split(/\s+/).filter(Boolean);
+  const names = words.length > 1 ? [words.join(""), words.join("_")] : [text];
+  return [...new Map(names.filter((name) => CAM4_USERNAME.test(name)).map((name) => [name.toLowerCase(), name])).values()];
+}
+
+function profileHeaders(username: string): Record<string, string> {
+  return { accept: "application/json, text/plain, */*", "accept-language": "en-US,en;q=0.8", referer: `https://www.cam4.com/${encodeURIComponent(username)}`, "user-agent": USER_AGENT };
+}
+
+/**
+ * GET a CAM4 JSON endpoint. A plain request first (CAM4 normally allows it); when it
+ * is blocked (403/429), the browser-compatible helper of the EasyX image.
+ */
+async function cam4Json(context: PluginContext, url: string, username: string): Promise<{ status: number; data?: Record<string, unknown> }> {
+  let status = 0;
+  try {
+    const response = await context.fetch(url, { headers: profileHeaders(username), signal: accountSignal(context, 20_000) });
+    status = response.status;
+    if (response.status !== 403 && response.status !== 429) {
+      if (!response.ok || response.status === 204) return { status: response.status };
+      try {
+        const data = await response.json() as unknown;
+        return { status: response.status, ...(data && typeof data === "object" && !Array.isArray(data) ? { data: data as Record<string, unknown> } : {}) };
+      } catch { return { status: 502 }; }
+    }
+  } catch (error) { if (context.signal?.aborted) throw error; }
+  try {
+    const body = await browserHtml(context, url);
+    if (!body.trim()) return { status: 204 };
+    try { const data = JSON.parse(body) as unknown; return { status: 200, ...(data && typeof data === "object" && !Array.isArray(data) ? { data: data as Record<string, unknown> } : {}) }; }
+    catch { return { status: 502 }; }
+  } catch (error) {
+    context.signal?.throwIfAborted();
+    const code = /HTTP (\d{3})/.exec(error instanceof Error ? error.message : String(error))?.[1];
+    return { status: code ? Number(code) : status || 502 };
+  }
+}
+
+type Cam4Profile = { username: string; imageUrl?: string; online?: boolean; gender?: string; country?: string };
+
+function profileFromInfo(data: Record<string, unknown>, username: string): Cam4Profile | undefined {
+  const found = findString(data, new Set(["username", "screenname", "login"]));
+  if (!found || found.toLowerCase() !== username.toLowerCase()) return undefined;
+  const imageUrl = findString(data, new Set(["profileimagelink", "profileimageurl", "profilepictureurl", "avatarurl", "avatar", "photourl"]));
+  const gender = findString(data, new Set(["gender", "sex"]));
+  const country = findString(data, new Set(["country", "countrycode"]));
+  return {
+    username: found ?? username,
+    ...(imageUrl && /^https?:\/\//i.test(imageUrl) ? { imageUrl } : {}),
+    ...(typeof data.online === "boolean" ? { online: data.online } : {}),
+    ...(gender ? { gender } : {}), ...(country ? { country } : {}),
+  };
+}
+
+/** The username as written in the profile page data, when the page describes that performer. */
+export function cam4UsernameInPage(html: string, username: string): string | undefined {
+  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`"(?:username|screenName|nickname)"\\s*:\\s*"(${escaped})"`, "i").exec(html);
+  return match?.[1];
+}
+
+/**
+ * Exact username lookup. Undefined when there is no such performer.
+ *
+ * CAM4's profile info API now answers HTTP 401 without a login on www.cam4.com, so
+ * this tries, in order: the info API on hu.cam4.com (used by other recorders), the
+ * public stream API (confirms rooms that are live), and the public profile page.
+ */
+export async function cam4ProfileByUsername(context: PluginContext, username: string): Promise<Cam4Profile | undefined> {
+  const problems: string[] = [];
+  for (const host of ["hu.cam4.com", "www.cam4.com"]) {
+    const { status, data } = await cam4Json(context, `https://${host}/rest/v1.0/profile/${encodeURIComponent(username)}/info`, username);
+    if (data && status >= 200 && status < 300) { const profile = profileFromInfo(data, username); if (profile) return profile; }
+    if (status === 404 || status === 410) return undefined;
+    problems.push(`info on ${host}: HTTP ${status}`);
+  }
+  const stream = await cam4Json(context, `https://www.cam4.com/rest/v1.0/profile/${encodeURIComponent(username)}/streamInfo`, username);
+  if (stream.data && typeof stream.data.cdnURL === "string" && /^https?:\/\//i.test(stream.data.cdnURL)) return { username, online: true };
+  if (stream.status !== 204 && !(stream.status >= 200 && stream.status < 300)) problems.push(`streamInfo: HTTP ${stream.status}`);
+  try {
+    const html = await browserHtml(context, `https://www.cam4.com/${encodeURIComponent(username)}`);
+    const found = cam4UsernameInPage(html, username);
+    if (found) return { username: found, ...(stream.status === 204 ? { online: false } : {}) };
+    return undefined;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/HTTP 404/.test(message)) return undefined;
+    problems.push(`profile page: ${message}`);
+  }
+  throw new Error(`CAM4 profile lookup for ${username} failed (${problems.join("; ")})`);
+}
+
+export async function searchCam4People(context: PluginContext, query: string): Promise<PersonCandidate[]> {
+  const results = new Map<string, PersonCandidate>();
+  let firstError: unknown;
+  for (const username of cam4SearchUsernames(query)) {
+    let profile: Cam4Profile | undefined;
+    try { profile = await cam4ProfileByUsername(context, username); } catch (error) { context.signal?.throwIfAborted(); firstError ??= error; continue; }
+    if (!profile) continue;
+    const profileUrl = `https://www.cam4.com/${encodeURIComponent(profile.username)}`;
+    results.set(profile.username.toLowerCase(), {
+      externalId: profile.username.toLowerCase(), name: profile.username,
+      ...(profile.imageUrl ? { imageUrl: profile.imageUrl } : {}),
+      profileUrls: [profileUrl],
+      metadata: { site: "cam4.com", ...(profile.online !== undefined ? { online: profile.online } : {}), ...(profile.gender ? { gender: profile.gender } : {}), ...(profile.country ? { country: profile.country } : {}) },
+    });
+  }
+  if (!results.size && firstError) throw firstError instanceof Error ? firstError : new Error(String(firstError));
+  return [...results.values()];
+}
+
+/** Adds the CAM4 room of a performer picked in "Find a performer" (or linked to CAM4 before). */
+export async function discoverCam4Sources(_context: PluginContext, performer: PerformerRecord): Promise<SourceCandidate[]> {
+  const linked = performer.externalRefs?.["org.easyx.cam4"];
+  const found = typeof linked === "string" ? cam4SearchUsernames(linked.replace(/^live:/i, ""))[0] : undefined;
+  if (!found) return [];
+  // Prefer the spelling of the performer name (the stored reference is lower case).
+  const username = performer.name.toLowerCase() === found.toLowerCase() ? performer.name : found;
+  const profileUrl = `https://www.cam4.com/${encodeURIComponent(username)}`;
+  // Same external ID as a source added by hand (its profile URL), so nothing is added twice.
+  return [{ externalId: profileUrl, label: "cam4.com", profileUrl, domain: "cam4.com" }];
+}
+
+// --- Continuous recording ---------------------------------------------------------
+/*
+ * A CAM4 room that goes private or briefly offline stops its public stream, which
+ * used to end the recording; every return became a separate video. Recordings now
+ * run through the shared live recorder: when the stream stops it keeps checking
+ * the room for up to CAM4_MERGE_GAP_MINUTES (default: STRIPCHAT_MERGE_GAP_MINUTES,
+ * otherwise 10). CAM4 gives a returning room a new stream address, so the recorder
+ * asks streamInfo for the current one. Breaks within the limit end up in one video.
+ */
+const mergeGapMinutes = Number(process.env.CAM4_MERGE_GAP_MINUTES ?? process.env.STRIPCHAT_MERGE_GAP_MINUTES ?? 10);
+const MERGE_GAP_MS = Number.isFinite(mergeGapMinutes) && mergeGapMinutes > 0 ? mergeGapMinutes * 60_000 : 0;
+const MERGE_POLL_MS = 20_000;
+const HLS_ATTEMPTS = 4;
+const HLS_RETRY_MS = 10_000;
+
+export function cam4StreamHeaders(): Record<string, string> {
+  return { referer: "https://www.cam4.com/", origin: "https://www.cam4.com" };
+}
+
+function cam4RoomName(pageUrl: string): string | undefined {
+  try { const name = new URL(pageUrl).pathname.split("/").filter(Boolean)[0]; return name && CAM4_USERNAME.test(name) ? name : undefined; }
+  catch { return undefined; }
+}
+
+function variantUrls(manifest: string, baseUrl: string): string[] {
+  if (!manifest.trimStart().startsWith("#EXTM3U")) return [];
+  const variants: Array<{ url: string; bandwidth: number }> = []; let info = "";
+  for (const raw of manifest.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith("#EXT-X-STREAM-INF")) { info = line; continue; }
+    if (!line || line.startsWith("#") || !/\.m3u8(?:$|\?)/i.test(line)) continue;
+    variants.push({ url: new URL(line, baseUrl).toString(), bandwidth: Number(/(?:^|[:,])BANDWIDTH=(\d+)/i.exec(info)?.[1] ?? 0) });
+    info = "";
+  }
+  return variants.sort((left, right) => right.bandwidth - left.bandwidth).map((variant) => variant.url);
+}
+
+const isLivePlaylist = (text: string) => text.trimStart().startsWith("#EXTM3U") && /#EXTINF:/i.test(text) && !/#EXT-X-ENDLIST/i.test(text);
+
+async function playlistText(context: PluginContext, url: string): Promise<string | undefined> {
+  try {
+    const response = await context.fetch(url, { headers: { ...cam4StreamHeaders(), "user-agent": USER_AGENT }, signal: accountSignal(context, 15_000) });
+    return response.ok ? await response.text() : undefined;
+  } catch (error) { if (context.signal?.aborted) throw error; return undefined; }
+}
+
+/** Current public master playlist and its best live variant; undefined while the room is not public. */
+export async function cam4LiveStream(context: PluginContext, username: string): Promise<{ masterUrl: string; mediaUrl: string } | undefined> {
+  const { status, data } = await cam4Json(context, `https://www.cam4.com/rest/v1.0/profile/${encodeURIComponent(username)}/streamInfo`, username);
+  if (status === 204 || status === 404) return undefined;
+  const masterUrl = typeof data?.cdnURL === "string" && /^https?:\/\//i.test(data.cdnURL) ? data.cdnURL : undefined;
+  if (!masterUrl) {
+    if (status >= 200 && status < 300) return undefined;
+    throw new Error(`CAM4 stream lookup for ${username} returned HTTP ${status}`);
+  }
+  const master = await playlistText(context, masterUrl);
+  if (!master) return undefined;
+  if (isLivePlaylist(master)) return { masterUrl, mediaUrl: masterUrl };
+  for (const variant of variantUrls(master, masterUrl)) {
+    const playlist = await playlistText(context, variant);
+    if (playlist && isLivePlaylist(playlist)) return { masterUrl, mediaUrl: variant };
+  }
+  return undefined;
+}
+
+const genericResolveDownload = plugin.resolveDownload!;
+
+export async function resolveCam4Download(context: PluginContext, item: MediaCandidate): Promise<DownloadRequest> {
+  const username = item.pageUrl ? cam4RoomName(item.pageUrl) : undefined;
+  if (!username || item.mediaType !== "video") return genericResolveDownload(context, item);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= HLS_ATTEMPTS; attempt += 1) {
+    context.signal?.throwIfAborted();
+    try {
+      const stream = await cam4LiveStream(context, username);
+      if (stream) {
+        return {
+          kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: item.filename ?? `${username}-live.mp4`,
+          args: [
+            "-e", LIVE_RECORDER_SCRIPT, stream.mediaUrl, stream.masterUrl, JSON.stringify(cam4StreamHeaders()), "{output}",
+            String(MERGE_GAP_MS), String(MERGE_POLL_MS), USER_AGENT,
+            `https://www.cam4.com/rest/v1.0/profile/${encodeURIComponent(username)}/streamInfo`, "cdnURL",
+          ],
+        } satisfies CommandDownloadRequest;
+      }
+      lastError = undefined;
+    } catch (error) { lastError = error; }
+    if (attempt < HLS_ATTEMPTS) await retryDelay(HLS_RETRY_MS, context.signal);
+  }
+  context.signal?.throwIfAborted();
+  // CAM4 answered, but the room has no public stream.
+  if (!lastError) throw new Error("The CAM4 room is not public");
+  // The room API could not be used: let yt-dlp try, as before this change.
+  context.log("debug", "CAM4 stream lookup failed; falling back to yt-dlp", lastError instanceof Error ? lastError.message : String(lastError));
+  return genericResolveDownload(context, item);
+}
+
+plugin.manifest.capabilities = [...new Set([...plugin.manifest.capabilities, "identity-search" as const, "source-discovery" as const])];
+plugin.searchPeople = searchCam4People;
+plugin.discoverSources = discoverCam4Sources;
+plugin.resolveDownload = resolveCam4Download;
 
 export default plugin;

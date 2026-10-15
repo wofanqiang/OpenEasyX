@@ -280,6 +280,8 @@ export default definePlugin({
     browserAuth: { loginUrl: "https://chaturbate.com/auth/login/", sessionSetting: "cookiesFile" },
     settings: [
       { key: "cookiesFile", label: "Account session", type: "session", cookieDomains: ["chaturbate.com"], help: "Optional. Public rooms normally do not require an account session." },
+      { key: "forceIpv4", label: "Use IPv4 for stream extraction", type: "boolean", default: true, help: "Avoids unreachable IPv6 routes when yt-dlp resolves or opens a recording. Disable only if your network requires IPv6." },
+      { key: "recordingMaxHeight", label: "Maximum recording height", type: "number", default: 0, help: "0 = best available; use 720, 480, or 1080 to capture a native stream at or below that height, with audio. A matching stream must be available. Choose Original stream in Settings → Live recording preset to avoid re-encoding." },
     ],
   },
   async testConnection(context) {
@@ -297,7 +299,7 @@ export default definePlugin({
   async listMedia(context, source) {
     try {
       const profileUrl = normalizedChaturbateUrl(source.profileUrl);
-      const info = await runYtDlpJson(context, ["--skip-download", "--dump-single-json", "--socket-timeout", "20", "--referer", "https://chaturbate.com/", ...configuredArgs(context.config), profileUrl], 90_000);
+      const info = await runYtDlpJson(context, ["--skip-download", "--dump-single-json", "--socket-timeout", "20", "--referer", "https://chaturbate.com/", ...(context.config.forceIpv4 !== false ? ["--force-ipv4"] : []), ...configuredArgs(context.config), profileUrl], 90_000);
       const candidate = chaturbateLiveCandidate(info, profileUrl);
       return candidate ? [candidate] : [];
     } catch (error) {
@@ -386,6 +388,10 @@ export default definePlugin({
   },
   async listFollowedLiveCams(context) { return followedSnapshot(context); },
   async setLiveCamFavorite(context, cam, favorite) { return setRemoteFavorite(context, cam, favorite); },
-  async resolveLiveStream(context, cam) { return ytDlpLiveStream(context, cam, { referer: "https://chaturbate.com/" }); },
-  async resolveDownload(context, item) { return ytDlpDownload(item, context.config, { referer: "https://chaturbate.com/", live: true }); },
+  async resolveLiveStream(context, cam) { return ytDlpLiveStream(context, cam, { referer: "https://chaturbate.com/", forceIpv4: context.config.forceIpv4 !== false }); },
+  async resolveDownload(context, item) {
+    const maxHeight = Number(context.config.recordingMaxHeight ?? 0);
+    if (!Number.isInteger(maxHeight) || maxHeight < 0) throw new Error("Maximum recording height must be 0 (best available) or a positive integer such as 720.");
+    return ytDlpDownload(item, context.config, { referer: "https://chaturbate.com/", live: true, forceIpv4: context.config.forceIpv4 !== false, maxHeight });
+  },
 });

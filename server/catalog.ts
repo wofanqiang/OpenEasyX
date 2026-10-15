@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { LibraryDatabase, type Media, type MediaKind } from "./library-database.js";
+import { firstMediaDate } from "../packages/media-date.js";
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv", ".ts", ".mts", ".m2ts"]);
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"]);
@@ -94,6 +95,7 @@ export class Catalog {
     readonly dataDir: string,
     readonly eagerThumbnails = process.env.NODE_ENV !== "test" && process.env.EASYX_EAGER_THUMBNAILS !== "false",
     private readonly storedMetadata?: (relativePath: string) => Record<string, unknown>,
+    private readonly resolvePerformerName: (name: string) => string = (name) => name,
     private readonly warn: (message: string) => void = () => {},
   ) {
     fs.mkdirSync(mediaRoot, { recursive: true });
@@ -131,16 +133,22 @@ export class Catalog {
           const performerValue = metadataString(metadata, ["performer"]);
           const sourceValue = metadataString(metadata, ["source", "sourceUrl", "source_url", "webpage_url", "url"]);
           const id = crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 24);
+          const fallbackDate = firstMediaDate(metadata.downloadedAt, stat.mtime.toISOString(), stat.birthtime.toISOString(), stat.ctime.toISOString()) ?? scanId;
+          const mediaDate = (metadata.live === true
+            ? firstMediaDate(metadata.recordedAt, metadata.downloadStartedAt, metadata.downloadedAt)
+            : firstMediaDate(metadata.publishedAt, metadata.published_at, metadata.timestamp, metadata.release_timestamp,
+              metadata.upload_timestamp, metadata.upload_date, metadata.release_date, metadata.date_published,
+              metadata.datePublished, metadata.date, metadata.created_at)) ?? fallbackDate;
           this.db.upsertMedia({
             id,
-            relativePath, kind, title: titleValue || cleanTitle(relativePath), performer: performerValue || (parts.length > 1 ? parts[0] : "Unsorted"),
+            relativePath, kind, title: titleValue || cleanTitle(relativePath), performer: this.resolvePerformerName(performerValue || (parts.length > 1 ? parts[0] : "Unsorted")),
             source: sourceDomain(sourceValue || (parts.length > 2 ? parts[1] : "")), extension, mimeType: MIMES[extension] ?? "application/octet-stream",
             // birthtime is the honest "when did this file first appear", which is what the library
             // shows as its ingest time, but a filesystem without it reports the epoch -- and that
             // would sort a recording captured a minute ago below everything from 1970. Fall back to
             // the mtime, which is at least a real date.
             size: stat.size, modifiedAt: stat.mtime.toISOString(),
-            addedAt: (stat.birthtimeMs > 0 ? stat.birthtime : stat.mtime).toISOString(),
+            addedAt: (stat.birthtimeMs > 0 ? stat.birthtime : stat.mtime).toISOString(), mediaDate,
             duration: 0, width: 0, height: 0, metadata, scanId,
           });
           if (this.eagerThumbnails) {

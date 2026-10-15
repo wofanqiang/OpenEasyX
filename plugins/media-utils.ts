@@ -1,3 +1,4 @@
+import { oldestMediaDate } from "../packages/media-date.js";
 import type { MediaCandidate } from "../packages/plugin-sdk/index.js";
 
 const MEDIA_EXTENSIONS = /\.(?:avif|bmp|gif|jpe?g|png|webp|mp4|m4v|mov|mkv|webm|avi|ts|zip|rar|7z)(?:$|[?#])/i;
@@ -51,20 +52,7 @@ function mediaType(url: string, hint?: string): MediaCandidate["mediaType"] {
 }
 
 export function sourcePublishedDate(...values: unknown[]): string | undefined {
-  const dates = values.flatMap((value) => {
-    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-      return [new Date(value > 10_000_000_000 ? value : value * 1000)];
-    }
-    if (typeof value !== "string" || !value.trim()) return [];
-    const raw = decodeMarkup(value.trim());
-    if (/^\d{10,13}$/.test(raw)) {
-      const stamp = Number(raw);
-      return [new Date(raw.length === 13 ? stamp : stamp * 1000)];
-    }
-    const compact = raw.match(/^(\d{4})(\d{2})(\d{2})$/);
-    return [compact ? new Date(`${compact[1]}-${compact[2]}-${compact[3]}T00:00:00Z`) : new Date(raw)];
-  }).filter((date) => !Number.isNaN(date.valueOf()) && date.getUTCFullYear() >= 1900 && date.valueOf() <= Date.now() + 86_400_000);
-  return dates.sort((left, right) => left.valueOf() - right.valueOf())[0]?.toISOString();
+  return oldestMediaDate(...values.map((value) => typeof value === "string" ? decodeMarkup(value.trim()) : value));
 }
 
 export function directCandidate(url: string, options: { hint?: string; title?: string; pageUrl?: string; width?: number; height?: number; expectedBytes?: number; publishedAt?: string } = {}): MediaCandidate {

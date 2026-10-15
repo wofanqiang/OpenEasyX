@@ -93,6 +93,8 @@ export type CommandDownloadRequest = {
   command: string;
   args: string[];
   filename: string;
+  /** Wrappers that finalize output themselves must exit successfully, even after a stop. */
+  requireSuccessfulExit?: boolean;
 };
 
 export type DownloadRequest = HttpDownloadRequest | CommandDownloadRequest;

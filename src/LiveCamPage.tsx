@@ -73,6 +73,9 @@ export function shouldRecoverNativeLiveMediaError(code: number | undefined, hidd
 }
 
 export function LivePlayer({ cam, close }: { cam: LiveCam; close: () => void }) {
+  // Catalogue refreshes replace cam objects even when the broadcast is unchanged.
+  // Only a different room (or an explicit retry) should replace the active stream.
+  const streamCam = useMemo(() => ({ id: cam.id, username: cam.username, pageUrl: cam.pageUrl, providerId: cam.providerId }), [cam.providerId, cam.id, cam.username, cam.pageUrl]);
   const video = useRef<HTMLVideoElement>(null); const player = useRef<HTMLDivElement>(null); const hideTimer = useRef<number | undefined>(undefined);
   const initialAudio = useRef(loadPlayerAudio(undefined, { volume: 1, muted: true }));
   const [streamUrl, setStreamUrl] = useState(""); const [error, setError] = useState(""); const [retry, setRetry] = useState(0);
@@ -107,15 +110,34 @@ export function LivePlayer({ cam, close }: { cam: LiveCam; close: () => void }) 
     return () => { window.removeEventListener("keydown", onKey); window.clearTimeout(hideTimer.current); };
   }, [close, fullscreen, pageFullscreen]);
   useEffect(() => {
-    let active = true; setStreamUrl(""); setError(""); setWaiting(true);
-    void api<{ streamUrl: string }>("/api/live-cams/stream", { method: "POST", body: JSON.stringify({ providerId: cam.providerId, cam }) })
+    let active = true; setStreamUrl(""); setError(""); setWaiting(true); setPlaying(false);
+    void api<{ streamUrl: string }>("/api/live-cams/stream", { method: "POST", signal: AbortSignal.timeout(30_000), body: JSON.stringify({ providerId: streamCam.providerId, cam: streamCam }) })
       .then((result) => { if (active) setStreamUrl(result.streamUrl); })
       .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : String(reason)); });
     return () => { active = false; };
-  }, [cam, retry]);
+  }, [streamCam, retry]);
   useEffect(() => {
     const element = video.current; if (!element || !streamUrl) return;
     let hls: HlsInstance | undefined; let active = true; let nativeHls = false; let wasPlayingBeforeHidden = false; let needsNativeRecovery = false; let recoveryQueued = false; let foregroundedAt = 0;
+    let networkRecoveries = 0; let mediaRecoveries = 0; let stopped = false;
+    const fail = (message: string) => {
+      if (!active) return;
+      stopped = true; hls?.stopLoad(); element.pause(); setWaiting(false); setPlaying(false); setError(message);
+    };
+    const play = () => void element.play().catch((reason: unknown) => {
+      if (!active || stopped) return;
+      if (reason instanceof DOMException && (reason.name === "NotAllowedError" || reason.name === "AbortError")) { setWaiting(false); return; }
+      fail("The live stream could not be played. Try opening it again.");
+    });
+    const canPlay = () => { if (!stopped && element.paused) play(); };
+    const reload = () => {
+      if (!active || stopped) return;
+      setWaiting(true);
+      // Reattach MediaSource for HLS.js; reload the native decoder for Safari.
+      element.addEventListener("canplay", canPlay, { once: true });
+      if (hls) hls.recoverMediaError();
+      else { element.src = streamUrl; element.load(); play(); }
+    };
     const recoverNativeStream = () => {
       if (!active || recoveryQueued) return;
       recoveryQueued = true; setError(""); setWaiting(true); setPlaying(false); setRetry((value) => value + 1);
@@ -123,13 +145,15 @@ export function LivePlayer({ cam, close }: { cam: LiveCam; close: () => void }) 
     const mediaError = () => {
       if (!active) return;
       const code = element.error?.code;
+      // HLS.js owns MediaSource error recovery; do not cover its retries with
+      // a terminal native-player error overlay.
+      if (hls) return;
       if (nativeHls && shouldRecoverNativeLiveMediaError(code, document.hidden, foregroundedAt, Date.now())) {
         needsNativeRecovery = true; setError(""); setWaiting(true); setPlaying(false);
         if (!document.hidden) recoverNativeStream();
         return;
       }
-      setWaiting(false); setPlaying(false);
-      setError(code ? `Safari could not play this live stream (media error ${code}).` : "The live stream could not be played.");
+      fail(code ? `The browser could not play this live stream (media error ${code}).` : "The live stream could not be played.");
     };
     const visibilityChanged = () => {
       if (!nativeHls) return;
@@ -145,32 +169,28 @@ export function LivePlayer({ cam, close }: { cam: LiveCam; close: () => void }) 
       if (element.canPlayType("application/vnd.apple.mpegurl")) {
         nativeHls = true;
         element.src = streamUrl; element.load();
-        await element.play().catch((reason) => { if (reason instanceof DOMException && reason.name === "NotAllowedError") setWaiting(false); else throw reason; });
+        play();
         return;
       }
       const { default: Hls } = await import("hls.js"); if (!active) return;
-      if (!Hls.isSupported()) { setError("This browser cannot play HLS live streams."); return; }
+      if (!Hls.isSupported()) { fail("This browser cannot play HLS live streams."); return; }
       hls = new Hls({ enableWorker: true, lowLatencyMode: true, backBufferLength: 30, highBufferWatchdogPeriod: 2, nudgeMaxRetry: 5 }); hls.loadSource(streamUrl); hls.attachMedia(element);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => void element.play().catch(() => setWaiting(false)));
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (active && !stopped) play(); });
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (!data.fatal || !hls) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); return; }
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
-        setError("The live stream stopped or could not be decoded.");
+        if (!active || stopped || !data.fatal || !hls) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveries++ < 2) { hls.startLoad(); return; }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 2) { reload(); return; }
+        fail("The live stream stopped or could not be decoded. Try opening a fresh stream.");
       });
     };
-    void start().catch(() => setError("The live player could not be initialized."));
-    return () => { active = false; element.removeEventListener("error", mediaError); document.removeEventListener("visibilitychange", visibilityChanged); hls?.destroy(); element.pause(); element.removeAttribute("src"); element.load(); };
-  }, [streamUrl]);
-  useEffect(() => {
-    const element = video.current;
-    if (!element || !streamUrl) return;
-    return monitorVideoStalls(element);
+    const stopMonitoring = monitorVideoStalls(element, { reload, failed: () => fail("The live image is still frozen. Try opening a fresh stream.") });
+    void start().catch(() => fail("The live player could not be initialized."));
+    return () => { active = false; stopMonitoring(); element.removeEventListener("canplay", canPlay); element.removeEventListener("error", mediaError); document.removeEventListener("visibilitychange", visibilityChanged); hls?.destroy(); element.pause(); element.removeAttribute("src"); element.load(); };
   }, [streamUrl]);
   return <div className="live-stage live-watch-stage">
     <div ref={player} className={`custom-player live-custom-player ${pageFullscreen ? "page-fullscreen" : ""} ${controls || !playing ? "controls-visible" : "controls-hidden"}`} tabIndex={0} onMouseMove={reveal} onTouchStart={reveal} onMouseLeave={() => playing && setControls(false)}>
       <div className="player-surface" onClick={togglePlayback} onDoubleClick={() => void toggleFullscreen()}><video ref={video} playsInline muted={muted} preload="auto"
-        onPlay={() => { setPlaying(true); setWaiting(false); setError(""); reveal(); }} onPlaying={() => { setPlaying(true); setWaiting(false); setError(""); }} onPause={() => { setPlaying(false); setWaiting(false); }} onWaiting={() => setWaiting(true)} onCanPlay={() => setWaiting(false)}
+        onPlay={() => { setPlaying(true); reveal(); }} onPlaying={() => { setPlaying(true); setWaiting(false); setError(""); }} onPause={() => { setPlaying(false); setWaiting(false); }} onWaiting={() => setWaiting(true)} onCanPlay={() => setWaiting(false)}
         onVolumeChange={(event) => { const audio = { volume: event.currentTarget.volume, muted: event.currentTarget.muted }; setVolume(audio.volume); setMuted(audio.muted); initialAudio.current = audio; savePlayerAudio(audio); }}/></div>
       {waiting && !error && <div className="player-buffering"><LoaderCircle className="spin"/></div>}
       {!playing && !waiting && !error && <button className="player-center-play" onClick={togglePlayback} aria-label="Play live stream"><Play fill="currentColor"/></button>}

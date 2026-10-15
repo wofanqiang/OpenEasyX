@@ -85,6 +85,10 @@ Live plugins must make `listMedia` a short, idempotent status check and return p
 
 Every media candidate needs a source-stable `externalId`. If several URLs represent the same underlying work, also return the same cross-variant `identityKey` and a numeric `qualityScore`. Return the source publication or creation date as an ISO-compatible `publishedAt` whenever it is available. EasyX retains the candidate with the highest known score while reconciling the oldest reliable date observed across its variants. After download, SHA-256 removes byte-identical duplicates and a conservative perceptual image fingerprint recognizes resized or recompressed copies for the same performer.
 
+For videos, the core also checks whether a newly downloaded excerpt is contained in a longer, completed video for the same performer, including videos from another source. It first searches cached frame fingerprints, then verifies the proposed interval using RGB samples across the entire excerpt. A confirmed excerpt is marked `duplicate` with `duplicateReason: "contained-excerpt"` and `duplicateOf` pointing to the full video. Only the temporary excerpt is discarded; the original file, quality and publication date remain unchanged. Subsequent discovery of that source item does not queue it again.
+
+This check runs after download, so it saves library space rather than the initial network transfer. Fingerprints of older downloads are generated when needed, persist across restarts, and are invalidated when the file changes. Detection is deliberately conservative: it handles continuous, same-speed excerpts between 10 seconds and 30 minutes, against originals up to 6 hours long. It requires varied visual content and near-complete agreement at four samples per second; heavily edited, cropped, very short or static clips may be retained. Audio is not compared. Missing files, unsupported codecs, ambiguous matches and analysis exceeding the two-minute budget preserve the new download. This does not retroactively remove existing excerpts or index manually imported library files.
+
 Suggested quality scoring:
 
 - images: pixel width × pixel height

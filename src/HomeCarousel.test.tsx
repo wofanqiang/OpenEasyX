@@ -24,5 +24,6 @@ describe("RecentCarousel", () => {
     expect(mediaQualityLabel({ kind: "video", width: 1920, height: 1080, extension: ".mp4" })).toBe("1080p");
     expect(mediaQualityLabel({ kind: "image", width: 2400, height: 1600, extension: ".jpg" })).toBe("2400×1600");
     expect(mediaDateLabel("2026-08-31T12:00:00.000Z")).toBe("Aug 31, 2026");
+    expect(mediaDateLabel("1970-01-01T00:00:00.000Z")).toBe("Unknown date");
   });
 });

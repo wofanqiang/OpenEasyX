@@ -1,3 +1,4 @@
+import { oldestMediaDate as mediaDate } from "../packages/media-date.js";
 import type { CommandDownloadRequest, LiveCam, LiveStream, MediaCandidate, PluginContext } from "../packages/plugin-sdk/index.js";
 
 type YtDlpEntry = Record<string, unknown> & { entries?: YtDlpEntry[] };
@@ -9,16 +10,6 @@ function text(value: unknown): string | undefined {
 function number(value: unknown): number | undefined {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-}
-
-function mediaDate(...values: unknown[]): string | undefined {
-  return values.flatMap((value) => {
-    if (typeof value === "number" && Number.isFinite(value) && value > 0) return [new Date(value > 10_000_000_000 ? value : value * 1000)];
-    const raw = text(value); if (!raw) return [];
-    const compact = raw.match(/^(\d{4})(\d{2})(\d{2})$/);
-    return [compact ? new Date(`${compact[1]}-${compact[2]}-${compact[3]}T00:00:00Z`) : new Date(raw)];
-  }).filter((date) => !Number.isNaN(date.valueOf()) && date.getUTCFullYear() >= 1900 && date.valueOf() <= Date.now() + 86_400_000)
-    .sort((left, right) => left.valueOf() - right.valueOf())[0]?.toISOString();
 }
 
 export function configuredArgs(config: Record<string, unknown>): string[] {
@@ -86,8 +77,9 @@ export function liveStreamFromInfo(info: YtDlpEntry, username: string): LiveStre
   return { url, headers, contentType: /\.m3u8(?:$|\?)/i.test(url) ? "application/vnd.apple.mpegurl" : undefined };
 }
 
-export async function ytDlpLiveStream(context: PluginContext, cam: LiveCam, options: { referer?: string; impersonate?: string } = {}): Promise<LiveStream> {
+export async function ytDlpLiveStream(context: PluginContext, cam: LiveCam, options: { referer?: string; impersonate?: string; forceIpv4?: boolean } = {}): Promise<LiveStream> {
   const args = ["--skip-download", "--dump-single-json", "--socket-timeout", "20", ...configuredArgs(context.config)];
+  if (options.forceIpv4) args.push("--force-ipv4");
   if (options.impersonate) args.push("--impersonate", options.impersonate);
   if (options.referer) args.push("--referer", options.referer);
   const info = await runYtDlpJson(context, [...args, cam.pageUrl], 90_000);
@@ -125,11 +117,12 @@ export function playlistCandidates(info: YtDlpEntry, sourceUrl: string, prefix: 
   return [...found.values()];
 }
 
-export function ytDlpDownload(item: MediaCandidate, config: Record<string, unknown>, options: { referer?: string; live?: boolean; impersonate?: string } = {}): CommandDownloadRequest {
+export function ytDlpDownload(item: MediaCandidate, config: Record<string, unknown>, options: { referer?: string; live?: boolean; impersonate?: string; forceIpv4?: boolean; maxHeight?: number } = {}): CommandDownloadRequest {
   const extractorUrl = text(item.metadata?.extractorUrl) ?? item.pageUrl;
   if (!extractorUrl) throw new Error("The extractor did not provide a downloadable page URL");
+  const height = options.live && options.maxHeight && Number.isInteger(options.maxHeight) && options.maxHeight > 0 ? `[height<=${options.maxHeight}]` : "";
   const format = options.live
-    ? "bestvideo+bestaudio/best"
+    ? `bestvideo${height}+bestaudio/best${height}`
     : "bestvideo*[vcodec!=none]+bestaudio[acodec!=none]/best[acodec!=none]/best";
   const args = [
     "--progress", "--newline", "--progress-delta", "0.5", "--progress-template", "download:easyx-progress:%(progress._percent_str)s", "--no-playlist", "--retries", "5", "--fragment-retries", "5",
@@ -139,10 +132,12 @@ export function ytDlpDownload(item: MediaCandidate, config: Record<string, unkno
     "--continue",
     "--concurrent-fragments", "1", ...configuredArgs(config),
   ];
+  if (options.forceIpv4) args.push("--force-ipv4");
   if (options.impersonate) args.push("--impersonate", options.impersonate);
   if (options.referer) args.push("--referer", options.referer);
   args.push("--format", format, "--merge-output-format", "mp4", "--remux-video", "mp4", "--output", "{output}");
-  if (options.live) args.push("--no-hls-use-mpegts");
+  // Capture separate live video/audio together, preserving their shared timeline.
+  if (options.live) args.push("--downloader", "ffmpeg", "--no-hls-use-mpegts");
   args.push(extractorUrl);
   return { kind: "command", command: "yt-dlp", args, filename: item.filename ?? `${item.externalId}.mp4` };
 }

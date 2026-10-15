@@ -57,15 +57,22 @@ function decodedFrames(element: FrameVideo) {
   return typeof element.webkitDecodedFrameCount === "number" ? element.webkitDecodedFrameCount : undefined;
 }
 
-export function monitorVideoStalls(element: HTMLVideoElement) {
+export function monitorVideoStalls(element: HTMLVideoElement, options: {
+  reload?: () => void;
+  failed?: () => void;
+} = {}) {
   let state = videoStallState(performance.now(), element.currentTime);
   let frameRequest: number | undefined;
   let recovering = false;
+  let active = true;
+  let animationRequest: number | undefined;
+  let failed = false;
   let previousDecodedFrames = decodedFrames(element);
   const hasFrameCallback = typeof element.requestVideoFrameCallback === "function";
   const hasFrameCounter = previousDecodedFrames !== undefined;
 
   const frame = (now: number, metadata: VideoFrameCallbackMetadata) => {
+    if (!active) return;
     noteRenderedVideoFrame(state, now, metadata.mediaTime);
     frameRequest = element.requestVideoFrameCallback(frame);
   };
@@ -86,29 +93,45 @@ export function monitorVideoStalls(element: HTMLVideoElement) {
       }
       previousDecodedFrames = nextDecodedFrames;
     }
-    if ((!hasFrameCallback && !hasFrameCounter) || recovering) return;
+    if ((!hasFrameCallback && !hasFrameCounter) || recovering || failed) return;
     const now = performance.now();
-    if (!shouldRecoverVideoStall(state, {
+    // Check one final time after the retry budget, so a persistent black screen
+    // becomes an actionable error rather than silently abandoning recovery.
+    if (!shouldRecoverVideoStall({ ...state, consecutiveRecoveries: 0 }, {
       now, currentTime: element.currentTime, duration: element.duration,
       paused: element.paused, ended: element.ended, seeking: element.seeking,
       readyState: element.readyState, hidden: document.hidden,
     })) return;
 
+    if (state.consecutiveRecoveries >= VIDEO_STALL_MAX_RECOVERIES) {
+      failed = true;
+      options.failed?.();
+      return;
+    }
+
     recovering = true;
     const resumeAt = element.currentTime;
     noteVideoStallRecovery(state, now, resumeAt);
+    if (state.consecutiveRecoveries > 1 && options.reload) {
+      try { options.reload(); } finally { recovering = false; }
+      return;
+    }
     element.pause();
-    const maximum = Number.isFinite(element.duration) ? Math.max(0, element.duration - 0.1) : resumeAt + 0.04;
-    element.currentTime = Math.min(maximum, resumeAt + 0.04);
-    window.requestAnimationFrame(() => {
-      void element.play().then(() => {
-        console.info(`[Open EasyX] Recovered frozen video at ${resumeAt.toFixed(2)}s.`);
-      }).catch(() => {}).finally(() => { recovering = false; });
+    try {
+      const maximum = Number.isFinite(element.duration) ? Math.max(0, element.duration - 0.1) : resumeAt + 0.04;
+      element.currentTime = Math.min(maximum, resumeAt + 0.04);
+    } catch { /* A live seek window can move while recovery is in progress. */ }
+    animationRequest = window.requestAnimationFrame(() => {
+      animationRequest = undefined;
+      if (!active) return;
+      void element.play().catch(() => {}).finally(() => { recovering = false; });
     });
   }, 1_000);
 
   return () => {
+    active = false;
     window.clearInterval(timer);
+    if (animationRequest !== undefined) window.cancelAnimationFrame(animationRequest);
     element.removeEventListener("loadeddata", playbackBaseline);
     element.removeEventListener("seeked", playbackBaseline);
     if (frameRequest !== undefined && typeof element.cancelVideoFrameCallback === "function") element.cancelVideoFrameCallback(frameRequest);

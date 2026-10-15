@@ -1,8 +1,9 @@
+import { LIVE_RECORDER_SCRIPT, retryDelay } from "../live-recorder.js";
 import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
 import { browserHtml } from "../browser-html-utils.js";
 import { stripchatFavoriteCams, stripchatProfileLiveCams, stripchatStreamConfig } from "../live-cam-discovery.js";
-import type { CommandDownloadRequest, LiveCam, LiveCamFavoriteSnapshot, LiveStream, MediaCandidate, MediaSource, PluginContext } from "../../packages/plugin-sdk/index.js";
+import type { CommandDownloadRequest, LiveCam, LiveCamFavoriteSnapshot, LiveStream, MediaCandidate, MediaSource, PerformerRecord, PersonCandidate, PluginContext, SourceCandidate } from "../../packages/plugin-sdk/index.js";
 
 const plugin = createLiveCamPlugin({
   id: "org.easyx.stripchat", name: "Stripchat Live", prefix: "stripchat", homepage: "https://stripchat.com",
@@ -269,28 +270,100 @@ export async function resolveStripchatDirect(context: PluginContext, pageUrl: st
   return { url: stream.masterUrl, headers: stream.headers, contentType: "application/vnd.apple.mpegurl" };
 }
 
+// A room that has just (re)started often needs a few seconds before its public HLS
+// manifest is available. Retry briefly instead of failing the recording at once.
+const STRIPCHAT_HLS_ATTEMPTS = 4;
+const STRIPCHAT_HLS_RETRY_MS = 10_000;
+async function resolveStripchatHlsWithRetry(context: PluginContext, pageUrl: string): Promise<ResolvedStripchatHls> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= STRIPCHAT_HLS_ATTEMPTS; attempt += 1) {
+    context.signal?.throwIfAborted();
+    try { return await resolveStripchatHls(context, pageUrl); }
+    catch (error) {
+      lastError = error;
+      if (attempt === STRIPCHAT_HLS_ATTEMPTS || context.signal?.aborted) break;
+      context.log("debug", `Stripchat HLS not ready (attempt ${attempt}/${STRIPCHAT_HLS_ATTEMPTS}); retrying`, error instanceof Error ? error.message : String(error));
+      await retryDelay(STRIPCHAT_HLS_RETRY_MS, context.signal);
+    }
+  }
+  throw lastError;
+}
+
+/*
+ * Continuous recording across short breaks.
+ *
+ * A Stripchat room that goes private, into a group show or briefly offline stops
+ * its public HLS stream, which used to end the recording; every return then became
+ * a separate video. The recording now runs through a small wrapper: each public
+ * stretch is recorded as a part, and when the stream stops the wrapper keeps
+ * polling the same public manifest for up to STRIPCHAT_MERGE_GAP_MINUTES (default
+ * 10). If the room comes back in time, recording continues with a new part; when
+ * the gap runs out (or the recording is stopped) all parts are joined into one
+ * video. While the wrapper waits, the item stays "downloading", so the session
+ * source scanner keeps the same session and no second recording is queued.
+ */
+const mergeGapMinutes = Number(process.env.STRIPCHAT_MERGE_GAP_MINUTES ?? 10);
+const STRIPCHAT_MERGE_GAP_MS = Number.isFinite(mergeGapMinutes) && mergeGapMinutes > 0 ? mergeGapMinutes * 60_000 : 0;
+const STRIPCHAT_MERGE_POLL_MS = 20_000;
+
+/** Standalone recorder run with `node -e`; it must not contain the server's output placeholders. */
+
 export async function resolveStripchatDownload(context: PluginContext, item: MediaCandidate): Promise<CommandDownloadRequest> {
   if (!item.pageUrl) throw new Error("Stripchat recording is missing its public room URL");
-  const stream = await resolveStripchatHls(context, item.pageUrl);
-  const headerLines = Object.entries(stream.headers).map(([name, value]) => `${name}: ${value}`).join("\r\n");
+  const stream = await resolveStripchatHlsWithRetry(context, item.pageUrl);
   return {
-    kind: "command", command: "ffmpeg", filename: item.filename ?? "stripchat-live.mp4",
+    kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: item.filename ?? "stripchat-live.mp4",
     args: [
-      "-hide_banner", "-loglevel", "warning", "-headers", `${headerLines}\r\n`, "-i", stream.mediaUrl,
-      "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", "-y", "{output}",
+      "-e", LIVE_RECORDER_SCRIPT, stream.mediaUrl, stream.masterUrl, JSON.stringify(stream.headers), "{output}",
+      String(STRIPCHAT_MERGE_GAP_MS), String(STRIPCHAT_MERGE_POLL_MS), USER_AGENT,
     ],
   };
 }
 
+/** Room status from the profile page, e.g. "public", "private", "p2p", "groupShow", "idle", "off". */
+export function stripchatRoomStatus(html: string): string | undefined {
+  const marker = html.indexOf("window.__PRELOADED_STATE__");
+  const start = marker >= 0 ? html.indexOf("{", marker) : -1;
+  if (start < 0) return undefined;
+  let depth = 0; let quoted = false; let escaped = false;
+  for (let index = start; index < html.length; index += 1) {
+    const char = html[index];
+    if (quoted) { if (escaped) escaped = false; else if (char === "\\") escaped = true; else if (char === '"') quoted = false; continue; }
+    if (char === '"') quoted = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}" && --depth === 0) {
+      try {
+        const state = JSON.parse(html.slice(start, index + 1));
+        const status = state?.viewCam?.model?.status;
+        return typeof status === "string" && status.trim() ? status.trim().toLowerCase() : undefined;
+      } catch { return undefined; }
+    }
+  }
+  return undefined;
+}
+
+// Only statuses known to have no public stream; anything unknown is still recorded.
+const STRIPCHAT_NON_PUBLIC_STATUSES = new Set(["private", "p2p", "groupshow", "virtualprivate", "idle", "off", "offline"]);
+
 export async function listStripchatMedia(context: PluginContext, source: MediaSource): Promise<MediaCandidate[]> {
   const username = new URL(source.profileUrl).pathname.split("/").filter(Boolean).at(-1)?.replace(/^@/, "") ?? "live";
-  const cam = stripchatProfileLiveCams(await browserHtml(context, source.profileUrl), username)[0];
-  if (!cam) return [];
+  const html = await browserHtml(context, source.profileUrl);
+  const cam = stripchatProfileLiveCams(html, username)[0];
+  if (!cam) { return []; }
+  // "Online" is not enough: in a private, group or away state there is no public
+  // stream, so a recording would fail. Treat it as offline; when the room returns
+  // to a public show a new session (and recording) starts.
+  const status = stripchatRoomStatus(html);
+  if (status && STRIPCHAT_NON_PUBLIC_STATUSES.has(status)) {
+    context.log("debug", `Stripchat room ${cam.username} is online but not public (${status}); not recording`);
+    return [];
+  }
   const safeName = cam.username.replace(/[^a-z0-9_.-]+/gi, "-").replace(/^-+|-+$/g, "") || "live";
   return [{
     externalId: `stripchat:${cam.username.toLowerCase()}:live`,
-    title: cam.title ?? `${cam.username} live`, pageUrl: cam.pageUrl, mediaType: "video", filename: `${safeName}-live.mp4`,
-    metadata: { extractorUrl: cam.pageUrl, live: true, viewers: cam.viewers, gender: cam.gender, tags: cam.tags ?? [] },
+    title: `${cam.username} live`, pageUrl: cam.pageUrl, mediaType: "video",
+    filename: `${safeName}-live.mp4`,
+    metadata: { extractorUrl: cam.pageUrl, live: true, viewers: cam.viewers, gender: cam.gender, tags: cam.tags ?? [], roomTitle: cam.title, status },
   }];
 }
 
@@ -315,5 +388,143 @@ plugin.testConnection = async (context) => {
 };
 plugin.listFollowedLiveCams = stripchatFollowedSnapshot;
 plugin.setLiveCamFavorite = setStripchatFavorite;
+
+/*
+ * Performer search ("Find a performer").
+ *
+ * Stripchat has no public name search, so this looks up exact usernames: the text
+ * as typed and, for multi-word input, the words joined with nothing, "_" and "-"
+ * ("Jane Doe" -> JaneDoe, Jane_Doe, Jane-Doe). Every result is a model confirmed
+ * by its Stripchat profile page; the user reviews and picks one. Picking it stores the Stripchat username
+ * on the performer, and source discovery then adds exactly that room as a source.
+ */
+const STRIPCHAT_USERNAME = /^[A-Za-z0-9_-]{3,40}$/;
+
+export function stripchatSearchUsernames(query: string): string[] {
+  let text = query.trim();
+  try { if (/^https?:\/\//i.test(text)) text = new URL(text).pathname.split("/").filter(Boolean).at(-1) ?? ""; } catch { return []; }
+  text = text.replace(/^@/, "");
+  const words = text.split(/\s+/).filter(Boolean);
+  const names = words.length > 1 ? [words.join(""), words.join("_"), words.join("-")] : [text];
+  return [...new Map(names.filter((name) => STRIPCHAT_USERNAME.test(name)).map((name) => [name.toLowerCase(), name])).values()];
+}
+
+type StripchatModel = { username: string; avatarUrl?: string; online?: boolean; gender?: string; country?: string; renamedFrom?: string };
+
+const textValue = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+/**
+ * Stripchat blocks its JSON API for server requests (HTTP 403 plain, 418 even with
+ * a Chrome fingerprint), but serves the public profile page through the browser-
+ * compatible helper of the EasyX image, the same page the plugin loads to record.
+ * That page embeds window.__PRELOADED_STATE__, which describes the model whether
+ * the room is online or not.
+ */
+function preloadedState(html: string): unknown {
+  const marker = html.indexOf("window.__PRELOADED_STATE__");
+  if (marker < 0) return undefined;
+  const start = html.indexOf("{", marker);
+  if (start < 0) return undefined;
+  let depth = 0; let quoted = false;
+  for (let index = start; index < html.length; index += 1) {
+    const character = html[index];
+    if (quoted && character === "\\") { index += 1; continue; }
+    if (character === "\"") quoted = !quoted;
+    else if (!quoted && character === "{") depth += 1;
+    else if (!quoted && character === "}" && --depth === 0) {
+      try { return JSON.parse(html.slice(start, index + 1)); } catch { return undefined; }
+    }
+  }
+  return undefined;
+}
+
+/** Model objects in the page state with exactly this username (any nesting depth). */
+export function stripchatModelsInState(state: unknown, username: string): Record<string, any>[] {
+  const wanted = username.toLowerCase();
+  const found: Record<string, any>[] = [];
+  const seen = new Set<unknown>();
+  const visit = (value: unknown, depth: number) => {
+    if (!value || typeof value !== "object" || depth > 12 || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) { for (const child of value) visit(child, depth + 1); return; }
+    const item = value as Record<string, any>;
+    const name = textValue(item.username) ?? textValue(item.login);
+    if (name?.toLowerCase() === wanted && (item.id !== undefined || item.isModel !== undefined)) found.push(item);
+    for (const child of Object.values(item)) visit(child, depth + 1);
+  };
+  visit(state, 0);
+  // Model records first, then the ones with the most detail.
+  return found.sort((left, right) => Number(right.isModel === true) - Number(left.isModel === true) || Object.keys(right).length - Object.keys(left).length);
+}
+
+export function stripchatModelFromPage(html: string, username: string): StripchatModel | undefined {
+  const models = stripchatModelsInState(preloadedState(html), username);
+  const state = preloadedState(html) as { viewCam?: { model?: Record<string, unknown> } } | undefined;
+  const roomModel = state?.viewCam?.model;
+  const confirmed = models.some((item) => item.isModel === true)
+    || (roomModel && roomModel.isModel !== false && String(roomModel.username ?? roomModel.login ?? "").toLowerCase() === username.toLowerCase());
+  if (!models.length || !confirmed) return undefined;
+  const pick = (key: string) => models.map((item) => textValue(item[key])).find(Boolean);
+  return {
+    username: pick("username") ?? pick("login") ?? username,
+    avatarUrl: pick("avatarUrl") ?? pick("previewUrlThumbSmall") ?? pick("previewUrl"),
+    online: models.some((item) => item.isLive === true || item.isOnline === true) ? true
+      : models.some((item) => item.isLive === false || item.isOnline === false) ? false : undefined,
+    gender: pick("gender"), country: pick("country"),
+  };
+}
+
+/** Exact username lookup (online or offline) via the public profile page. Undefined when there is no such model. */
+export async function stripchatModelByUsername(context: PluginContext, username: string): Promise<StripchatModel | undefined> {
+  let html: string;
+  try {
+    html = await browserHtml(context, `https://stripchat.com/${encodeURIComponent(username)}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/HTTP 404/.test(message)) return undefined;
+    throw new Error(`Stripchat profile lookup for ${username} failed: ${message}`);
+  }
+  return stripchatModelFromPage(html, username);
+}
+
+function personFromModel(model: StripchatModel): PersonCandidate {
+  const profileUrl = `https://stripchat.com/${encodeURIComponent(model.username)}`;
+  return {
+    externalId: model.username.toLowerCase(), name: model.username,
+    ...(model.renamedFrom ? { aliases: [model.renamedFrom] } : {}),
+    ...(model.avatarUrl ? { imageUrl: model.avatarUrl } : {}),
+    profileUrls: [profileUrl],
+    metadata: { site: "stripchat.com", ...(model.online !== undefined ? { online: model.online } : {}), ...(model.gender ? { gender: model.gender } : {}), ...(model.country ? { country: model.country } : {}), ...(model.renamedFrom ? { renamedFrom: model.renamedFrom } : {}) },
+  };
+}
+
+export async function searchStripchatPeople(context: PluginContext, query: string): Promise<PersonCandidate[]> {
+  const results = new Map<string, PersonCandidate>();
+  let firstError: unknown;
+  for (const username of stripchatSearchUsernames(query)) {
+    try {
+      const model = await stripchatModelByUsername(context, username);
+      if (model) results.set(model.username.toLowerCase(), personFromModel(model));
+    } catch (error) { context.signal?.throwIfAborted(); firstError ??= error; }
+  }
+  if (!results.size && firstError) throw firstError instanceof Error ? firstError : new Error(String(firstError));
+  return [...results.values()];
+}
+
+/** Adds the Stripchat room of a performer picked in "Find a performer" (or linked to Stripchat before). */
+export async function discoverStripchatSources(_context: PluginContext, performer: PerformerRecord): Promise<SourceCandidate[]> {
+  const linked = textValue(performer.externalRefs?.["org.easyx.stripchat"]);
+  const found = linked ? stripchatSearchUsernames(linked.replace(/^live:/i, ""))[0] : undefined;
+  if (!found) return [];
+  // Prefer the spelling of the performer name (the stored reference is lower case).
+  const username = performer.name.toLowerCase() === found.toLowerCase() ? performer.name : found;
+  const profileUrl = `https://stripchat.com/${encodeURIComponent(username)}`;
+  // Same external ID as a source added by hand (its profile URL), so nothing is added twice.
+  return [{ externalId: profileUrl, label: "stripchat.com", profileUrl, domain: "stripchat.com" }];
+}
+
+plugin.manifest.capabilities = [...new Set([...plugin.manifest.capabilities, "identity-search" as const, "source-discovery" as const])];
+plugin.searchPeople = searchStripchatPeople;
+plugin.discoverSources = discoverStripchatSources;
 
 export default plugin;

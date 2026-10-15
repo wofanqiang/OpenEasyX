@@ -1,15 +1,23 @@
 import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
-import { asJson, id, now } from "./utils.js";
+import { asJson, id, now, safeSegment } from "./utils.js";
 import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packages/plugin-sdk/index.js";
+import { firstMediaDate, oldestMediaDate, validMediaDate } from "../packages/media-date.js";
 import { outputDefaults } from "../packages/output-settings.js";
 import { liveCrawlBudgetDefaults } from "../packages/live-budget.js";
+import type { VideoFingerprint } from "./video-matching.js";
+import { profileIdentity, type PerformerConflict } from "../packages/profile-identity.js";
+import { PerformerConflictError } from "./performer-conflict.js";
 
 export type Performer = {
   id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>; autoRecord: boolean;
+  /** Recording priority: -1 low, 0 normal, 1 high. Higher priorities start first and may preempt lower live recordings. */
+  priority?: number;
   createdAt: string; updatedAt: string;
 };
+
+export const PERFORMER_PRIORITIES = { low: -1, normal: 0, high: 1 } as const;
 
 export type Source = {
   id: string; performerId: string; pluginId: string; externalId: string; label: string;
@@ -27,6 +35,7 @@ export type DownloadItem = {
   status: string; progress: number; downloadedBytes: number; checksumSha256?: string; visualHash?: string; storagePath?: string; error?: string;
   attempts?: number; nextRetryAt?: string;
   downloadStartedAt?: string; downloadFinishedAt?: string;
+  duplicateOf?: string; duplicateReason?: string;
   createdAt: string; updatedAt: string;
 };
 
@@ -81,6 +90,15 @@ export class Database {
         image_url TEXT, external_refs_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS performers_name_unique ON performers(name COLLATE NOCASE);
+      CREATE TABLE IF NOT EXISTS performer_identities (
+        performer_id TEXT NOT NULL REFERENCES performers(id) ON DELETE CASCADE,
+        plugin_id TEXT NOT NULL, external_id TEXT NOT NULL,
+        PRIMARY KEY(performer_id,plugin_id,external_id)
+      );
+      CREATE TABLE IF NOT EXISTS performer_redirects (
+        name TEXT PRIMARY KEY COLLATE NOCASE,
+        performer_id TEXT NOT NULL REFERENCES performers(id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS sources (
         id TEXT PRIMARY KEY, performer_id TEXT NOT NULL REFERENCES performers(id) ON DELETE CASCADE,
         plugin_id TEXT NOT NULL, external_id TEXT NOT NULL, label TEXT NOT NULL, profile_url TEXT NOT NULL,
@@ -104,6 +122,16 @@ export class Database {
       CREATE INDEX IF NOT EXISTS items_status_idx ON items(status, updated_at);
       CREATE INDEX IF NOT EXISTS items_identity_idx ON items(identity_key, quality_score DESC);
       CREATE INDEX IF NOT EXISTS items_checksum_idx ON items(checksum_sha256);
+      CREATE TABLE IF NOT EXISTS video_fingerprints (
+        item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+        file_stamp TEXT NOT NULL, fingerprint_json TEXT
+      );
+      CREATE TABLE IF NOT EXISTS live_recording_state (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        room_url TEXT NOT NULL, suppressed INTEGER NOT NULL DEFAULT 0,
+        offline INTEGER NOT NULL DEFAULT 0, retries INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(source_id,room_url)
+      );
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS live_cam_favorites (
         provider_id TEXT NOT NULL, username_key TEXT NOT NULL, cam_id TEXT NOT NULL, username TEXT NOT NULL,
@@ -120,7 +148,15 @@ export class Database {
     if (!favoriteColumns.has("auto_record")) this.sqlite.exec("ALTER TABLE live_cam_favorites ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0");
     const performerColumns = new Set((this.sqlite.prepare("PRAGMA table_info(performers)").all() as Array<{ name: string }>).map((column) => column.name));
     if (!performerColumns.has("auto_record")) this.sqlite.exec("ALTER TABLE performers ADD COLUMN auto_record INTEGER NOT NULL DEFAULT 0");
+    if (!performerColumns.has("priority")) this.sqlite.exec("ALTER TABLE performers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0");
     const sourceColumns = new Set((this.sqlite.prepare("PRAGMA table_info(sources)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!sourceColumns.has("profile_key")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN profile_key TEXT");
+    for (const source of this.sqlite.prepare("SELECT id,profile_url FROM sources WHERE profile_key IS NULL").all() as Array<{ id: string; profile_url: string }>) {
+      this.sqlite.prepare("UPDATE sources SET profile_key=? WHERE id=?").run(profileIdentity(source.profile_url) ?? null, source.id);
+    }
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS sources_profile_key_idx ON sources(profile_key,performer_id)");
+    this.sqlite.exec(`INSERT OR IGNORE INTO performer_identities(performer_id,plugin_id,external_id)
+      SELECT p.id,j.key,j.value FROM performers p,json_each(p.external_refs_json) j WHERE j.type='text'`);
     if (!sourceColumns.has("scraper_plugin_id")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scraper_plugin_id TEXT");
     if (!sourceColumns.has("scrape_enabled")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scrape_enabled INTEGER NOT NULL DEFAULT 0");
     if (!sourceColumns.has("sync_interval_seconds")) {
@@ -128,10 +164,12 @@ export class Database {
       this.sqlite.exec("UPDATE sources SET sync_interval_seconds=sync_interval_minutes*60");
     }
     const itemColumns = new Set((this.sqlite.prepare("PRAGMA table_info(items)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!itemColumns.has("original_external_id")) this.sqlite.exec("ALTER TABLE items ADD COLUMN original_external_id TEXT");
     if (!itemColumns.has("visual_hash")) this.sqlite.exec("ALTER TABLE items ADD COLUMN visual_hash TEXT");
     if (!itemColumns.has("download_started_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_started_at TEXT");
     if (!itemColumns.has("download_finished_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_finished_at TEXT");
     if (!itemColumns.has("downloaded_bytes")) this.sqlite.exec("ALTER TABLE items ADD COLUMN downloaded_bytes INTEGER NOT NULL DEFAULT 0");
+    if (!itemColumns.has("duplicate_reason")) this.sqlite.exec("ALTER TABLE items ADD COLUMN duplicate_reason TEXT");
     if (!itemColumns.has("attempts")) this.sqlite.exec("ALTER TABLE items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
     if (!itemColumns.has("next_retry_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN next_retry_at TEXT");
     // A plain column maintained by the write paths, not a generated one: the queue queries used
@@ -199,10 +237,17 @@ export class Database {
   }
 
   storedMediaMetadata(relativePath: string): Record<string, unknown> {
-    const row = this.sqlite.prepare(`SELECT p.name AS performer,s.domain AS source,i.title FROM items i
+    const normalized = relativePath.replaceAll("\\", "/");
+    const row = this.sqlite.prepare(`SELECT p.name AS performer,s.domain AS source,i.* FROM items i
       JOIN performers p ON p.id=i.performer_id JOIN sources s ON s.id=i.source_id
-      WHERE i.storage_path=? AND i.status='completed' LIMIT 1`).get(relativePath) as { performer: string; source: string; title?: string } | undefined;
-    return row ? { performer: row.performer, source: row.source, ...(row.title ? { title: row.title } : {}) } : {};
+      WHERE replace(i.storage_path,'\\','/')=? AND i.status='completed' LIMIT 1`).get(normalized) as any;
+    if (!row) return {};
+    const live = asJson<Record<string, unknown>>(row.metadata_json, {}).live === true;
+    const recordedAt = live ? firstMediaDate(row.download_started_at, row.created_at) : undefined;
+    const publishedAt = live ? recordedAt : validMediaDate(row.published_at);
+    return { performer: row.performer, source: row.source, ...(row.title ? { title: row.title } : {}),
+      live, ...(recordedAt ? { recordedAt } : {}), ...(publishedAt ? { publishedAt } : {}),
+      downloadedAt: firstMediaDate(row.download_started_at, row.created_at) };
   }
 
   updateSettings(values: Record<string, unknown>) {
@@ -301,7 +346,37 @@ export class Database {
     return row ? this.mapPerformer(row) : undefined;
   }
 
+  resolvePerformerName(name: string): string {
+    const row = this.sqlite.prepare("SELECT p.name FROM performer_redirects r JOIN performers p ON p.id=r.performer_id WHERE r.name=? COLLATE NOCASE").get(name) as { name: string } | undefined;
+    return row?.name ?? name;
+  }
+
+  findPerformerByIdentity(pluginId: string, externalId: string): Performer | undefined {
+    const row = this.sqlite.prepare("SELECT p.* FROM performer_identities i JOIN performers p ON p.id=i.performer_id WHERE i.plugin_id=? AND i.external_id=? LIMIT 1").get(pluginId, externalId) as any;
+    return row ? this.mapPerformer(row) : undefined;
+  }
+
+  sourceConflicts(performerId: string, profileUrl?: string): PerformerConflict[] {
+    const keys = profileUrl === undefined
+      ? this.listSources(performerId).map((source) => ({ key: profileIdentity(source.profileUrl), url: source.profileUrl }))
+      : [{ key: profileIdentity(profileUrl), url: profileUrl }];
+    const conflicts = new Map<string, PerformerConflict>();
+    for (const { key, url } of keys) {
+      if (!key) continue;
+      const rows = this.sqlite.prepare("SELECT DISTINCT p.id,p.name FROM sources s JOIN performers p ON p.id=s.performer_id WHERE s.profile_key=? AND p.id<>?").all(key, performerId) as Array<{ id: string; name: string }>;
+      for (const existingPerformer of rows) conflicts.set(existingPerformer.id, { performerId, existingPerformer, profileUrl: url });
+    }
+    return [...conflicts.values()];
+  }
+
+  private assertSourceOwner(performerId: string, profileUrl: string) {
+    const conflict = this.sourceConflicts(performerId, profileUrl)[0];
+    if (conflict) throw new PerformerConflictError(conflict);
+  }
+
   createPerformer(values: PerformerInput): Performer {
+    const mergedName = this.resolvePerformerName(values.name);
+    if (mergedName !== values.name) throw Object.assign(new Error(`This name belongs to the merged profile ${mergedName}`), { statusCode: 409 });
     const performerId = id("person"); const stamp = now();
     this.sqlite.prepare("INSERT INTO performers(id,name,aliases_json,image_url,external_refs_json,auto_record,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
       .run(performerId, values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, "{}", 0, stamp, stamp);
@@ -320,39 +395,136 @@ export class Database {
     return this.sqlite.prepare("UPDATE performers SET auto_record=?,updated_at=? WHERE id=?").run(autoRecord ? 1 : 0, now(), performerId).changes > 0;
   }
 
+  /** Merges imported details into a performer: aliases and links are added, an existing image is kept. */
+  mergePerformerDetails(performerId: string, values: { aliases?: string[]; imageUrl?: string; externalRefs?: Record<string, string>; identities?: Array<{ pluginId: string; externalId: string }> }): Performer | undefined {
+    const performer = this.getPerformer(performerId);
+    if (!performer) return undefined;
+    const aliases = [...new Map([...performer.aliases, ...(values.aliases ?? [])]
+      .filter((alias) => typeof alias === "string" && alias.trim() && alias.toLowerCase() !== performer.name.toLowerCase())
+      .map((alias) => [alias.toLowerCase(), alias])).values()];
+    const identities = [...Object.entries(values.externalRefs ?? {}).map(([pluginId, externalId]) => ({ pluginId, externalId })), ...(values.identities ?? [])];
+    for (const { pluginId, externalId } of identities) {
+      const owner = this.findPerformerByIdentity(pluginId, externalId);
+      if (owner && owner.id !== performerId) throw new PerformerConflictError({ performerId, existingPerformer: owner });
+    }
+    const refs = { ...Object.fromEntries(Object.entries(values.externalRefs ?? {}).filter(([, value]) => typeof value === "string" && value)), ...performer.externalRefs };
+    this.sqlite.prepare("UPDATE performers SET aliases_json=?,image_url=COALESCE(image_url,?),external_refs_json=?,updated_at=? WHERE id=?")
+      .run(JSON.stringify(aliases), values.imageUrl ?? null, JSON.stringify(refs), now(), performerId);
+    const identity = this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities(performer_id,plugin_id,external_id) VALUES(?,?,?)");
+    for (const { pluginId, externalId } of identities) identity.run(performerId, pluginId, externalId);
+    return this.getPerformer(performerId);
+  }
+
+  performerIdentities(performerId: string): Array<{ pluginId: string; externalId: string }> {
+    return this.sqlite.prepare("SELECT plugin_id AS pluginId, external_id AS externalId FROM performer_identities WHERE performer_id=? ORDER BY plugin_id,external_id").all(performerId) as Array<{ pluginId: string; externalId: string }>;
+  }
+
+  setPerformerPriority(performerId: string, priority: number): Performer | undefined {
+    const value = Math.max(-1, Math.min(1, Math.trunc(priority)));
+    this.sqlite.prepare("UPDATE performers SET priority=?,updated_at=? WHERE id=?").run(value, now(), performerId);
+    return this.getPerformer(performerId);
+  }
+
+  /** Recording priority of the performer an item belongs to (0 when unknown). */
+  itemPriority(itemId: string): number {
+    const row = this.sqlite.prepare("SELECT p.priority FROM items i LEFT JOIN performers p ON p.id=i.performer_id WHERE i.id=?").get(itemId) as { priority: number | null } | undefined;
+    return Number(row?.priority ?? 0) || 0;
+  }
+
+  /** Priorities of queued live recordings, highest first. */
+  queuedLivePriorities(): number[] {
+    return (this.sqlite.prepare(`SELECT COALESCE(p.priority,0) AS priority FROM items i LEFT JOIN performers p ON p.id=i.performer_id
+      WHERE i.status='queued' AND json_extract(i.metadata_json,'$.live')=1 ORDER BY priority DESC, i.created_at`).all() as Array<{ priority: number }>)
+      .map((row) => Number(row.priority) || 0);
+  }
+
   deletePerformer(performerId: string): boolean {
     return this.sqlite.prepare("DELETE FROM performers WHERE id=?").run(performerId).changes > 0;
   }
 
+  performerMergePreview(fromId: string, targetId: string) {
+    if (fromId === targetId) throw Object.assign(new Error("Choose two different performers"), { statusCode: 400 });
+    const from = this.getPerformer(fromId); const target = this.getPerformer(targetId);
+    if (!from || !target) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+    const counts = (performer: Performer) => ({ id: performer.id, name: performer.name,
+      sources: this.listSources(performer.id).length,
+      files: Number((this.sqlite.prepare("SELECT count(*) n FROM items WHERE performer_id=? AND storage_path IS NOT NULL").get(performer.id) as any).n) });
+    const active = this.sqlite.prepare("SELECT id FROM items WHERE performer_id IN (?,?) AND status IN ('downloading','paused','stopping','cancelling') LIMIT 1").get(fromId, targetId);
+    return { from: counts(from), target: counts(target), blocked: !!active };
+  }
+
+  mergePerformers(fromId: string, targetId: string, imageUrl?: string) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const preview = this.performerMergePreview(fromId, targetId);
+      if (preview.blocked) throw Object.assign(new Error("Finish or cancel active downloads for both performers before merging"), { statusCode: 409 });
+      const from = this.getPerformer(fromId)!; const target = this.getPerformer(targetId)!;
+      const aliases = [...new Set([...target.aliases, from.name, ...from.aliases])].filter((name) => name.toLowerCase() !== target.name.toLowerCase());
+      this.sqlite.prepare("UPDATE performers SET aliases_json=?,external_refs_json=?,image_url=?,updated_at=? WHERE id=?")
+        .run(JSON.stringify(aliases), JSON.stringify({ ...from.externalRefs, ...target.externalRefs }), target.imageUrl ?? imageUrl ?? from.imageUrl ?? null, now(), targetId);
+      this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities SELECT ?,plugin_id,external_id FROM performer_identities WHERE performer_id=?").run(targetId, fromId);
+      this.sqlite.prepare("UPDATE items SET performer_id=? WHERE performer_id=?").run(targetId, fromId);
+      for (const source of this.listSources(fromId)) {
+        const same = this.sqlite.prepare("SELECT id FROM sources WHERE performer_id=? AND plugin_id=? AND (external_id=? OR (profile_key IS NOT NULL AND profile_key=?)) ORDER BY created_at LIMIT 1")
+          .get(targetId, source.pluginId, source.externalId, profileIdentity(source.profileUrl) ?? null) as { id: string } | undefined;
+        if (!same) this.sqlite.prepare("UPDATE sources SET performer_id=?,updated_at=? WHERE id=?").run(targetId, now(), source.id);
+        else {
+          // Keep every item ID and storage path, including two already stored
+          // variants of the same external ID. The resolver still sees its original ID.
+          for (const item of this.sqlite.prepare("SELECT id,external_id FROM items WHERE source_id=?").all(source.id) as Array<{ id: string; external_id: string }>) {
+            const collision = this.sqlite.prepare("SELECT id FROM items WHERE source_id=? AND external_id=?").get(same.id, item.external_id);
+            if (collision) this.sqlite.prepare("UPDATE items SET original_external_id=COALESCE(original_external_id,external_id),external_id=? WHERE id=?")
+              .run(`merged:${item.id}`, item.id);
+          }
+          this.sqlite.prepare("UPDATE items SET source_id=? WHERE source_id=?").run(same.id, source.id);
+          this.sqlite.prepare("DELETE FROM sources WHERE id=?").run(source.id);
+        }
+      }
+      this.sqlite.prepare("UPDATE performer_redirects SET performer_id=? WHERE performer_id=?").run(targetId, fromId);
+      this.sqlite.prepare("INSERT INTO performer_redirects(name,performer_id) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET performer_id=excluded.performer_id").run(from.name, targetId);
+      if (safeSegment(from.name) !== from.name && !this.getPerformerByName(safeSegment(from.name))) this.sqlite.prepare("INSERT INTO performer_redirects(name,performer_id) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET performer_id=excluded.performer_id").run(safeSegment(from.name), targetId);
+      this.sqlite.prepare("DELETE FROM performers WHERE id=?").run(fromId);
+      this.sqlite.exec("COMMIT");
+      return { performer: this.getPerformer(targetId)!, previousName: from.name };
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+  }
+
   upsertPerformer(candidate: PersonCandidate, pluginId: string, targetPerformerId?: string): Performer {
+    const owner = this.findPerformerByIdentity(pluginId, candidate.externalId);
     const existing = (targetPerformerId
       ? this.sqlite.prepare("SELECT * FROM performers WHERE id=?").get(targetPerformerId)
-      : this.sqlite.prepare("SELECT * FROM performers WHERE name=? COLLATE NOCASE").get(candidate.name)) as any;
+      : this.sqlite.prepare("SELECT * FROM performers WHERE name=? COLLATE NOCASE").get(this.resolvePerformerName(candidate.name))
+        ?? (owner ? this.sqlite.prepare("SELECT * FROM performers WHERE id=?").get(owner.id) : undefined)) as any;
+    if (owner && existing && owner.id !== existing.id) throw new PerformerConflictError({ performerId: existing.id, existingPerformer: owner, profileUrl: candidate.profileUrls?.[0] });
     const stamp = now();
     if (existing) {
-      const aliases = [...new Set([...asJson<string[]>(existing.aliases_json, []), ...(candidate.aliases ?? [])])];
+      const aliases = [...new Set([...asJson<string[]>(existing.aliases_json, []), ...(candidate.aliases ?? []), ...(candidate.name.toLowerCase() !== existing.name.toLowerCase() ? [candidate.name] : [])])];
       const refs = { ...asJson<Record<string, string>>(existing.external_refs_json, {}), [pluginId]: candidate.externalId };
       this.sqlite.prepare("UPDATE performers SET aliases_json=?, image_url=COALESCE(?,image_url), external_refs_json=?, updated_at=? WHERE id=?")
         .run(JSON.stringify(aliases), candidate.imageUrl ?? null, JSON.stringify(refs), stamp, existing.id);
+      this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities VALUES(?,?,?)").run(existing.id, pluginId, candidate.externalId);
       return this.getPerformer(existing.id)!;
     }
     const performerId = id("person");
     this.sqlite.prepare("INSERT INTO performers(id,name,aliases_json,image_url,external_refs_json,auto_record,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
       .run(performerId, candidate.name, JSON.stringify(candidate.aliases ?? []), candidate.imageUrl ?? null, JSON.stringify({ [pluginId]: candidate.externalId }), 0, stamp, stamp);
+    this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities VALUES(?,?,?)").run(performerId, pluginId, candidate.externalId);
     return this.getPerformer(performerId)!;
   }
 
   private mapPerformer(row: any): Performer {
     return { id: row.id, name: row.name, aliases: asJson(row.aliases_json, []), imageUrl: row.image_url ?? undefined,
-      externalRefs: asJson(row.external_refs_json, {}), autoRecord: !!row.auto_record, createdAt: row.created_at, updatedAt: row.updated_at };
+      externalRefs: asJson(row.external_refs_json, {}), autoRecord: !!row.auto_record, priority: Number(row.priority ?? 0) || 0, createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   addSource(performerId: string, pluginId: string, candidate: SourceCandidate): Source {
+    this.assertSourceOwner(performerId, candidate.profileUrl);
     const sourceId = id("source"); const stamp = now();
     this.sqlite.prepare(`INSERT INTO sources(id,performer_id,plugin_id,external_id,label,profile_url,domain,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(performer_id,plugin_id,external_id) DO UPDATE SET label=excluded.label,profile_url=excluded.profile_url,domain=excluded.domain,updated_at=excluded.updated_at`)
       .run(sourceId, performerId, pluginId, candidate.externalId, candidate.label, candidate.profileUrl, candidate.domain, stamp, stamp);
     const row = this.sqlite.prepare("SELECT * FROM sources WHERE performer_id=? AND plugin_id=? AND external_id=?").get(performerId, pluginId, candidate.externalId) as any;
+    this.sqlite.prepare("UPDATE sources SET profile_key=? WHERE id=?").run(profileIdentity(candidate.profileUrl) ?? null, row.id);
     return this.mapSource(row);
   }
 
@@ -370,12 +542,18 @@ export class Database {
 
   updateSource(sourceId: string, values: Partial<Pick<Source, "pluginId" | "label" | "profileUrl" | "domain" | "enabled" | "autoDownload" | "scrapeEnabled" | "syncIntervalSeconds">> & { scraperPluginId?: string | null }) {
     const source = this.getSource(sourceId); if (!source) return undefined;
+    // Refreshing an already stored account must not turn a legacy conflict into
+    // a runtime failure. New associations still require an explicit merge.
+    if (values.profileUrl !== undefined && profileIdentity(values.profileUrl) !== profileIdentity(source.profileUrl)) {
+      this.assertSourceOwner(source.performerId, values.profileUrl);
+    }
     this.sqlite.prepare("UPDATE sources SET plugin_id=?,label=?,profile_url=?,domain=?,enabled=?,auto_download=?,scraper_plugin_id=?,scrape_enabled=?,sync_interval_seconds=?,sync_interval_minutes=?,updated_at=? WHERE id=?")
       .run(values.pluginId ?? source.pluginId, values.label ?? source.label, values.profileUrl ?? source.profileUrl, values.domain ?? source.domain,
         (values.enabled ?? source.enabled) ? 1 : 0, (values.autoDownload ?? source.autoDownload) ? 1 : 0,
         values.scraperPluginId === undefined ? source.scraperPluginId ?? null : values.scraperPluginId,
         (values.scrapeEnabled ?? source.scrapeEnabled) ? 1 : 0, values.syncIntervalSeconds ?? source.syncIntervalSeconds,
         Math.max(1, Math.round((values.syncIntervalSeconds ?? source.syncIntervalSeconds) / 60)), now(), sourceId);
+    if (values.profileUrl !== undefined) this.sqlite.prepare("UPDATE sources SET profile_key=? WHERE id=?").run(profileIdentity(values.profileUrl) ?? null, sourceId);
     return this.getSource(sourceId);
   }
 
@@ -404,13 +582,81 @@ export class Database {
       syncIntervalSeconds: row.sync_interval_seconds ?? row.sync_interval_minutes * 60, lastSyncedAt: row.last_synced_at ?? undefined, nextSyncAt: row.next_sync_at ?? undefined, lastError: row.last_error ?? undefined };
   }
 
-  ingestItems(source: Source, candidates: MediaCandidate[], onStoredDateChange?: (itemId: string, publishedAt: string) => void): { added: number; upgraded: number; skipped: number } {
+  /** Explicitly reconsider rediscovered missing media; ordinary scans keep deletion history. */
+  hardRefreshItems(source: Source, candidates: MediaCandidate[], hasStoredFile: (item: DownloadItem) => boolean, onStoredDateChange?: (itemId: string, publishedAt: string) => void) {
+    let recovered = 0;
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      for (const candidate of candidates) {
+        const item = this.getItemBySourceExternalId(source.id, candidate.externalId);
+        if (!item || !["completed", "deleted", "failed", "cancelled", "duplicate", "superseded"].includes(item.status) || hasStoredFile(item)) continue;
+        const original = item.duplicateOf ? this.getItem(item.duplicateOf) : undefined;
+        if (original && hasStoredFile(original)) continue;
+        this.sqlite.prepare(`UPDATE items SET status=?,progress=0,downloaded_bytes=0,error=NULL,checksum_sha256=NULL,visual_hash=NULL,storage_path=NULL,duplicate_of=NULL,duplicate_reason=NULL,
+          download_started_at=NULL,download_finished_at=NULL,metadata_json=?,page_url=?,filename=?,title=?,updated_at=? WHERE id=?`)
+          .run(source.autoDownload || this.getSettings().autoQueueDiscovered ? "queued" : "available", JSON.stringify(candidate.metadata ?? {}), candidate.pageUrl ?? null,
+            candidate.filename ?? null, candidate.title ?? null, now(), item.id);
+        this.sqlite.prepare("DELETE FROM video_fingerprints WHERE item_id=?").run(item.id);
+        recovered++;
+      }
+      const result = this.ingestItems(source, candidates, onStoredDateChange, true);
+      this.sqlite.exec("COMMIT");
+      return { ...result, recovered };
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+  }
+
+  // Source scans own live sessions: plugins do not open the application's database.
+  liveScanCandidates(source: Source, candidates: MediaCandidate[], nowMs = Date.now()): MediaCandidate[] {
+    if (!candidates.length) {
+      this.sqlite.prepare("UPDATE live_recording_state SET offline=1,suppressed=0,retries=0 WHERE source_id=?").run(source.id);
+      return candidates;
+    }
+    return candidates.flatMap((candidate) => {
+      if (candidate.metadata?.live !== true) return [candidate];
+      const room = candidate.pageUrl ?? source.profileUrl;
+      this.sqlite.prepare("INSERT OR IGNORE INTO live_recording_state(source_id,room_url) VALUES(?,?)").run(source.id, room);
+      const state = this.sqlite.prepare("SELECT * FROM live_recording_state WHERE source_id=? AND room_url=?").get(source.id, room) as any;
+      const previous = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND json_extract(metadata_json,'$.live')=1
+        AND COALESCE(page_url,?)=? ORDER BY CASE WHEN status IN ('available','queued','downloading','paused','stopping','cancelling') THEN 0 ELSE 1 END,
+        created_at DESC,rowid DESC LIMIT 1`).get(source.id, source.profileUrl, room) as any;
+      if (previous && ["available", "queued", "downloading", "paused", "stopping", "cancelling"].includes(previous.status)) return [];
+      if (state.suppressed || (previous && ["cancelled", "deleted"].includes(previous.status) && !state.offline)) return [];
+      if (!previous) {
+        this.sqlite.prepare("UPDATE live_recording_state SET offline=0 WHERE source_id=? AND room_url=?").run(source.id, room);
+        return [candidate];
+      }
+      const ended = Date.parse(previous.download_finished_at ?? previous.updated_at);
+      const started = Date.parse(previous.download_started_at ?? "");
+      const short = previous.status === "failed" || !Number.isFinite(started) || ended - started < 300_000;
+      const delay = Math.min(900_000, 45_000 * 2 ** Math.min(state.retries, 5));
+      if (!state.offline && short && (!Number.isFinite(ended) || nowMs - ended < delay)) return [];
+      const retries = short && !state.offline ? state.retries + 1 : 0;
+      this.sqlite.prepare("UPDATE live_recording_state SET offline=0,retries=? WHERE source_id=? AND room_url=?").run(retries, source.id, room);
+      const session = id("live");
+      const filename = path.parse(candidate.filename ?? "live.mp4");
+      return [{ ...candidate, externalId: `${candidate.externalId}#${session}`, identityKey: undefined,
+        filename: `${filename.name}-${session}${filename.ext}`, metadata: { ...candidate.metadata, session } }];
+    });
+  }
+
+  suppressLiveRecording(itemId: string) {
+    const item = this.getItem(itemId);
+    if (item?.metadata.live !== true) return;
+    const room = item.pageUrl ?? this.getSource(item.sourceId)?.profileUrl;
+    if (!room) return;
+    this.sqlite.prepare(`INSERT INTO live_recording_state(source_id,room_url,suppressed) VALUES(?,?,1)
+      ON CONFLICT(source_id,room_url) DO UPDATE SET suppressed=1,offline=0`).run(item.sourceId, room);
+  }
+
+  ingestItems(source: Source, candidates: MediaCandidate[], onStoredDateChange?: (itemId: string, publishedAt: string) => void, ignoreDeletedHistory = false): { added: number; upgraded: number; skipped: number } {
     let added = 0, upgraded = 0, skipped = 0; const autoGlobal = !!this.getSettings().autoQueueDiscovered;
     for (const candidate of candidates) {
-      let canonicalDate = validMediaDate(candidate.publishedAt);
-      const existing = this.sqlite.prepare("SELECT id,published_at,status,storage_path FROM items WHERE source_id=? AND external_id=?").get(source.id, candidate.externalId) as any;
+      let canonicalDate = candidate.metadata?.live === true ? now() : validMediaDate(candidate.publishedAt);
+      const existing = this.sqlite.prepare("SELECT id,published_at,status,storage_path,created_at,download_started_at FROM items WHERE source_id=? AND external_id=?").get(source.id, candidate.externalId) as any;
       if (existing) {
-        canonicalDate = oldestMediaDate(existing.published_at, canonicalDate);
+        canonicalDate = candidate.metadata?.live === true
+          ? firstMediaDate(existing.download_started_at, existing.created_at)
+          : oldestMediaDate(existing.published_at, canonicalDate);
         if (canonicalDate && canonicalDate !== existing.published_at) {
           this.sqlite.prepare("UPDATE items SET published_at=?,updated_at=? WHERE id=?").run(canonicalDate, now(), existing.id);
           if (existing.status === "completed" && existing.storage_path) onStoredDateChange?.(existing.id, canonicalDate);
@@ -419,8 +665,8 @@ export class Database {
       }
       if (candidate.identityKey) {
         const deleted = this.sqlite.prepare("SELECT id FROM items WHERE performer_id=? AND identity_key=? AND status='deleted' LIMIT 1").get(source.performerId, candidate.identityKey);
-        if (deleted) { skipped++; continue; }
-        const best = this.sqlite.prepare("SELECT id,quality_score,status,published_at,storage_path FROM items WHERE performer_id=? AND identity_key=? AND status NOT IN ('failed','superseded') ORDER BY quality_score DESC LIMIT 1").get(source.performerId, candidate.identityKey) as any;
+        if (deleted && !ignoreDeletedHistory) { skipped++; continue; }
+        const best = this.sqlite.prepare("SELECT id,quality_score,status,published_at,storage_path FROM items WHERE performer_id=? AND identity_key=? AND status NOT IN ('failed','superseded') AND (?=0 OR status NOT IN ('deleted','cancelled','duplicate')) ORDER BY quality_score DESC LIMIT 1").get(source.performerId, candidate.identityKey, ignoreDeletedHistory ? 1 : 0) as any;
         canonicalDate = oldestMediaDate(best?.published_at, canonicalDate);
         if (best && Number(best.quality_score) >= (candidate.qualityScore ?? 0)) {
           if (canonicalDate && canonicalDate !== best.published_at) {
@@ -526,6 +772,7 @@ export class Database {
     const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
     const row = this.sqlite.prepare("SELECT id FROM items WHERE replace(storage_path,'\\','/')=? AND status='completed' ORDER BY updated_at DESC LIMIT 1").get(normalized) as { id: string } | undefined;
     if (!row) return undefined;
+    this.suppressLiveRecording(row.id);
     this.sqlite.prepare("UPDATE items SET status='deleted',progress=1,error=NULL,updated_at=? WHERE id=?").run(now(), row.id);
     return this.getItem(row.id);
   }
@@ -535,7 +782,8 @@ export class Database {
   // composite index (items_queue_pool_idx) lets this run as a search instead of a table scan.
   nextQueued(live?: boolean): DownloadItem | undefined {
     const pool = live === undefined ? "" : live ? " AND is_live=1" : " AND is_live=0";
-    const row = this.sqlite.prepare(`SELECT * FROM items WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?)${pool} ORDER BY created_at LIMIT 1`).get(now()) as any;
+    // Highest performer priority first, then oldest.
+    const row = this.sqlite.prepare(`SELECT i.* FROM items i LEFT JOIN performers p ON p.id=i.performer_id WHERE i.status='queued' AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)${pool} ORDER BY COALESCE(p.priority,0) DESC, i.created_at LIMIT 1`).get(now()) as any;
     return row ? this.mapItem(row) : undefined;
   }
 
@@ -572,13 +820,14 @@ export class Database {
 
   setItemStatus(itemId: string, status: string, values: { progress?: number; downloadedBytes?: number; error?: string | null; checksum?: string; storagePath?: string; duplicateOf?: string } = {}) {
     const stamp = now();
-    this.sqlite.prepare(`UPDATE items SET status=?,progress=COALESCE(?,progress),downloaded_bytes=CASE WHEN ?='queued' THEN 0 ELSE COALESCE(?,downloaded_bytes) END,error=?,checksum_sha256=COALESCE(?,checksum_sha256),storage_path=COALESCE(?,storage_path),duplicate_of=COALESCE(?,duplicate_of),
+    this.sqlite.prepare(`UPDATE items SET status=?,progress=COALESCE(?,progress),downloaded_bytes=CASE WHEN ?='queued' THEN 0 ELSE COALESCE(?,downloaded_bytes) END,error=?,checksum_sha256=COALESCE(?,checksum_sha256),storage_path=COALESCE(?,storage_path),duplicate_of=CASE WHEN ?='queued' THEN NULL ELSE COALESCE(?,duplicate_of) END,
+      duplicate_reason=CASE WHEN ?='duplicate' THEN duplicate_reason ELSE NULL END,
+      published_at=CASE WHEN ?='downloading' AND json_extract(metadata_json,'$.live')=1 THEN COALESCE(download_started_at,?) ELSE published_at END,
       attempts=CASE WHEN ? IN ('completed','duplicate') THEN 0 ELSE attempts END,next_retry_at=CASE WHEN ? IN ('completed','duplicate') THEN NULL ELSE next_retry_at END,
       download_started_at=CASE WHEN ?='queued' THEN NULL WHEN ?='downloading' AND download_started_at IS NULL THEN ? ELSE download_started_at END,
       download_finished_at=CASE WHEN ? IN ('queued','downloading','paused','stopping','cancelling') THEN NULL WHEN ? IN ('completed','duplicate','failed','cancelled','deleted') THEN ? ELSE download_finished_at END,
       updated_at=? WHERE id=?`)
-      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, values.duplicateOf ?? null,
-        status, status, status, status, stamp, status, status, stamp, stamp, itemId);
+      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, status, values.duplicateOf ?? null, status, status, stamp, status, status, status, status, stamp, status, status, stamp, stamp, itemId);
     return this.getItem(itemId);
   }
 
@@ -603,6 +852,32 @@ export class Database {
     return row ? this.mapItem(row) : undefined;
   }
 
+  completedVideos(performerId: string, exceptId: string): DownloadItem[] {
+    return (this.sqlite.prepare("SELECT * FROM items WHERE performer_id=? AND id<>? AND media_type='video' AND status='completed' AND storage_path IS NOT NULL ORDER BY created_at DESC")
+      .all(performerId, exceptId) as any[]).map(this.mapItem);
+  }
+
+  getVideoFingerprint(itemId: string, fileStamp: string): VideoFingerprint | null | undefined {
+    const row = this.sqlite.prepare("SELECT fingerprint_json FROM video_fingerprints WHERE item_id=? AND file_stamp=?")
+      .get(itemId, fileStamp) as { fingerprint_json: string | null } | undefined;
+    if (!row) return undefined;
+    if (!row.fingerprint_json) return null;
+    const value = asJson<VideoFingerprint | null>(row.fingerprint_json, null);
+    return value?.version === 1 && Number.isFinite(value.duration) && Array.isArray(value.hashes)
+      && value.hashes.every((hash) => typeof hash === "string" && (hash === "" || /^[a-f0-9]{32}$/.test(hash))) ? value : undefined;
+  }
+
+  setVideoFingerprint(itemId: string, fileStamp: string, fingerprint: VideoFingerprint | undefined) {
+    this.sqlite.prepare(`INSERT INTO video_fingerprints(item_id,file_stamp,fingerprint_json) VALUES(?,?,?)
+      ON CONFLICT(item_id) DO UPDATE SET file_stamp=excluded.file_stamp,fingerprint_json=excluded.fingerprint_json`)
+      .run(itemId, fileStamp, fingerprint ? JSON.stringify(fingerprint) : null);
+  }
+
+  markVideoExcerpt(itemId: string, originalId: string, checksum: string) {
+    this.setItemStatus(itemId, "duplicate", { progress: 1, checksum, duplicateOf: originalId });
+    this.sqlite.prepare("UPDATE items SET duplicate_reason='contained-excerpt',storage_path=NULL WHERE id=?").run(itemId);
+  }
+
   findVisualDuplicate(visualHash: string, exceptId: string, performerId: string, mediaType: string, maximumDistance = 5): DownloadItem | undefined {
     const candidates = (this.sqlite.prepare("SELECT * FROM items WHERE performer_id=? AND media_type=? AND visual_hash IS NOT NULL AND id<>? AND status='completed' ORDER BY updated_at DESC LIMIT 200").all(performerId, mediaType, exceptId) as any[])
       .map((row) => ({ row, distance: hammingDistance(visualHash, String(row.visual_hash)) }))
@@ -618,7 +893,10 @@ export class Database {
   }
 
   setCanonicalMediaDate(itemId: string, publishedAt?: string) {
-    const canonical = oldestMediaDate(this.getItem(itemId)?.publishedAt, publishedAt);
+    const item = this.getItem(itemId);
+    const canonical = item?.metadata.live === true
+      ? firstMediaDate(item.downloadStartedAt, item.createdAt)
+      : oldestMediaDate(item?.publishedAt, publishedAt);
     if (canonical) this.sqlite.prepare("UPDATE items SET published_at=?,updated_at=? WHERE id=?").run(canonical, now(), itemId);
     return canonical;
   }
@@ -647,6 +925,7 @@ export class Database {
   }
 
   deleteItem(itemId: string) {
+    this.suppressLiveRecording(itemId);
     return Number(this.sqlite.prepare("DELETE FROM items WHERE id=?").run(itemId).changes) > 0;
   }
 
@@ -676,11 +955,12 @@ export class Database {
   }
 
   private mapItem(row: any): DownloadItem {
-    return { id: row.id, performerId: row.performer_id, sourceId: row.source_id, pluginId: row.plugin_id, externalId: row.external_id,
+    return { id: row.id, performerId: row.performer_id, sourceId: row.source_id, pluginId: row.plugin_id, externalId: row.original_external_id ?? row.external_id,
       identityKey: row.identity_key ?? undefined, title: row.title ?? undefined, pageUrl: row.page_url ?? undefined, mediaType: row.media_type,
       filename: row.filename ?? undefined, qualityScore: row.quality_score, expectedBytes: row.expected_bytes ?? undefined, publishedAt: row.published_at ?? undefined,
       metadata: asJson(row.metadata_json, {}), status: row.status, progress: row.progress, downloadedBytes: Number(row.downloaded_bytes ?? 0), checksumSha256: row.checksum_sha256 ?? undefined, visualHash: row.visual_hash ?? undefined,
       storagePath: row.storage_path ?? undefined, error: row.error ?? undefined,
+      duplicateOf: row.duplicate_of ?? undefined, duplicateReason: row.duplicate_reason ?? undefined,
       attempts: Number(row.attempts ?? 0), nextRetryAt: row.next_retry_at ?? undefined,
       downloadStartedAt: row.download_started_at ?? undefined, downloadFinishedAt: row.download_finished_at ?? undefined,
       createdAt: row.created_at, updatedAt: row.updated_at };
@@ -693,17 +973,6 @@ export class Database {
       createdAt: row.created_at, updatedAt: row.updated_at,
     };
   }
-}
-
-function validMediaDate(value?: string): string | undefined {
-  if (!value) return undefined;
-  const date = new Date(value);
-  const year = date.getUTCFullYear();
-  return Number.isNaN(date.valueOf()) || year < 1900 || date.valueOf() > Date.now() + 86_400_000 ? undefined : date.toISOString();
-}
-
-function oldestMediaDate(...values: Array<string | undefined>): string | undefined {
-  return values.map(validMediaDate).filter((value): value is string => Boolean(value)).sort()[0];
 }
 
 function hammingDistance(left: string, right: string): number {

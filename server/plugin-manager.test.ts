@@ -29,6 +29,17 @@ const temporaryDirectories: string[] = [];
 afterEach(() => { for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
 
 describe("plugin lifecycle", () => {
+  it("includes the message and code when a plugin fails to load", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-plugin-error-")); temporaryDirectories.push(root);
+    const plugins = path.join(root, "plugins"); fs.mkdirSync(path.join(plugins, "broken"), { recursive: true });
+    fs.writeFileSync(path.join(plugins, "broken", "index.mjs"), 'throw Object.assign(new Error("Missing runtime dependency"), { code: "MODULE_NOT_FOUND" });');
+    const db = new Database(path.join(root, "data")); const logs: unknown[] = [];
+    try {
+      await new PluginManager(db, [plugins], undefined, (_level, _scope, message, details) => logs.push({ message, details })).load();
+      expect(logs).toContainEqual({ message: "Failed to load plugin", details: { file: path.join(plugins, "broken", "index.mjs"), error: "Missing runtime dependency", code: "MODULE_NOT_FOUND" } });
+    } finally { db.close(); }
+  });
+
   it("accepts only HTTPS browser login manifests tied to a session setting", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-plugin-browser-auth-")); temporaryDirectories.push(root);
     const pluginRoot = path.join(root, "plugins"); fs.mkdirSync(path.join(pluginRoot, "valid"), { recursive: true }); fs.mkdirSync(path.join(pluginRoot, "valid-manyvids"), { recursive: true }); fs.mkdirSync(path.join(pluginRoot, "invalid"), { recursive: true });
