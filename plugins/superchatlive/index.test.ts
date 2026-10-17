@@ -4,7 +4,7 @@ import superchatPlugin from "./index.js";
 import {
   listSuperchatMedia, normalizedGender, primaryTagFor, resetSuperchatCaches, resolveSuperchatDownload,
   resolveSuperchatStream, roomUrl, setSuperchatFavorite, superchatFavoriteCam, superchatFollowedSnapshot,
-  superchatLiveCam, superchatPage, usernameFromRoomUrl,
+  superchatLiveCam, superchatPage, superchatRoomState, usernameFromRoomUrl,
 } from "./index.js";
 import {
   DEFAULT_HLS_TEMPLATE, applyMouflonChallenge, buildSuperchatHlsUrl, coerceMouflonPlaylist, hlsHostFromPlaylist,
@@ -222,6 +222,53 @@ describe("SuperChat MOUFLON v2 playlist handling", () => {
       "https://media-hls.doppiocdn.media/b-hls-21/1/1_42_AbC.mp4",
     ]);
     expect(mouflonSegmentUrls("https://media-hls.doppiocdn.media/b-hls-21/media.mp4")).toEqual([]);
+  });
+});
+
+describe("SuperChat room state fallback", () => {
+  /** The real block: Cloudflare answers the detail endpoint with a 403 HTML page. */
+  const BLOCKED = () => new Response("<!DOCTYPE html><title>Attention Required! | Cloudflare</title>", { status: 403 });
+
+  it("rebuilds the room from the search index when the detail endpoint is refused", async () => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/users/user-ids/")) return Response.json({ id: 229010972 });
+      if (url.includes("/v2/models/")) return BLOCKED();
+      if (url.includes("/v4/models/search/group/username")) {
+        return Response.json({ models: [
+          { id: 47385733, username: "Issabel_white", status: "off", isLive: false, isVr: false },
+          { id: 229010972, username: "IsabelaWhite", status: "public", isLive: true, isVr: true, isHd: true, viewersCount: 116, topic: "vr show", broadcastGender: "female" },
+        ] });
+      }
+      return new Response("{}");
+    });
+    const state = await superchatRoomState(context(fetch), "isabelawhite");
+    expect(state).toMatchObject({
+      modelId: 229010972, streamName: "229010972", modelToken: "", online: true, status: "public",
+      title: "vr show", viewers: 116, gender: "female", isVr: true, isHd: true,
+    });
+  });
+
+  it("refuses to borrow another room's search entry", async () => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/users/user-ids/")) return Response.json({ id: 229010972 });
+      if (url.includes("/v2/models/")) return BLOCKED();
+      // Only a near-miss name: resolving through it would play a different room.
+      return Response.json({ models: [{ id: 47385733, username: "Issabel_white", status: "off" }] });
+    });
+    await expect(superchatRoomState(context(fetch), "isabelawhite")).rejects.toThrow("SuperChat API returned HTTP 403");
+  });
+
+  it("reports a room that is no longer public instead of failing on the block", async () => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/users/user-ids/")) return Response.json({ id: 229010972 });
+      if (url.includes("/v2/models/")) return BLOCKED();
+      return Response.json({ models: [{ id: 229010972, username: "IsabelaWhite", status: "p2pVoice", isLive: true }] });
+    });
+    await expect(resolveSuperchatStream(context(fetch), { id: "isabelawhite", username: "isabelawhite", pageUrl: roomUrl("isabelawhite") }))
+      .rejects.toThrow("isabelawhite is not broadcasting a public show");
   });
 });
 

@@ -33,6 +33,9 @@ const PRIMARY_TAG: Record<NonNullable<LiveCamQuery["gender"]>, string> = {
   female: "girls", male: "men", couple: "couples", trans: "trans",
 };
 
+/** Tag order for the search-index fallback: the room's gender is unknown there. */
+const SEARCH_PRIMARY_TAGS = [...new Set(Object.values(PRIMARY_TAG))];
+
 /**
  * The tag a VR-capable room carries, and the catalogue's only VR filter.
  *
@@ -424,13 +427,74 @@ export async function superchatModelId(context: PluginContext, username: string)
 }
 
 /**
+ * Rebuild a room's state from the search index.
+ *
+ * `/v2/models/{id}` is the one endpoint Cloudflare refuses to serve to a datacenter IP when the
+ * client's TLS fingerprint is not a browser's (HTTP 403, "Attention Required!"); every other path
+ * this plugin uses — `config/initial`, `users/user-ids`, `models/get-list`, the search index — is
+ * still answered. A 403 there therefore says nothing about the room, and without a substitute the
+ * whole player fails for rooms that are perfectly live.
+ *
+ * The search index publishes every field the player needs except `cam.modelToken` and
+ * `hlsPlaylist`, and both of those are empty for a public room anyway — the only kind this plugin
+ * is willing to play — so the substitute state is complete for its purpose.
+ *
+ * Matching is exact on the username: a search for `isabelawhite` also returns `isabellawhite` and
+ * `issabel_white`, and borrowing one of those would hand the player a different room.
+ */
+async function roomStateFromSearch(context: PluginContext, username: string, modelId: number): Promise<SuperchatRoomState | undefined> {
+  const wanted = username.trim().toLowerCase();
+  for (const primaryTag of SEARCH_PRIMARY_TAGS) {
+    let payload: Record<string, unknown> | undefined;
+    try {
+      payload = record(await apiJson(context, apiUrl("/v4/models/search/group/username", { primaryTag, query: username })));
+    } catch { continue; }
+    const rooms = Array.isArray(payload?.models)
+      ? payload.models.map(record).filter((item): item is Record<string, unknown> => Boolean(item))
+      : [];
+    const hit = rooms.find((item) => (text(item.username) ?? "").toLowerCase() === wanted);
+    if (!hit) continue;
+    const id = whole(hit.id) ?? modelId;
+    const status = (text(hit.status) ?? "").toLowerCase();
+    return {
+      modelId: id,
+      // The detail endpoint names the stream; the search index only carries the id, which is the
+      // stream name a non-VR room publishes (a VR room appends `_vr` below).
+      streamName: String(id),
+      modelToken: "",
+      online: status === "public" && hit.isLive !== false,
+      status,
+      title: text(hit.topic) ?? text(hit.username) ?? username,
+      viewers: whole(hit.viewersCount),
+      gender: text(hit.broadcastGender) ?? text(hit.gender),
+      thumbnailUrl: text(hit.previewUrlThumbSmall),
+      isVr: hit.isVr === true,
+      isHd: hit.isHd === true,
+    };
+  }
+  return undefined;
+}
+
+/**
  * One exact room, with the fields a stream needs. The detail endpoint returns the model,
- * its public `cam` token and the stream name in a single response.
+ * its public `cam` token and the stream name in a single response; when that call is refused the
+ * search index answers instead (see `roomStateFromSearch`).
  */
 export async function superchatRoomState(context: PluginContext, username: string): Promise<SuperchatRoomState> {
   const modelId = await superchatModelId(context, username);
-  const payload = record(await apiJson(context, apiUrl(`/v2/models/${modelId}`)));
-  if (!payload) throw new Error("SuperChat returned an invalid room response");
+  let payload: Record<string, unknown> | undefined;
+  let detailError: unknown;
+  try {
+    payload = record(await apiJson(context, apiUrl(`/v2/models/${modelId}`)));
+  } catch (error) { detailError = error; }
+  if (!payload) {
+    const substitute = await roomStateFromSearch(context, username, modelId);
+    if (substitute) {
+      context.log("warn", `SuperChat room detail for ${username} was refused (${detailError instanceof Error ? detailError.message : "empty response"}); resolved it from the search index instead`);
+      return substitute;
+    }
+    throw detailError ?? new Error("SuperChat returned an invalid room response");
+  }
   const model = record(payload.model) ?? {};
   const cam = record(payload.cam) ?? {};
   const status = (text(model.status) ?? "").toLowerCase();
