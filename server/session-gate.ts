@@ -14,9 +14,10 @@ const PUBLIC_ENDPOINTS = new Set(["/api/auth/login", "/api/auth/me", "/api/healt
  *    credential.
  *  * Static assets are what renders the login screen in the first place.
  *
- * The /browser path is deliberately *not* exempt, and the rule stays even though the noVNC proxy
- * it gated has been removed: it sits outside /api/, so without this line any future path under it
- * would be treated as a public static asset and answer unauthenticated.
+ * The /browser path is deliberately *not* exempt. The noVNC proxy behind it is only registered
+ * when browser login is enabled (see server/index.ts), but the rule holds regardless: /browser
+ * sits outside /api/, so without this line a future path under it would be treated as a public
+ * static asset and answer unauthenticated.
  */
 export function isSessionExempt(path: string): boolean {
   if (PUBLIC_ENDPOINTS.has(path)) return true;

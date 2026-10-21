@@ -39,6 +39,23 @@ export function removeStaleBrowserArtifacts(profileDir: string, runtimeDir = "/t
   unlinkNonDirectory(path.join(runtimeDir, ".X11-unix", `X${displayNumber}`));
 }
 
+/**
+ * Integrated browser login runs a whole desktop (Xvfb + openbox + Chromium), which a 1 GB
+ * single-core deployment cannot afford to start by accident. The feature is therefore off unless
+ * EASYX_ENABLE_BROWSER_LOGIN=true. The check lives here so every entry point -- starting a
+ * session, and the paste bridge that talks to it -- refuses the same way, instead of one route
+ * starting the desktop while another one's viewer has nowhere to connect.
+ */
+export function browserLoginEnabled(): boolean {
+  return process.env.EASYX_ENABLE_BROWSER_LOGIN === "true";
+}
+
+export function assertBrowserLoginEnabled() {
+  if (!browserLoginEnabled()) {
+    throw Object.assign(new Error("Integrated browser login is disabled on this instance (set EASYX_ENABLE_BROWSER_LOGIN=true to enable it)"), { statusCode: 503 });
+  }
+}
+
 export function onlyFansSessionFromBrowser(cookies: BrowserCookie[], values: BrowserValues): string {
   const onlyFansCookies = cookies.filter((cookie) => {
     const domain = text(cookie.domain)?.replace(/^\./, "").toLowerCase();
@@ -166,6 +183,10 @@ export class BrowserLoginManager {
   constructor(private dataDir: string) {}
 
   async start(pluginId: string, manifest: PluginManifest) {
+    // Gate the whole feature, not just the viewer: without this a session could start (spawning
+    // the desktop) while the /browser proxy stayed unregistered, leaving the user staring at a
+    // 404 where the viewer should be.
+    assertBrowserLoginEnabled();
     if (!manifest.browserAuth) throw Object.assign(new Error(`${manifest.name} does not support integrated browser login`), { statusCode: 409 });
     await this.stop();
     const browserRoot = path.join(this.dataDir, "browser");

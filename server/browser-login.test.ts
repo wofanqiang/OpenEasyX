@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { manyVidsSessionFromBrowser, netscapeSessionFromBrowser, onlyFansSessionFromBrowser, removeStaleBrowserArtifacts } from "./browser-login.js";
+import { manyVidsSessionFromBrowser, netscapeSessionFromBrowser, onlyFansSessionFromBrowser, removeStaleBrowserArtifacts, browserLoginEnabled } from "./browser-login.js";
 
 const temporaryDirectories: string[] = [];
 afterEach(() => { for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
@@ -48,6 +48,25 @@ describe("integrated OnlyFans browser session capture", () => {
       { name: "auth_id", value: "123", domain: "onlyfans.com" },
       { name: "sess", value: "session", domain: "onlyfans.com" },
     ], { userAgent: "Browser" })).toThrow("x-bc");
+  });
+});
+
+describe("integrated browser login feature gate", () => {
+  const previous = process.env.EASYX_ENABLE_BROWSER_LOGIN;
+  afterEach(() => {
+    if (previous === undefined) delete process.env.EASYX_ENABLE_BROWSER_LOGIN;
+    else process.env.EASYX_ENABLE_BROWSER_LOGIN = previous;
+  });
+
+  it("stays off unless the environment asks for it by name", () => {
+    delete process.env.EASYX_ENABLE_BROWSER_LOGIN;
+    expect(browserLoginEnabled()).toBe(false);
+    process.env.EASYX_ENABLE_BROWSER_LOGIN = "false";
+    expect(browserLoginEnabled()).toBe(false);
+    process.env.EASYX_ENABLE_BROWSER_LOGIN = "1";
+    expect(browserLoginEnabled()).toBe(false);
+    process.env.EASYX_ENABLE_BROWSER_LOGIN = "true";
+    expect(browserLoginEnabled()).toBe(true);
   });
 });
 

@@ -1,5 +1,6 @@
 import { maxConcurrentDownloadsLimit } from "./download-limits.js";
 import path from "node:path";
+import fastifyHttpProxy from "@fastify/http-proxy";
 import fs from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import Fastify from "fastify";
@@ -13,7 +14,7 @@ import { DownloadQueue } from "./downloader.js";
 import { discoverPeople } from "./discovery.js";
 import { deletePerformerFiles, performerDirectory, ensurePerformerDirectory, renamePerformerDirectory } from "./performer-files.js";
 import { domainFromUrl } from "./utils.js";
-import { BrowserLoginManager } from "./browser-login.js";
+import { BrowserLoginManager, browserLoginEnabled, assertBrowserLoginEnabled } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
 import { LiveCamImages } from "./live-cam-images.js";
 import { LiveCamService } from "./live-cams.js";
@@ -85,11 +86,14 @@ const queue = new DownloadQueue(
 // surfaced to the Activity page by /api/tasks, rather than being faked as download items.
 const tasks = new TaskRegistry();
 const browserLogin = new BrowserLoginManager(dataDir);
-// The /browser proxy is deliberately outside the session gate (the hook above only
-// guards /api/), and x11vnc runs without a password, so enabling this exposes a remote
-// desktop to anyone who can reach the port. Say so loudly at boot.
-if (process.env.EASYX_ENABLE_BROWSER_LOGIN === "true") {
-  appLogger.warn({ scope: "browser-login" }, "Browser login is enabled: /browser (noVNC) is served without authentication and the VNC server has no password. Only enable it on a trusted network.");
+// The /browser viewer is only meaningful while browser login is enabled: the login manager starts
+// websockify on 127.0.0.1:6080 to serve noVNC over the desktop it runs Chromium in, and nothing
+// listens there otherwise. The proxy itself is registered further down, once `app` exists; see the
+// note next to it for why it is conditional. The session gate covers /browser either way.
+// x11vnc runs without a password, so enabling this still exposes a remote desktop to anyone who can
+// reach the viewer; say so loudly at boot.
+if (browserLoginEnabled()) {
+  appLogger.warn({ scope: "browser-login" }, "Browser login is enabled: /browser (noVNC) requires a session, but the VNC server itself has no password. Only enable it on a trusted network.");
 }
 const systemStats = new SystemStatsService({ mediaDir });
 // Performers are intentionally NOT materialized from live-cam favorites at boot. A favorite is a
@@ -126,12 +130,6 @@ if (adoptedAutoRecord.orphaned.length) app.log.warn({ scope: "auto-record", orph
 const raisedIntervals = enforcePollingFloors();
 if (raisedIntervals) app.log.info({ scope: "sources", count: raisedIntervals }, `Raised ${raisedIntervals} source(s) to their provider's minimum polling interval`);
 const autoRecorder = startAutoRecorder({ db, liveCams, mediaRoot: mediaDir, log: (message) => app.log.info({ scope: "auto-record" }, message) });
-
-function ensureBrowserLoginEnabled() {
-  if (process.env.EASYX_ENABLE_BROWSER_LOGIN !== "true") {
-    throw Object.assign(new Error("Integrated browser login is disabled on this instance (set EASYX_ENABLE_BROWSER_LOGIN=true to enable it)"), { statusCode: 503 });
-  }
-}
 
 function refreshLiveCamFavorites(providerId?: string) {
   if (providerId && !plugins.get(providerId, false).listFollowedLiveCams) return;
@@ -178,12 +176,16 @@ function sessionCookie(request: FastifyRequest): string | undefined {
 }
 app.addHook("onRequest", createSessionGate({ verifySession: (cookie) => auth.verifySession(cookie), readSessionCookie: sessionCookie }));
 
-// The noVNC viewer proxy that used to live here pointed at 127.0.0.1:6080, which nothing in this
-// deployment provides: no compose service listens there, so every request was a 500 with no way to
-// configure the upstream. It has been removed rather than given a token -- an access token on a
-// route that can only ever fail is not hardening. If a browser viewer comes back, it belongs behind
-// the session gate with its own capability token, and `isSessionExempt` already refuses to treat
-// /browser as a public path.
+// The noVNC viewer for the integrated browser login. browser-login.ts starts websockify on
+// 127.0.0.1:6080 only while a browser session is active, and the service is gated behind
+// EASYX_ENABLE_BROWSER_LOGIN, so the proxy is registered only when that flag is on: with the flag
+// off, nothing listens on 6080 and every request through the proxy would be a 500 against an
+// upstream that was never started. x11vnc runs without a password, so the session gate above is
+// the only thing between the viewer and the desktop Chromium logs in from -- hence the boot
+// warning. CI's runtime smoke enables the flag and asserts /browser/vnc.html answers 200.
+if (browserLoginEnabled()) {
+  await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
+}
 const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds());
 const sourceSync = new SourceSync(db, mediaDir, ensureScraperPlugin, (id) => plugins.context(id), (ids) => queue.applyStoredMediaDates(ids));
 registerPerformerMergeRoutes(app, db, libraryDb, dataDir, (id) => performerOperations.has(id) || performerRefreshStatus.running || discoveryStatus.running || db.listSources(id).some((source) => sourceSync.active.has(source.id)));
@@ -337,7 +339,7 @@ app.post<{ Params: { id: string }; Body: Record<string, unknown> | undefined }>(
   return { plugin: plugins.list().find((entry) => entry.manifest.id === request.params.id), test };
 });
 app.post<{ Params: { id: string }; Body: { text?: unknown } }>("/api/plugins/:id/browser-login/paste", async (request) => {
-  ensureBrowserLoginEnabled();
+  assertBrowserLoginEnabled();
   plugins.get(request.params.id, false);
   const value = z.string().min(1).max(100_000).parse(request.body?.text);
   return browserLogin.paste(request.params.id, value);
