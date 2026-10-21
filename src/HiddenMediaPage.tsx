@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { EyeOff, FileWarning, FolderSearch2, LoaderCircle, RotateCcw, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronLeft, ChevronRight, EyeOff, FileWarning, FolderSearch2, LoaderCircle, RotateCcw, Search, Trash2 } from "lucide-react";
 import { api } from "./api";
 import "./library.css";
 
@@ -10,6 +10,10 @@ type HiddenMedia = {
   extension: string; size: number; modifiedAt: string; addedAt: string;
   duration: number; width: number; height: number;
 };
+type HiddenPage = { items: HiddenMedia[]; total: number; page: number; pageSize: number; pages: number };
+
+const PAGE_SIZE = 48;
+const SEARCH_DEBOUNCE_MS = 250;
 
 function formatBytes(bytes = 0) {
   if (!bytes) return "0 B";
@@ -41,30 +45,50 @@ function sourceDomain(value = "") {
  * no visible surface at all: the only way to see or clear one was to edit the database over SSH.
  * Restore re-checks the file first, because putting an unreadable entry back would just hide it
  * again on the next visit.
+ *
+ * Paging and search are server-side: filtering one page client-side would answer "nothing matches"
+ * for an entry that is simply on another page.
  */
 export function HiddenMediaPage({ setNotice, refresh }: { setNotice: (text: string) => void; refresh: () => void }) {
-  const [items, setItems] = useState<HiddenMedia[] | null>(null);
+  const [result, setResult] = useState<HiddenPage | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [applied, setApplied] = useState("");
+  const [page, setPage] = useState(1);
+  // A response for an older query must never overwrite a newer one.
+  const requestId = useRef(0);
 
-  const load = useCallback(async () => {
-    const result = await api<{ items: HiddenMedia[] }>("/api/library/hidden");
-    setItems(result.items);
+  const load = useCallback(async (targetPage: number, term: string) => {
+    const id = requestId.current + 1;
+    requestId.current = id;
+    const params = new URLSearchParams({ page: String(targetPage), pageSize: String(PAGE_SIZE) });
+    if (term.trim()) params.set("q", term.trim());
+    const next = await api<HiddenPage>(`/api/library/hidden?${params.toString()}`);
+    if (requestId.current === id) setResult(next);
   }, []);
-  useEffect(() => { void load().catch((error) => setNotice(error instanceof Error ? error.message : String(error))); }, [load, setNotice]);
 
-  const visible = useMemo(() => {
-    const term = query.trim().toLowerCase();
-    if (!term) return items ?? [];
-    return (items ?? []).filter((item) => [item.title, item.performer, item.source, item.relativePath].some((value) => value.toLowerCase().includes(term)));
-  }, [items, query]);
+  useEffect(() => {
+    void load(page, applied).catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+  }, [load, page, applied, setNotice]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { setPage(1); setApplied(query); }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  /** Reloads after a row leaves this page; a page that is now past the end steps back. */
+  const reloadAfterRemoval = async () => {
+    const remaining = (result?.items.length ?? 1) - 1;
+    await load(remaining > 0 ? page : Math.max(1, page - 1), applied);
+    refresh();
+  };
 
   const restore = async (item: HiddenMedia) => {
     setBusy(item.id);
     try {
       await api(`/api/library/hidden/${encodeURIComponent(item.id)}/restore`, { method: "POST" });
       setNotice(`Restored “${item.title}” to the library.`);
-      await load(); refresh();
+      await reloadAfterRemoval();
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(null); }
   };
@@ -73,37 +97,46 @@ export function HiddenMediaPage({ setNotice, refresh }: { setNotice: (text: stri
     if (!window.confirm(`Permanently remove “${item.title}”? Its file is deleted if it still exists.`)) return;
     setBusy(item.id);
     try {
-      const result = await api<{ fileDeleted: boolean }>(`/api/library/hidden/${encodeURIComponent(item.id)}`, { method: "DELETE" });
-      setNotice(result.fileDeleted ? `Deleted “${item.title}” and its file.` : `“${item.title}” was already gone — the entry is cleared.`);
-      await load(); refresh();
+      const outcome = await api<{ fileDeleted: boolean }>(`/api/library/hidden/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+      setNotice(outcome.fileDeleted ? `Deleted “${item.title}” and its file.` : `“${item.title}” was already gone — the entry is cleared.`);
+      await reloadAfterRemoval();
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(null); }
   };
 
-  const total = items?.length ?? 0;
+  const total = result?.total ?? 0;
+  const searching = applied.trim().length > 0;
+  const items = useMemo(() => result?.items ?? [], [result]);
   return <section className="library-page">
     <div className="library-intro">
-      <div><p>COLLECTION</p><h2>Hidden</h2><span>{total} {total === 1 ? "entry" : "entries"} hidden from every listing</span></div>
+      <div><p>COLLECTION</p><h2>Hidden</h2><span>{total} {total === 1 ? "entry" : "entries"} hidden from every listing{searching ? ` · filtered by “${applied.trim()}”` : ""}</span></div>
     </div>
     <div className="filters">
-      <label><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search hidden entries…" aria-label="Search hidden entries"/></label>
+      <label><Search/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search hidden entries…" aria-label="Search hidden entries"/></label>
     </div>
     <p className="recovery-hint"><FileWarning/><span>An entry lands here when the library could not read its file — usually a recording with no video track, or a file that disappeared outside the app. <b>Restore</b> checks the file is readable before putting it back; <b>Remove</b> clears the entry and deletes the file if it is still there.</span></p>
-    {items === null ? <div className="loading"><LoaderCircle className="spin"/>Loading hidden entries…</div>
-      : visible.length ? <div className="media-grid">{visible.map((item) => <article className="media-card" key={item.id}>
-          <span className="poster" aria-hidden="true"><span className="media-art"><EyeOff/></span><span className="type">{item.kind === "video" ? "FILM" : "IMG"}</span>
-            {item.duration > 0 && <time>{Math.floor(item.duration / 60)}:{String(Math.floor(item.duration % 60)).padStart(2, "0")}</time>}
-          </span>
-          <div className="media-copy">
-            <span className="media-title">{item.title}</span>
-            <p>{item.performer || "Unsorted"}{item.source ? ` - ${sourceDomain(item.source)}` : ""} · {formatBytes(item.size)}</p>
-            <div className="media-facts"><span>{qualityLabel(item)}</span><i/><time dateTime={item.modifiedAt}>{mediaDateLabel(item.modifiedAt)}</time></div>
-            <div className="selection-actions">
-              <button className="quiet" disabled={busy === item.id} onClick={() => void restore(item)}>{busy === item.id ? <LoaderCircle className="spin"/> : <RotateCcw/>}Restore</button>
-              <button className="delete-selection" disabled={busy === item.id} onClick={() => void remove(item)}><Trash2/>Remove</button>
+    {result === null ? <div className="loading"><LoaderCircle className="spin"/>Loading hidden entries…</div>
+      : items.length ? <>
+          <div className="media-grid">{items.map((item) => <article className="media-card" key={item.id}>
+            <span className="poster" aria-hidden="true"><span className="media-art"><EyeOff/></span><span className="type">{item.kind === "video" ? "FILM" : "IMG"}</span>
+              {item.duration > 0 && <time>{Math.floor(item.duration / 60)}:{String(Math.floor(item.duration % 60)).padStart(2, "0")}</time>}
+            </span>
+            <div className="media-copy">
+              <span className="media-title">{item.title}</span>
+              <p>{item.performer || "Unsorted"}{item.source ? ` - ${sourceDomain(item.source)}` : ""} · {formatBytes(item.size)}</p>
+              <div className="media-facts"><span>{qualityLabel(item)}</span><i/><time dateTime={item.modifiedAt}>{mediaDateLabel(item.modifiedAt)}</time></div>
+              <div className="selection-actions">
+                <button className="quiet" disabled={busy === item.id} onClick={() => void restore(item)}>{busy === item.id ? <LoaderCircle className="spin"/> : <RotateCcw/>}Restore</button>
+                <button className="delete-selection" disabled={busy === item.id} onClick={() => void remove(item)}><Trash2/>Remove</button>
+              </div>
             </div>
-          </div>
-        </article>)}</div>
-      : <div className="empty-state"><FolderSearch2/><h3>{total ? "No entries match" : "Nothing is hidden"}</h3><p>{total ? "Adjust the search to see the hidden entries again." : "Every indexed file is readable, so the library has nothing to hide."}</p></div>}
+          </article>)}</div>
+          {(result?.pages ?? 1) > 1 && <div className="pagination">
+            <button disabled={page <= 1 || busy !== null} onClick={() => setPage((current) => Math.max(1, current - 1))}><ChevronLeft/>Previous</button>
+            <span>Page {result?.page ?? page} of {result?.pages ?? 1} · {total} hidden</span>
+            <button disabled={page >= (result?.pages ?? 1) || busy !== null} onClick={() => setPage((current) => current + 1)}>Next<ChevronRight/></button>
+          </div>}
+        </>
+      : <div className="empty-state"><FolderSearch2/><h3>{searching ? "No entries match" : "Nothing is hidden"}</h3><p>{searching ? "Adjust the search to see the hidden entries again." : "Every indexed file is readable, so the library has nothing to hide."}</p></div>}
   </section>;
 }

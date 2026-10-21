@@ -77,14 +77,17 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
   app.get<{ Querystring: Record<string, string | undefined> }>("/api/library/playlist", async (request) => ({ ids: libraryDb.playlist(libraryQuery(request.query)) }));
   // Entries the library hides are filtered out of every listing below, and they are hidden exactly
   // when a read failed, so there used to be no way back except editing the database over SSH.
-  app.get("/api/library/hidden", async () => ({ items: libraryDb.hiddenMedia() }));
+  app.get<{ Querystring: Record<string, string | undefined> }>("/api/library/hidden", async (request) => (
+    libraryDb.hiddenMedia({ q: request.query.q?.slice(0, 200), page: positive(request.query.page, 1), pageSize: positive(request.query.pageSize, 48, 100) })
+  ));
   app.post<{ Params: { id: string } }>("/api/library/hidden/:id/restore", async (request) => {
     const media = libraryDb.getMedia(request.params.id, { includeHidden: true });
     if (!media) throw Object.assign(new Error("Media not found"), { statusCode: 404 });
-    // Check what a player would actually open, not the row: restoring on trust would put an entry
-    // back into every listing that fails again the moment somebody clicks it.
+    // The same check that hid it: a read of the file the player would open. Deliberately not
+    // `playbackFile` -- that remuxes a non-faststart MP4, which would stall this request for
+    // minutes on a large file just to prove it is readable.
     let stat: fs.Stats | undefined;
-    try { stat = fs.statSync((await catalog.playbackFile(media)).file); } catch { stat = undefined; }
+    try { stat = fs.statSync(catalog.absolutePath(media)); } catch { stat = undefined; }
     if (!stat?.isFile() || stat.size <= 0) {
       throw Object.assign(new Error("The file is still unreadable, so this entry stays hidden"), { statusCode: 409 });
     }

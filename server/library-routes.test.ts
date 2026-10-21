@@ -181,3 +181,69 @@ describe("hidden entries", () => {
     db.close();
   });
 });
+
+describe("hidden list paging", () => {
+  it("pages the list instead of truncating the tail", async () => {
+    const { data, media, db } = libraryFixture();
+    const directory = path.join(media, "Example Performer", "example.com");
+    for (const name of ["one.jpg", "two.jpg", "three.jpg"]) fs.writeFileSync(path.join(directory, name), "image-bytes");
+    const catalog = new Catalog(db, media, data, false);
+    await catalog.scan();
+    for (const item of db.listMedia({ pageSize: 100 }).items) db.markMediaUnplayable(item.id);
+
+    const app = Fastify();
+    registerLibraryRoutes(app, db, catalog, { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3], data);
+
+    const first = await app.inject({ method: "GET", url: "/api/library/hidden?page=1&pageSize=2" });
+    expect(first.json()).toMatchObject({ total: 3, page: 1, pageSize: 2, pages: 2 });
+    expect(first.json().items).toHaveLength(2);
+
+    const second = await app.inject({ method: "GET", url: "/api/library/hidden?page=2&pageSize=2" });
+    expect(second.json().items).toHaveLength(1);
+    // Every row is reachable, which is the point: a silent cap leaves the tail invisible.
+    const ids = new Set([...first.json().items, ...second.json().items].map((item: { id: string }) => item.id));
+    expect(ids.size).toBe(3);
+    await app.close();
+    db.close();
+  });
+
+  it("searches the whole set, not just the page in hand", async () => {
+    const { data, media, db } = libraryFixture();
+    const directory = path.join(media, "Example Performer", "example.com");
+    fs.writeFileSync(path.join(directory, "needle.jpg"), "image-bytes");
+    fs.writeFileSync(path.join(directory, "other.jpg"), "image-bytes");
+    const catalog = new Catalog(db, media, data, false);
+    await catalog.scan();
+    for (const item of db.listMedia({ pageSize: 100 }).items) db.markMediaUnplayable(item.id);
+
+    const app = Fastify();
+    registerLibraryRoutes(app, db, catalog, { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3], data);
+    const found = await app.inject({ method: "GET", url: "/api/library/hidden?q=needle" });
+    expect(found.json().total).toBe(1);
+    expect(found.json().items[0].title).toContain("needle");
+    await app.close();
+    db.close();
+  });
+});
+
+describe("hidden restore does not wait on ffmpeg", () => {
+  it("restores a readable video whose file only needs a remux at playback time", async () => {
+    const { data, media, db } = libraryFixture();
+    // A readable file that is not a faststart MP4: the player remuxes it on demand, which is not a
+    // reason to keep the entry hidden -- and verifying that must not run ffmpeg inside the request.
+    const file = path.join(media, "Example Performer", "example.com", "clip.mp4");
+    fs.writeFileSync(file, "readable but not a faststart mp4");
+    const catalog = new Catalog(db, media, data, false);
+    await catalog.scan();
+    const item = db.listMedia().items[0];
+    db.markMediaUnplayable(item.id);
+
+    const app = Fastify();
+    registerLibraryRoutes(app, db, catalog, { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3], data);
+    const response = await app.inject({ method: "POST", url: `/api/library/hidden/${item.id}/restore` });
+    expect(response.statusCode).toBe(200);
+    expect(db.getMedia(item.id)).toBeDefined();
+    await app.close();
+    db.close();
+  });
+});

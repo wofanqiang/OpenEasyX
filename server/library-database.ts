@@ -232,17 +232,36 @@ export class LibraryDatabase {
     return Number(this.sqlite.prepare("UPDATE media SET playable=1 WHERE id=? AND playable=0 AND missing=0").run(id).changes) > 0;
   }
 
-  /** What the library is currently hiding. `missing=1` is a separate state the scan owns. */
-  hiddenMedia(limit = 500) {
-    const rows = this.sqlite.prepare(`SELECT * FROM media WHERE missing=0 AND playable=0
-      ORDER BY modified_at DESC LIMIT ?`).all(Math.max(1, Math.min(2_000, limit))) as Record<string, unknown>[];
-    return rows.map((row) => ({
-      id: String(row.id), relativePath: String(row.relative_path), kind: row.kind as MediaKind,
-      title: String(row.title), performer: String(row.performer), source: String(row.source),
-      extension: String(row.extension), size: Number(row.size),
-      modifiedAt: String(row.modified_at), addedAt: String(row.added_at),
-      duration: Number(row.duration), width: Number(row.width), height: Number(row.height),
-    }));
+  /**
+   * What the library is currently hiding. `missing=1` is a separate state the scan owns.
+   *
+   * Paged like the other listings: a silent cap would leave the tail of a large set unreachable,
+   * which is the same "invisible rows" complaint this list exists to answer.
+   */
+  hiddenMedia(query: { page?: number; pageSize?: number; q?: string } = {}) {
+    const pageSize = Math.max(1, Math.min(100, query.pageSize ?? 48));
+    const page = Math.max(1, query.page ?? 1);
+    const where = ["missing=0", "playable=0"];
+    const values: SQLInputValue[] = [];
+    if (query.q?.trim()) {
+      where.push("(title LIKE ? ESCAPE '\\' OR performer LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')");
+      const term = `%${query.q.trim().replace(/[\\%_]/g, "\\$&")}%`;
+      values.push(term, term, term);
+    }
+    const clause = where.join(" AND ");
+    const total = Number((this.sqlite.prepare(`SELECT COUNT(*) count FROM media WHERE ${clause}`).get(...values) as { count: number }).count);
+    const rows = this.sqlite.prepare(`SELECT * FROM media WHERE ${clause}
+      ORDER BY modified_at DESC LIMIT ? OFFSET ?`).all(...values, pageSize, (page - 1) * pageSize) as Record<string, unknown>[];
+    return {
+      items: rows.map((row) => ({
+        id: String(row.id), relativePath: String(row.relative_path), kind: row.kind as MediaKind,
+        title: String(row.title), performer: String(row.performer), source: String(row.source),
+        extension: String(row.extension), size: Number(row.size),
+        modifiedAt: String(row.modified_at), addedAt: String(row.added_at),
+        duration: Number(row.duration), width: Number(row.width), height: Number(row.height),
+      })),
+      total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)),
+    };
   }
 
   updateProbe(id: string, values: { duration?: number; width?: number; height?: number }) {
