@@ -258,16 +258,40 @@ export function stripchatPreloadedState(html: string): Record<string, unknown> |
  */
 export const STRIPCHAT_PAGE_ATTEMPTS = 3;
 
-export async function stripchatSsrPage(context: PluginContext, url: string, attempts = STRIPCHAT_PAGE_ATTEMPTS): Promise<string> {
+/** Ceiling for one attempt, so a hung edge cannot spend the whole budget before the first answer. */
+export const STRIPCHAT_PAGE_TIMEOUT_MS = 45_000;
+
+/**
+ * Total time one page may take across all attempts.
+ *
+ * Retrying multiplies a wait, and this is not the only retry: the recording path wraps the caller
+ * in four attempts of its own with a ten-second pause. Three attempts of a hung upstream would
+ * stack to 135s there, and four of those to nine minutes of a recording slot -- spent on the three
+ * percent of requests that are a shell page, which usually resolves on the next request anyway.
+ * One budget bounds the whole thing instead of the retries each having their own ceiling.
+ */
+export const STRIPCHAT_PAGE_BUDGET_MS = 100_000;
+
+export async function stripchatSsrPage(
+  context: PluginContext,
+  url: string,
+  options: { attempts?: number; budgetMs?: number } = {},
+): Promise<string> {
+  const attempts = options.attempts ?? STRIPCHAT_PAGE_ATTEMPTS;
+  const deadline = Date.now() + (options.budgetMs ?? STRIPCHAT_PAGE_BUDGET_MS);
   let shellPages = 0;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     context.signal?.throwIfAborted();
-    const html = await browserHtml(context, url);
+    // Never hand the helper more time than the budget has left, or the last attempt can outlive it.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const html = await browserHtml(context, url, { timeoutMs: Math.min(remaining, STRIPCHAT_PAGE_TIMEOUT_MS) });
     // The structural test, not a substring test: the shell page contains the bare identifier
     // `"__PRELOADED_STATE__"` inside its loader script, so asking whether the string appears
     // answers "yes" for exactly the page this exists to reject.
     if (stripchatPreloadedState(html)) return html;
     shellPages += 1;
+    context.log("debug", `Stripchat served its static page shell (attempt ${attempt + 1}/${attempts})`);
   }
   // Worded to stay clear of server/offline-error.ts: the room's state is unknown, not confirmed
   // offline, so this must not park the room on the hour-long cooldown.

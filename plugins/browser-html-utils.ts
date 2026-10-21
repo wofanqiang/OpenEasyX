@@ -20,8 +20,16 @@ export function absoluteUrl(value: string, base: string): string {
   return new URL(decodeHtml(value.trim()), base).toString();
 }
 
-export async function browserHtml(context: PluginContext, url: string): Promise<string> {
-  return compatibleHtml(context, url, false);
+/**
+ * How long one fetch may take, in milliseconds.
+ *
+ * Exposed so a caller that retries can divide a single budget across its attempts instead of
+ * multiplying the default ceiling by the number of tries.
+ */
+export type BrowserHtmlOptions = { timeoutMs?: number };
+
+export async function browserHtml(context: PluginContext, url: string, options: BrowserHtmlOptions = {}): Promise<string> {
+  return compatibleHtml(context, url, false, options.timeoutMs);
 }
 
 export async function renderedBrowserHtml(context: PluginContext, url: string): Promise<string> {
@@ -49,10 +57,10 @@ export async function browserCapturedLiveStream(context: PluginContext, url: str
   return { url: streamUrl, headers, contentType: streamUrl.includes(".mpd") ? "application/dash+xml" : "application/vnd.apple.mpegurl" };
 }
 
-async function compatibleHtml(context: PluginContext, url: string, render: boolean): Promise<string> {
+async function compatibleHtml(context: PluginContext, url: string, render: boolean, timeoutMs?: number): Promise<string> {
   let result;
   try {
-    result = await context.runCommand("easyx-browser-fetch", render ? ["--render", url] : [url], { timeoutMs: render ? 90_000 : 60_000, maxOutputBytes: 32 * 1024 * 1024 });
+    result = await context.runCommand("easyx-browser-fetch", render ? ["--render", url] : [url], { timeoutMs: timeoutMs ?? (render ? 90_000 : 60_000), maxOutputBytes: 32 * 1024 * 1024 });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") throw new Error("This provider requires the EasyX Docker image (browser-compatible fetch helper not found)");

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "../../packages/plugin-sdk/index.js";
+import { STRIPCHAT_PAGE_TIMEOUT_MS, stripchatSsrPage } from "../live-cam-discovery.js";
 import { listStripchatMedia, resolveStripchatDirect, resolveStripchatDownload, setStripchatFavorite, stripchatFollowedSnapshot, stripchatPublicPlaybackKey } from "./index.js";
 
 const temporaryDirectories: string[] = [];
@@ -144,6 +145,60 @@ describe("Stripchat direct live playback", () => {
     // the hour-long cooldown that is meant for a room that is genuinely off.
     expect(/did not expose an hls host|no public .*hls host returned a live manifest/i.test(error?.message ?? "")).toBe(false);
     expect(mock.runCommand).toHaveBeenCalledTimes(3);
+  });
+
+  it("counts its attempts against one budget instead of stacking a timeout per attempt", async () => {
+    const slow = { exitCode: 0, stderr: "", stdout: STATIC_SHELL_PAGE };
+    // Each attempt burns real time, like a hung edge would.
+    const runCommand = vi.fn(async (_command: string, _args: string[], _options?: { timeoutMs?: number }) => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return slow;
+    });
+    const mock = { log: vi.fn(), signal: undefined, runCommand } as unknown as PluginContext;
+    await expect(stripchatSsrPage(mock, "https://stripchat.com/Alice", { attempts: 3, budgetMs: 20 })).rejects.toThrow(/static page shell/);
+    // The second attempt would start past the deadline, so it must not start at all: without this,
+    // three attempts of a hung upstream stack up inside a caller that retries four more times.
+    expect(runCommand).toHaveBeenCalledTimes(1);
+    // The command runner floors this at one second; what matters is that we ask for what is left
+    // rather than for another full ceiling.
+    expect(runCommand.mock.calls[0][2]!.timeoutMs).toBeLessThanOrEqual(20);
+  });
+
+  it("caps one attempt so a single hung edge cannot spend the whole budget", async () => {
+    const runCommand = vi.fn(async (_command: string, _args: string[], _options?: { timeoutMs?: number }) => (
+      { exitCode: 0, stderr: "", stdout: pageState() }
+    ));
+    const mock = { log: vi.fn(), signal: undefined, runCommand } as unknown as PluginContext;
+    await stripchatSsrPage(mock, "https://stripchat.com/Alice");
+    expect(runCommand.mock.calls[0][2]!.timeoutMs).toBe(STRIPCHAT_PAGE_TIMEOUT_MS);
+  });
+
+  it("refuses a player module address that points inside the host network", async () => {
+    const mock = context("");
+    // The player origin is written by the page we just downloaded, so it can name any address.
+    mock.runCommand.mockResolvedValue({
+      exitCode: 0, stderr: "",
+      stdout: pageState().replace("https://mmp.doppiocdn.com/player/mmp", "http://169.254.169.254/latest"),
+    });
+    const error = await resolveStripchatDirect(mock, "https://stripchat.com/Alice").then(() => undefined, (failure: Error) => failure);
+    expect(error?.message).toContain("points inside this host's network");
+    expect(mock.fetch).not.toHaveBeenCalled();
+  });
+
+  it("refuses an internal segment address without reporting the room offline", async () => {
+    // A manifest is remote content as well, so a segment URL gets the same treatment.
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/v2.12.0/main.js")) return new Response('url.searchParams.set("pkey","PublicKey123456")');
+      if (url.includes("/master/")) return new Response("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nhttp://127.0.0.1:8080/secret.m3u8\n");
+      return new Response("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2\nsegment.mp4\n");
+    });
+    const mock = { config: {}, fetch, log: vi.fn(), runCommand: vi.fn(async () => ({ exitCode: 0, stdout: pageState(), stderr: "" })) } as unknown as PluginContext;
+    const error = await resolveStripchatDirect(mock, "https://stripchat.com/Alice").then(() => undefined, (failure: Error) => failure);
+    expect(error?.message).toContain("points inside this host's network");
+    expect(fetch.mock.calls.map(([input]) => String(input)).some((url) => url.includes("127.0.0.1"))).toBe(false);
+    // Our own refusal, not evidence about the room: the offline patterns would park it for an hour.
+    expect(/did not expose an hls host|no public .*hls host returned a live manifest/i.test(error?.message ?? "")).toBe(false);
   });
 
   it("rejects Stripchat's finite intro advertisement playlist", async () => {

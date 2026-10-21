@@ -247,34 +247,77 @@ async function stripchatRoomStream(context: PluginContext, pageUrl: string): Pro
   return stripchatStreamConfig(await stripchatSsrPage(context, pageUrl));
 }
 
+/** Hosts that must never be reached from a URL a downloaded document chose for us. */
+function isInternalHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host === "0.0.0.0") return true;
+  if (/\.(localhost|local|internal|localdomain|home\.arpa)$/.test(host)) return true;
+  // A colon only survives URL parsing inside a bracketed IPv6 literal, so these prefixes are safe
+  // to read as addresses rather than as names.
+  if (host.includes(":")) return host === "::1" || host.startsWith("fe80:") || /^f[cd][0-9a-f]{2}:/.test(host);
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const [a, b] = [Number(octets[1]), Number(octets[2])];
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+}
+
+/**
+ * Every URL fetched below was written by a page we just downloaded, so the remote can ask this
+ * server to request an address of its choosing. Stripchat authors those addresses, which keeps the
+ * risk low -- but a loopback or metadata target would turn a playback request into a probe of the
+ * host's own network, and that is not a failure mode worth leaving open for a page that a stale
+ * cache or a compromised config could redirect.
+ *
+ * Names are checked, not resolved: a DNS lookup per segment would cost more than it prevents, and
+ * the tempting targets here are literals.
+ */
+function fetchableUrl(value: string): string {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("Stripchat returned a stream address that is not a URL"); }
+  if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("Stripchat returned a stream address with an unsupported scheme");
+  if (isInternalHost(url.hostname)) throw new Error("Stripchat returned a stream address that points inside this host's network");
+  return url.toString();
+}
+
 async function resolveStripchatHls(context: PluginContext, pageUrl: string): Promise<ResolvedStripchatHls> {
   const stream = await stripchatRoomStream(context, pageUrl);
   if (!stream?.domains.length) throw new Error("The public room did not expose an HLS host");
   if (!stream.playerScriptUrl) throw new Error("The public room did not expose its player module");
   const headers = { referer: "https://stripchat.com/", origin: "https://stripchat.com" };
-  const playerResponse = await context.fetch(stream.playerScriptUrl, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
+  const playerResponse = await context.fetch(fetchableUrl(stream.playerScriptUrl), { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
   if (!playerResponse.ok) throw new Error(`Stripchat player module returned HTTP ${playerResponse.status}`);
   const playbackKey = stripchatPublicPlaybackKey(await playerResponse.text());
   if (!playbackKey) throw new Error("Stripchat player module did not expose a public playback key");
 
+  let rejectedInternal = false;
   for (const domain of stream.domains) {
     const master = new URL(`https://edge-hls.${domain}/hls/${encodeURIComponent(stream.modelId)}/master/${encodeURIComponent(stream.modelId)}_auto.m3u8`);
     master.searchParams.set("pkey", playbackKey);
+    let masterUrl: string;
+    try { masterUrl = fetchableUrl(master.toString()); }
+    catch { rejectedInternal = true; continue; }
     try {
-      const response = await context.fetch(master, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
+      const response = await context.fetch(masterUrl, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
       if (!response.ok) continue;
       const manifest = await response.text();
       if (!manifest.trimStart().startsWith("#EXTM3U") || manifest.includes("#EXT-X-MOUFLON-ADVERT")) continue;
       for (const candidate of playlistUrls(manifest, master.toString())) {
         const variant = new URL(candidate);
         if (!variant.searchParams.has("pkey")) variant.searchParams.set("pkey", playbackKey);
-        const variantResponse = await context.fetch(variant, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
+        // The manifest is remote content too, so its segment URLs get the same check.
+        let variantUrl: string;
+        try { variantUrl = fetchableUrl(variant.toString()); }
+        catch { rejectedInternal = true; continue; }
+        const variantResponse = await context.fetch(variantUrl, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
         if (variantResponse.ok && isLivePlaylist(await variantResponse.text())) {
           return { masterUrl: master.toString(), mediaUrl: variant.toString(), headers };
         }
       }
     } catch { /* Try the next CDN host. */ }
   }
+  // Kept apart from the message below: a rejected internal target is our own refusal, not evidence
+  // that the room is offline, and the offline patterns would park the room for an hour.
+  if (rejectedInternal) throw new Error("Stripchat returned a stream address that points inside this host's network");
   throw new Error("No public Stripchat HLS host returned a live manifest");
 }
 
