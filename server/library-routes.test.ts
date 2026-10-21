@@ -99,3 +99,85 @@ describe("media deletion while a merge is running", () => {
     db.close();
   });
 });
+
+describe("hidden entries", () => {
+  /** An image keeps the fixture off ffmpeg: `playbackFile` only remuxes videos. */
+  async function hiddenFixture() {
+    const fixture = libraryFixture();
+    const file = path.join(fixture.media, "Example Performer", "example.com", "portrait.jpg");
+    fs.writeFileSync(file, "image-bytes");
+    const catalog = new Catalog(fixture.db, fixture.media, fixture.data, false);
+    await catalog.scan();
+    const item = fixture.db.listMedia().items[0];
+    fixture.db.markMediaUnplayable(item.id);
+    const downloadDb = { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3];
+    const app = Fastify();
+    registerLibraryRoutes(app, fixture.db, catalog, downloadDb, fixture.data);
+    return { ...fixture, file, catalog, app, item };
+  }
+
+  it("lists an entry every other view filters out", async () => {
+    const { app, db, item } = await hiddenFixture();
+    // This is the whole complaint: the row is invisible everywhere and had no surface at all.
+    expect(db.listMedia().total).toBe(0);
+    const response = await app.inject({ method: "GET", url: "/api/library/hidden" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items).toEqual([expect.objectContaining({ id: item.id, title: item.title })]);
+    await app.close();
+    db.close();
+  });
+
+  it("refuses to restore an entry whose file still cannot be read", async () => {
+    const { app, db, item, file } = await hiddenFixture();
+    fs.rmSync(file);
+    const response = await app.inject({ method: "POST", url: `/api/library/hidden/${item.id}/restore` });
+    // Restoring on trust would put the entry back into every listing and hide it again the first
+    // time somebody opened it, which is the loop this page exists to break.
+    expect(response.statusCode).toBe(409);
+    // A bare Fastify reports the thrown message as `message`; the production error handler maps it
+    // onto `error` for the client. Either way the reason has to survive to the caller.
+    expect(response.json().message).toContain("still unreadable");
+    expect(db.getMedia(item.id)).toBeUndefined();
+    await app.close();
+    db.close();
+  });
+
+  it("restores an entry once its file reads again", async () => {
+    const { app, db, item, file } = await hiddenFixture();
+    fs.rmSync(file);
+    fs.writeFileSync(file, "image-bytes");
+    const response = await app.inject({ method: "POST", url: `/api/library/hidden/${item.id}/restore` });
+    expect(response.statusCode).toBe(200);
+    expect(db.getMedia(item.id)).toBeDefined();
+    expect(db.listMedia().total).toBe(1);
+    // And it leaves the hidden list, so the page cannot offer it twice.
+    expect((await app.inject({ method: "GET", url: "/api/library/hidden" })).json().items).toEqual([]);
+    await app.close();
+    db.close();
+  });
+
+  it("clears a hidden entry whose file is already gone", async () => {
+    const { app, db, item, file } = await hiddenFixture();
+    fs.rmSync(file);
+    // `deleteMedia` requires the file to exist, so this used to be a dead end: the row could not
+    // even be deleted, because being hidden usually means the file vanished.
+    const response = await app.inject({ method: "DELETE", url: `/api/library/hidden/${item.id}` });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ id: item.id, bytes: 0, fileDeleted: false });
+    expect(db.getMedia(item.id, { includeHidden: true })).toBeUndefined();
+    expect((await app.inject({ method: "GET", url: "/api/library/hidden" })).json().items).toEqual([]);
+    await app.close();
+    db.close();
+  });
+
+  it("deletes the file as well when a hidden entry still has one", async () => {
+    const { app, db, item, file } = await hiddenFixture();
+    const response = await app.inject({ method: "DELETE", url: `/api/library/hidden/${item.id}` });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().fileDeleted).toBe(true);
+    expect(fs.existsSync(file)).toBe(false);
+    expect(db.getMedia(item.id, { includeHidden: true })).toBeUndefined();
+    await app.close();
+    db.close();
+  });
+});

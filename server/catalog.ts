@@ -245,6 +245,18 @@ export class Catalog {
     return { bytes: stat.size };
   }
 
+  /**
+   * Drops a library entry without touching a file that is already gone.
+   *
+   * `deleteMedia` cannot cover this: it requires the file to exist, and an entry is hidden
+   * precisely when a read failed -- usually because the file vanished. Without this, that row had
+   * no way out at all.
+   */
+  forgetMedia(media: Media) {
+    this.db.markMediaMissing(media.id);
+    this.removeGeneratedArtifacts(media.id, media.kind);
+  }
+
   private enqueueFfmpeg<T>(task: () => Promise<T>) {
     const operation = this.ffmpegQueue.then(task, task);
     this.ffmpegQueue = operation.then(() => undefined, () => undefined);

@@ -75,6 +75,37 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
     return { ...result, items: result.items.map(payload) };
   });
   app.get<{ Querystring: Record<string, string | undefined> }>("/api/library/playlist", async (request) => ({ ids: libraryDb.playlist(libraryQuery(request.query)) }));
+  // Entries the library hides are filtered out of every listing below, and they are hidden exactly
+  // when a read failed, so there used to be no way back except editing the database over SSH.
+  app.get("/api/library/hidden", async () => ({ items: libraryDb.hiddenMedia() }));
+  app.post<{ Params: { id: string } }>("/api/library/hidden/:id/restore", async (request) => {
+    const media = libraryDb.getMedia(request.params.id, { includeHidden: true });
+    if (!media) throw Object.assign(new Error("Media not found"), { statusCode: 404 });
+    // Check what a player would actually open, not the row: restoring on trust would put an entry
+    // back into every listing that fails again the moment somebody clicks it.
+    let stat: fs.Stats | undefined;
+    try { stat = fs.statSync((await catalog.playbackFile(media)).file); } catch { stat = undefined; }
+    if (!stat?.isFile() || stat.size <= 0) {
+      throw Object.assign(new Error("The file is still unreadable, so this entry stays hidden"), { statusCode: 409 });
+    }
+    if (!libraryDb.markMediaPlayable(media.id)) throw Object.assign(new Error("This entry is not hidden"), { statusCode: 409 });
+    return payload(requiredMedia(media.id));
+  });
+  // Removing a hidden entry has to work when its file is already gone: that is usually *why* it is
+  // hidden, and `deleteMedia` refuses a missing file, so the row would otherwise be stuck forever.
+  app.delete<{ Params: { id: string } }>("/api/library/hidden/:id", async (request) => {
+    const media = libraryDb.getMedia(request.params.id, { includeHidden: true });
+    if (!media) throw Object.assign(new Error("Media not found"), { statusCode: 404 });
+    let bytes = 0;
+    try { bytes = catalog.deleteMedia(media).bytes; }
+    catch (error) {
+      const status = (error as { statusCode?: number }).statusCode;
+      // Only a missing file is forgiven; a permission problem must surface, not be papered over.
+      if (status !== 404) throw error;
+      catalog.forgetMedia(media);
+    }
+    return { id: media.id, bytes, fileDeleted: bytes > 0 };
+  });
   app.get("/api/library-performers", async () => libraryDb.performers().map((performer) => {
     const cover = libraryDb.getMedia(performer.coverId);
     return { ...performer, coverUrl: cover ? payload(cover).thumbnailUrl : "" };

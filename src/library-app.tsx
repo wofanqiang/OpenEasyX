@@ -1,11 +1,12 @@
 import { firstMediaDate, validMediaDate } from "../packages/media-date";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Aperture, BarChart3, ChevronLeft, ChevronRight, Clock3, Eye, Film, FolderSearch2, HardDrive, Heart, History, Image as ImageIcon,
+  Aperture, BarChart3, ChevronLeft, ChevronRight, Clock3, Eye, EyeOff, Film, FolderSearch2, HardDrive, Heart, History, Image as ImageIcon,
   Layers, Library as LibraryIcon, ListChecks, LoaderCircle, Play, Search, SlidersHorizontal, Sparkles,
   Radio, Settings as SettingsIcon, Square, CheckSquare, Trash2, UserRound, Users, X,
 } from "lucide-react";
 import { api } from "./api";
+import { HiddenMediaPage } from "./HiddenMediaPage";
 import { PlayerViewer, type PlaybackContext } from "./Player";
 import { autoplayOnOpen } from "./playback";
 import { playbackAutoStart, playbackLocationState, type EasyXLocationState } from "./playbackRoute";
@@ -32,7 +33,7 @@ type LibraryResult = { items: Media[]; total: number; page: number; pageSize: nu
 type Performer = { name: string; count: number; videos: number; images: number; coverId?: string; coverUrl?: string };
 type Facets = { performers: Performer[]; sources: Array<{ name: string; count: number }> };
 type LibraryPreset = { query?: string; performer?: string; source?: string; kind?: "video" | "image" | ""; watched?: "unseen" | "progress" | "unfinished" | "completed" | ""; sort?: string; page?: number };
-type Page = "home" | "live-cam" | "library" | "performers" | "favorites" | "history" | "statistics" | "settings";
+type Page = "home" | "live-cam" | "library" | "performers" | "favorites" | "history" | "statistics" | "hidden" | "settings";
 type OpenMedia = (media: Media, context?: PlaybackContext) => void;
 type DeletionResult = { deleted: Array<{ id: string; bytes: number; downloaderTracked: boolean }>; failed: Array<{ id: string; error: string }> };
 type DeleteMedia = (ids: string[]) => Promise<DeletionResult>;
@@ -44,7 +45,7 @@ type LocationState = { pathname: string; search: string; state: EasyXLocationSta
 
 let previewBlockedUntil = 0;
 
-const pagePaths: Record<Page, string> = { home: "/media", "live-cam": "/live-cam", library: "/library", performers: "/library-performers", favorites: "/favorites", history: "/history", statistics: "/statistics", settings: "/media-settings" };
+const pagePaths: Record<Page, string> = { home: "/media", "live-cam": "/live-cam", library: "/library", performers: "/library-performers", favorites: "/favorites", history: "/history", statistics: "/statistics", hidden: "/hidden", settings: "/media-settings" };
 
 export function isLibraryRoute(pathname: string) {
   return Object.values(pagePaths).some((route) => pathname === route || pathname.startsWith(`${route}/`)) || /^\/(watch|photos)\/[a-f0-9]{24}\/?$/.test(pathname);
@@ -135,6 +136,7 @@ function timeAgo(value?: string) {
 const nav: Array<[Page, string, React.ElementType]> = [
   ["home", "Home", Aperture], ["live-cam", "Live Cam", Radio], ["library", "Library", LibraryIcon], ["performers", "Performers", Users],
   ["favorites", "Favorites", Heart], ["history", "History", History], ["statistics", "Statistics", BarChart3], ["settings", "Settings", SettingsIcon],
+  ["hidden", "Hidden", EyeOff],
 ];
 
 export function LibraryApp() {
@@ -289,6 +291,7 @@ export function LibraryApp() {
         {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })} refreshToken={refreshToken}/>}
         {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("history", preset), { replace: true })} refreshToken={refreshToken}/>}
         {page === "statistics" && <Statistics stats={dashboard.stats}/>}
+        {page === "hidden" && <HiddenMediaPage setNotice={setNotice} refresh={() => void refresh()}/>}
         {page === "settings" && <SettingsPage setNotice={setNotice}/>}
       </div>}
     {notice && <div className="toast">{notice}<button onClick={() => setNotice("")}><X/></button></div>}

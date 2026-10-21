@@ -223,6 +223,28 @@ export class LibraryDatabase {
     return Number(this.sqlite.prepare("UPDATE media SET playable=0 WHERE id=? AND playable=1").run(id).changes) > 0;
   }
 
+  /**
+   * Puts a hidden entry back into every listing. Callers must check the file first: the row was
+   * hidden precisely because the file could not be read, and restoring on trust would return an
+   * entry that fails again the moment someone opens it.
+   */
+  markMediaPlayable(id: string) {
+    return Number(this.sqlite.prepare("UPDATE media SET playable=1 WHERE id=? AND playable=0 AND missing=0").run(id).changes) > 0;
+  }
+
+  /** What the library is currently hiding. `missing=1` is a separate state the scan owns. */
+  hiddenMedia(limit = 500) {
+    const rows = this.sqlite.prepare(`SELECT * FROM media WHERE missing=0 AND playable=0
+      ORDER BY modified_at DESC LIMIT ?`).all(Math.max(1, Math.min(2_000, limit))) as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: String(row.id), relativePath: String(row.relative_path), kind: row.kind as MediaKind,
+      title: String(row.title), performer: String(row.performer), source: String(row.source),
+      extension: String(row.extension), size: Number(row.size),
+      modifiedAt: String(row.modified_at), addedAt: String(row.added_at),
+      duration: Number(row.duration), width: Number(row.width), height: Number(row.height),
+    }));
+  }
+
   updateProbe(id: string, values: { duration?: number; width?: number; height?: number }) {
     this.sqlite.prepare(`UPDATE media SET duration=CASE WHEN ?>0 THEN ? ELSE duration END,
       width=CASE WHEN ?>0 THEN ? ELSE width END,height=CASE WHEN ?>0 THEN ? ELSE height END WHERE id=?`)
@@ -241,11 +263,16 @@ export class LibraryDatabase {
     };
   }
 
-  getMedia(id: string): Media | undefined {
+  /**
+   * `includeHidden` reaches a row the rest of the app cannot see. It exists for the recovery path
+   * that has to inspect a hidden entry before putting it back, and for nothing else.
+   */
+  getMedia(id: string, options: { includeHidden?: boolean } = {}): Media | undefined {
+    const visible = options.includeHidden ? "" : " AND m.playable=1";
     const row = this.sqlite.prepare(`SELECT m.*,COALESCE(NULLIF(m.duration,0),p.duration,0) effective_duration,
       COALESCE(p.favorite,0) favorite,COALESCE(p.progress_seconds,0) progress_seconds,
       COALESCE(p.completed,0) completed,COALESCE(p.view_count,0) view_count,p.last_viewed_at
-      FROM media m LEFT JOIN playback p ON p.media_id=m.id WHERE m.id=? AND m.missing=0 AND m.playable=1`).get(id) as Record<string, unknown> | undefined;
+      FROM media m LEFT JOIN playback p ON p.media_id=m.id WHERE m.id=? AND m.missing=0${visible}`).get(id) as Record<string, unknown> | undefined;
     return row ? this.mapMedia(row) : undefined;
   }
 
