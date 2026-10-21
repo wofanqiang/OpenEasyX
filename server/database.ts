@@ -34,7 +34,7 @@ export type DownloadItem = {
   qualityScore: number; expectedBytes?: number; publishedAt?: string; metadata: Record<string, unknown>;
   status: string; progress: number; downloadedBytes: number; checksumSha256?: string; visualHash?: string; storagePath?: string; error?: string;
   attempts?: number; nextRetryAt?: string;
-  downloadStartedAt?: string; downloadFinishedAt?: string;
+  downloadStartedAt?: string; downloadFinishedAt?: string; captureEndedAt?: string;
   duplicateOf?: string; duplicateReason?: string;
   createdAt: string; updatedAt: string;
 };
@@ -168,6 +168,10 @@ export class Database {
     if (!itemColumns.has("visual_hash")) this.sqlite.exec("ALTER TABLE items ADD COLUMN visual_hash TEXT");
     if (!itemColumns.has("download_started_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_started_at TEXT");
     if (!itemColumns.has("download_finished_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_finished_at TEXT");
+    // When the capture process itself ended. A live recording keeps running post-processing
+    // (concat + TS remux + faststart) for minutes after its ffmpeg is gone, and for that whole
+    // window it is no longer capturing the room -- see activeLiveItemForSource below.
+    if (!itemColumns.has("capture_ended_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN capture_ended_at TEXT");
     if (!itemColumns.has("downloaded_bytes")) this.sqlite.exec("ALTER TABLE items ADD COLUMN downloaded_bytes INTEGER NOT NULL DEFAULT 0");
     if (!itemColumns.has("duplicate_reason")) this.sqlite.exec("ALTER TABLE items ADD COLUMN duplicate_reason TEXT");
     if (!itemColumns.has("attempts")) this.sqlite.exec("ALTER TABLE items ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
@@ -792,29 +796,44 @@ export class Database {
   // media), and two ffmpeg captures of one room fight over the same viewer session, the same
   // CPU and the same disk budget until both die. Callers that would open or create a live
   // capture consult this first, so the room only ever has one capture in flight.
+  /**
+   * Record that the capture process for a live item has ended, while the item is still being
+   * packaged (concat, TS remux, re-encode).
+   *
+   * `status` deliberately stays `downloading` for that whole stretch -- it is the status the
+   * queue and the Activity page understand -- so the room needs this separate marker to know
+   * it is free to broadcast into a new recording. Without it a room that went live again was
+   * refused for as long as the previous capture took to convert, which on a 1-core box is
+   * minutes per part and can be quarter of an hour for a long session.
+   */
+  markCaptureEnded(itemId: string): void {
+    const stamp = now();
+    this.sqlite.prepare("UPDATE items SET capture_ended_at=COALESCE(capture_ended_at,?),updated_at=? WHERE id=?").run(stamp, stamp, itemId);
+  }
+
   activeLiveItemForSource(sourceId: string, exceptItemId?: string): DownloadItem | undefined {
     const row = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND id<>? AND is_live=1
-      AND status IN ('queued','downloading','paused','stopping','cancelling') ORDER BY created_at LIMIT 1`)
+      AND status IN ('queued','downloading','paused','stopping','cancelling') AND capture_ended_at IS NULL ORDER BY created_at LIMIT 1`)
       .get(sourceId, exceptItemId ?? "") as any;
     return row ? this.mapItem(row) : undefined;
   }
 
   requeueInterruptedDownloads() {
     const stamp = now();
-    const queued = this.sqlite.prepare("UPDATE items SET status='queued',progress=0,downloaded_bytes=0,error=NULL,attempts=0,next_retry_at=NULL,download_started_at=NULL,download_finished_at=NULL,updated_at=? WHERE status='downloading'").run(stamp);
+    const queued = this.sqlite.prepare("UPDATE items SET status='queued',progress=0,downloaded_bytes=0,error=NULL,attempts=0,next_retry_at=NULL,download_started_at=NULL,download_finished_at=NULL,capture_ended_at=NULL,updated_at=? WHERE status='downloading'").run(stamp);
     const cancelled = this.sqlite.prepare("UPDATE items SET status='cancelled',error=NULL,download_finished_at=?,updated_at=? WHERE status IN ('stopping','cancelling')").run(stamp, stamp);
     return Number(queued.changes) + Number(cancelled.changes);
   }
 
   retryFailedItems() {
-    const result = this.sqlite.prepare("UPDATE items SET status='queued',progress=0,downloaded_bytes=0,error=NULL,attempts=0,next_retry_at=NULL,download_started_at=NULL,download_finished_at=NULL,updated_at=? WHERE status='failed'").run(now());
+    const result = this.sqlite.prepare("UPDATE items SET status='queued',progress=0,downloaded_bytes=0,error=NULL,attempts=0,next_retry_at=NULL,download_started_at=NULL,download_finished_at=NULL,capture_ended_at=NULL,updated_at=? WHERE status='failed'").run(now());
     return Number(result.changes);
   }
 
   scheduleRetry(itemId: string, error: string, attempts: number, nextRetryAt: string) {
     // A9: downloaded_bytes is deliberately kept -- the staging partial file survives the
     // retry, and the downloader re-derives the true value from the file on disk anyway.
-    this.sqlite.prepare("UPDATE items SET status='queued',progress=0,error=?,attempts=?,next_retry_at=?,download_started_at=NULL,download_finished_at=NULL,updated_at=? WHERE id=?")
+    this.sqlite.prepare("UPDATE items SET status='queued',progress=0,error=?,attempts=?,next_retry_at=?,download_started_at=NULL,download_finished_at=NULL,capture_ended_at=NULL,updated_at=? WHERE id=?")
       .run(error, attempts, nextRetryAt, now(), itemId);
   }
 
@@ -826,8 +845,9 @@ export class Database {
       attempts=CASE WHEN ? IN ('completed','duplicate') THEN 0 ELSE attempts END,next_retry_at=CASE WHEN ? IN ('completed','duplicate') THEN NULL ELSE next_retry_at END,
       download_started_at=CASE WHEN ?='queued' THEN NULL WHEN ?='downloading' AND download_started_at IS NULL THEN ? ELSE download_started_at END,
       download_finished_at=CASE WHEN ? IN ('queued','downloading','paused','stopping','cancelling') THEN NULL WHEN ? IN ('completed','duplicate','failed','cancelled','deleted') THEN ? ELSE download_finished_at END,
+      capture_ended_at=CASE WHEN ?='queued' THEN NULL ELSE capture_ended_at END,
       updated_at=? WHERE id=?`)
-      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, status, values.duplicateOf ?? null, status, status, stamp, status, status, status, status, stamp, status, status, stamp, stamp, itemId);
+      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, status, values.duplicateOf ?? null, status, status, stamp, status, status, status, status, stamp, status, status, stamp, status, stamp, itemId);
     return this.getItem(itemId);
   }
 
@@ -963,6 +983,7 @@ export class Database {
       duplicateOf: row.duplicate_of ?? undefined, duplicateReason: row.duplicate_reason ?? undefined,
       attempts: Number(row.attempts ?? 0), nextRetryAt: row.next_retry_at ?? undefined,
       downloadStartedAt: row.download_started_at ?? undefined, downloadFinishedAt: row.download_finished_at ?? undefined,
+      captureEndedAt: row.capture_ended_at ?? undefined,
       createdAt: row.created_at, updatedAt: row.updated_at };
   }
 

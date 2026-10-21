@@ -33,6 +33,17 @@ export interface PostProcessGateOptions {
   loadResumeFactor?: number;
   /** Re-check interval while paused (default 5000ms). */
   pollMs?: number;
+  /**
+   * Longest a job may sit in the load window before it runs anyway (default 180000ms).
+   *
+   * The window is not reachable on a small box that is already carrying a live capture: a
+   * one-core VPS with one recording and one remux measures loadavg1 between 1.5 and 2.7, so
+   * the resume line (0.8) never opens and every post-process step waited minutes -- measured
+   * waits of 91s, 115s, 177s and 578s on a single 1-vCPU host. Post-processing is the step
+   * that finishes a capture that is already on disk, so after the cap it competes for CPU
+   * rather than waiting for a quiet machine that will not arrive. `0` disables the cap.
+   */
+  maxWaitMs?: number;
   /** Injectable CPU count for tests (default os.cpus().length, floored at 1). */
   cores?: number;
   /** Injectable load source for tests (default os.loadavg()[0]; 0 disables the gate). */
@@ -50,6 +61,7 @@ export class PostProcessGate {
   private readonly loadPauseFactor: number;
   private readonly loadResumeFactor: number;
   private readonly pollMs: number;
+  private readonly maxWaitMs: number;
   private readonly cores: number;
   private readonly loadAverage: () => number;
   private readonly log?: PostProcessGateOptions["log"];
@@ -69,6 +81,7 @@ export class PostProcessGate {
     this.loadPauseFactor = valid ? pause : Number.POSITIVE_INFINITY;
     this.loadResumeFactor = valid ? resume : 0;
     this.pollMs = Math.max(100, options.pollMs ?? 5000);
+    this.maxWaitMs = Math.max(0, options.maxWaitMs ?? 180_000);
     this.cores = options.cores ?? (os.cpus().length || 1);
     this.loadAverage = options.loadAverage ?? (() => os.loadavg()[0] ?? 0);
     this.log = options.log;
@@ -87,6 +100,7 @@ export class PostProcessGate {
       concurrency: number("EASYX_POSTPROCESS_CONCURRENCY") ?? 1,
       loadPauseFactor: number("EASYX_POSTPROCESS_LOAD_PAUSE") ?? 1.5,
       loadResumeFactor: number("EASYX_POSTPROCESS_LOAD_RESUME") ?? 0.8,
+      maxWaitMs: (number("EASYX_POSTPROCESS_MAX_WAIT_SECONDS") ?? 180) * 1000,
       log,
     });
   }
@@ -142,6 +156,7 @@ export class PostProcessGate {
    * the slot buys nothing else meanwhile.
    */
   private async waitForLoadWindow(label: string): Promise<void> {
+    const start = Date.now();
     for (;;) {
       const load = this.loadAverage();
       if (this.saturated) {
@@ -154,6 +169,15 @@ export class PostProcessGate {
         this.saturated = true;
         this.log?.("warn", "Post-process paused while the system is overloaded", { label, load, cores: this.cores });
       } else {
+        return;
+      }
+      const waited = Date.now() - start;
+      if (this.maxWaitMs > 0 && waited >= this.maxWaitMs) {
+        // Having decided to work under load, do not re-decide for the next job: a box that is
+        // permanently busy (a live capture plus its own remux on one core) would otherwise
+        // delay every step by the whole cap.
+        this.saturated = false;
+        this.log?.("warn", "Post-process started without a quiet load window", { label, load, cores: this.cores, waitedMs: waited, maxWaitMs: this.maxWaitMs });
         return;
       }
       await delay(this.pollMs);

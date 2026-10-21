@@ -458,9 +458,15 @@ export class DownloadQueue {
 
   /** Active items split by pool: live recordings and everything else. */
   private activeCounts() {
-    let recordings = 0;
-    for (const control of this.active.values()) if (control.live) recordings++;
-    return { recordings, downloads: this.active.size - recordings };
+    // A live item whose capture already ended (`encoding`: concat, TS remux, re-encode) is
+    // charged to the download pool instead: its capture ffmpeg is gone, so the room is free to
+    // open a new recording while the old capture converts. Counting it as a recording would
+    // hold the slot for as long as post-processing takes, which on a 1-core box is minutes.
+    let recordings = 0, downloads = 0;
+    for (const control of this.active.values()) {
+      if (control.live && !control.encoding) recordings++; else downloads++;
+    }
+    return { recordings, downloads };
   }
 
   private startItem(item: DownloadItem) {
@@ -679,6 +685,9 @@ export class DownloadQueue {
             control.encoding = true;
             recordingFinalize = true;
             this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
+            // The capture ffmpeg has exited: the room may broadcast into a new recording from
+            // now on, however long the fold-in below takes.
+            this.db.markCaptureEnded(item.id);
             const partBytes = parts.reduce((total, part) => total + fs.statSync(part).size, 0);
             if (parts.length === 1) {
               fs.renameSync(parts[0], tsPath);
@@ -706,6 +715,7 @@ export class DownloadQueue {
             control.encoding = true;
             recordingFinalize = true;
             this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
+            this.db.markCaptureEnded(item.id);
             this.writeLog?.("info", "download", "Remuxing live TS capture to MP4", { itemId: item.id });
             // Measure the constant A/V skew baked into the capture by the dual-HLS
             // recording command: video and audio come from two independent HLS
@@ -790,6 +800,7 @@ export class DownloadQueue {
         // Keep a "cancel"/"delete" so the re-encode is aborted and the item ends cancelled/deleted.
         if (control.action === "stop") control.action = undefined; control.encoding = true;
         this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
+        this.db.markCaptureEnded(item.id);
         this.writeLog?.("info", "download", "Encoding live recording", { itemId: item.id, preset });
         let encodeBytes = 0; try { encodeBytes = fs.statSync(temporary).size; } catch { /* keep 0 */ }
         await this.postProcessGate.run("Re-encode", () =>

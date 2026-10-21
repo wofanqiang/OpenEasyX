@@ -81,6 +81,23 @@ describe("Database", () => {
     expect(db.activeLiveItemForSource(source.id)).toBeUndefined();
   });
 
+  it("frees the room once the capture has ended, even while the item is still packaging", () => {
+    const db = createDb();
+    const person = db.createPerformer({ name: "Alice" });
+    const source = db.addSource(person.id, "test.live", { externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test" });
+    db.ingestItems(source, [{ externalId: "live-one", mediaType: "video", metadata: { live: true } }]);
+    const first = db.listItems().find((item) => item.externalId === "live-one")!;
+    db.setItemStatus(first.id, "downloading", { progress: 0.99 });
+
+    // Concat / remux window: the capture ffmpeg is gone but the item is still `downloading`.
+    db.markCaptureEnded(first.id);
+    expect(db.activeLiveItemForSource(source.id)).toBeUndefined();
+
+    // A retry clears the marker: the item is capturing again.
+    db.scheduleRetry(first.id, "boom", 1, new Date(Date.now() + 60_000).toISOString());
+    expect(db.activeLiveItemForSource(source.id)).toMatchObject({ id: first.id });
+  });
+
   it("does not let the global queue switch turn a live stream into a recording", () => {
     const db = createDb();
     expect(db.getSettings().autoQueueDiscovered).toBe(true);

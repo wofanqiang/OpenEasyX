@@ -86,6 +86,16 @@ describe("PostProcessGate", () => {
     expect(started).toBe(true);
   });
 
+  it("starts anyway once the load window has been waited out", async () => {
+    // A 1-vCPU host with a live capture running never dips under the resume line; waiting
+    // forever there means a finished recording is never packaged.
+    const gate = new PostProcessGate({ loadAverage: () => 2.4, cores: 1, pollMs: 5, maxWaitMs: 40 });
+    let started = false;
+    await gate.run("remux", async () => { started = true; });
+    expect(started).toBe(true);
+    expect(gate.status()).toMatchObject({ saturated: false, active: 0, queued: 0 });
+  });
+
   it("does not latch forever on a misconfigured threshold pair", async () => {
     // resume >= pause is invalid; the gate must disable the load check entirely.
     const gate = new PostProcessGate({ loadAverage: () => 50, cores: 1, pollMs: 5, loadPauseFactor: 1.5, loadResumeFactor: 2 });

@@ -207,6 +207,19 @@ describe("Open EasyX live cams", () => {
     expect(database.listItems(50)).toHaveLength(2);
   });
 
+  it("records a room again while its previous capture is still being packaged", async () => {
+    const { plugins, service, database } = await fixture();
+    plugins.install("test.live");
+    const cam = { id: "alice", username: "alice", title: "Alice live", pageUrl: "https://live.test/alice" };
+    const first = await service.record("test.live", cam);
+    // Concat/remux window: the room went live again, and the finished capture is still
+    // `downloading` at 99% while ffmpeg packages it. That is not a capture in flight.
+    database.markCaptureEnded(first.itemId);
+    const again = await service.record("test.live", cam);
+    expect(again.itemId).not.toBe(first.itemId);
+    expect(database.listItems(50)).toHaveLength(2);
+  });
+
   it("does not let an old in-flight account read overwrite a reconnected session", async () => {
     const { plugins, service } = await fixture(); plugins.install("test.live");
     let finishOld!: (value: { authoritative: boolean; cams: []; skippedReason: string }) => void;
