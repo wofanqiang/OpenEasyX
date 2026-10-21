@@ -40,6 +40,24 @@ describe("live capture request", () => {
     expect(headers).toContain("Referer: https://site.test/");
   });
 
+  it("gives every input a read timeout so a stalled socket cannot hang the capture", () => {
+    // -reconnect only reacts to a closed or errored connection. A CDN that keeps the socket open
+    // and stops sending blocks ffmpeg forever; before the timeout existed only the downloader's
+    // stall timer ended that, and it SIGKILLs the whole capture. 15s must stay below that timer
+    // (60s for a live item) so ffmpeg gets to reconnect first.
+    const request = ffmpegLiveCaptureCommand(
+      { url: "https://cdn.test/v.m3u8", audioUrl: "https://cdn.test/a.m3u8" },
+      { output: "{outputDir}/capture.ts", filename: "a.mp4" },
+    );
+    const index = request.args.indexOf("-rw_timeout");
+    expect(index).toBeGreaterThan(-1);
+    const microseconds = Number(request.args[index + 1]);
+    expect(microseconds).toBe(15_000_000);
+    expect(microseconds / 1_000_000).toBeLessThan(60);
+    // A protocol option must be given before the inputs it applies to.
+    expect(index).toBeLessThan(request.args.indexOf("-i"));
+  });
+
   it("muxes a separate audio rendition when the stream exposes one", () => {
     const request = ffmpegLiveCaptureCommand(
       { url: "https://cdn.test/v.m3u8", audioUrl: "https://cdn.test/a.m3u8" },

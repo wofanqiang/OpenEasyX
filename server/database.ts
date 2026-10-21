@@ -199,6 +199,9 @@ export class Database {
     this.setDefault("downloadRetryAttempts", 5);
     this.setDefault("downloadRetryBaseSeconds", 30);
     this.setDefault("downloadStallTimeoutSeconds", 120);
+    // Live captures get a tighter bound: they produce bytes continuously, so a minute of silence
+    // is a dead capture rather than a slow one, and every waited second is lost broadcast.
+    this.setDefault("liveStallTimeoutSeconds", 60);
     this.setDefault("autoQueueDiscovered", true);
     this.setDefault("defaultScrapeIntervalMinutes", 360);
     this.setDefault("defaultLiveIntervalSeconds", 10);

@@ -53,6 +53,10 @@ const MAX_DOWNLOADS = 8;
 // and six lanes with no remux alongside were measured fine on a 1-core box.
 const DEFAULT_MAX_RECORDINGS = 4;
 const MAX_RECORDINGS = 32;
+// A live capture that has produced no bytes for this long is dead, not slow (see
+// resolveLiveStallSeconds). Kept above the 15s ffmpeg read timeout in packages/live-capture.ts so
+// a reconnect attempt is always given time to land before the capture is written off.
+const LIVE_STALL_DEFAULT_SECONDS = 60;
 // A stale staging directory that still holds media is worth rescuing (A10); anything else
 // in .downloads is scaffolding (sidecars, empty dirs) and is simply removed.
 const MEDIA_EXTENSIONS = new Set([".ts", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".mp3", ".m4a", ".jpg", ".jpeg", ".png", ".webp"]);
@@ -100,6 +104,23 @@ export function stalledDownload(control: Pick<ActiveDownload, "encoding" | "acti
   if (control.encoding) return false;
   if (control.action || control.paused) return false;
   return now - lastActivity > timeoutMs;
+}
+
+/**
+ * Stall timeout that applies to a live capture, in seconds.
+ *
+ * Live and VOD failures are not symmetric. A stalled VOD download resumes from the byte offset it
+ * stopped at, so waiting longer costs nothing but time. A stalled live capture loses the broadcast
+ * for every second it waits, and the broadcast does not come back. The default therefore drops to
+ * `LIVE_STALL_DEFAULT_SECONDS` (60s) whatever the download timeout is, while still honouring a
+ * *smaller* configured value and an explicit `liveStallTimeoutSeconds` override. `0` keeps its
+ * existing meaning (no stall detection) for operators who want it disabled outright.
+ */
+export function resolveLiveStallSeconds(liveValue: unknown, downloadSeconds: number): number {
+  const explicit = Number(liveValue);
+  if (Number.isFinite(explicit) && explicit >= 0) return Math.floor(explicit);
+  if (downloadSeconds === 0) return 0;
+  return Math.min(downloadSeconds, LIVE_STALL_DEFAULT_SECONDS);
 }
 
 /**
@@ -596,7 +617,16 @@ export class DownloadQueue {
       lastProgress = nextProgress; lastBytes = nextBytes; lastProgressUpdate = stamp; lastActivity = stamp;
       if (!control.action) this.db.setItemStatus(item.id, control.paused ? "paused" : "downloading", { progress: nextProgress, downloadedBytes: nextBytes });
     };
-    const stallTimeoutMs = Math.max(0, Number(this.db.getSettings().downloadStallTimeoutSeconds ?? 120)) * 1000;
+    // A live capture writes continuously (a segment lands every few seconds), so a whole minute
+    // with no byte growth is already a dead capture: the read timeout inside ffmpeg has fired and
+    // its reconnects are failing. Waiting the download-sized timeout (120s by default) only
+    // deepens the hole against the live edge, and every one of those seconds is lost content --
+    // a VOD retry, by contrast, resumes from the same byte offset and loses nothing. So live
+    // captures get their own, tighter bound; an explicit `liveStallTimeoutSeconds` (0 disables)
+    // overrides it, and the configured download timeout still caps the value.
+    const configuredStallSeconds = Math.max(0, Number(this.db.getSettings().downloadStallTimeoutSeconds ?? 120));
+    const liveStallSeconds = resolveLiveStallSeconds(this.db.getSettings().liveStallTimeoutSeconds, configuredStallSeconds);
+    const stallTimeoutMs = (isLiveRecording ? liveStallSeconds : configuredStallSeconds) * 1000;
     const stallTimer = stallTimeoutMs > 0 ? setInterval(() => {
       if (!stalledDownload(control, lastByteGrowthAt, Date.now(), stallTimeoutMs)) return;
       control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");

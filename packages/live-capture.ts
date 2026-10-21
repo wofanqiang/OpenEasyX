@@ -3,6 +3,14 @@ import type { CommandDownloadRequest, EasyXPlugin, LiveCam, LiveStream, MediaCan
 const FFMPEG_CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /**
+ * ffmpeg protocol read/write timeout, in microseconds (15s). Long enough that a slow but healthy
+ * segment request is never cut, short enough that a dead socket is retried while the recording can
+ * still catch up with the live edge. Must stay below the live stall timeout in the downloader, or
+ * the stall timer kills the capture before ffmpeg has a chance to reconnect.
+ */
+const LIVE_READ_TIMEOUT_US = 15_000_000;
+
+/**
  * Build an ffmpeg command that captures a live HLS stream straight to MPEG-TS.
  * Capturing to TS (instead of letting yt-dlp record the whole session) keeps
  * memory in the tens of MB per stream and tolerates an abrupt stop: the
@@ -37,6 +45,14 @@ export function ffmpegLiveCaptureCommand(stream: LiveStream, options: { referer?
     // inside this process instead of tearing the capture down. Matches the comment above.
     "-reconnect_on_http_error", "403,5xx", "-reconnect_streamed", "1",
     "-reconnect_delay_max", "10",
+    // A read timeout is what makes `-reconnect` usable at all. The reconnect flags only react to
+    // a *closed* or *errored* connection; a CDN that holds the socket open and simply stops
+    // sending (a half-open TCP, the classic LL-HLS stall) blocks ffmpeg indefinitely, and the
+    // only thing that used to end it was the downloader's stall timer -- which SIGKILLs the whole
+    // capture, so a 30-second network hiccup cost the entire recording plus a 15-minute retry
+    // backoff. 15s matches the plugin-side recorder, so both capture paths now degrade the same
+    // way: the read fails, ffmpeg reconnects and re-reads the playlist, the capture survives.
+    "-rw_timeout", String(LIVE_READ_TIMEOUT_US),
     "-user_agent", FFMPEG_CHROME_USER_AGENT,
   ];
   if (headerArg.trim()) args.push("-headers", headerArg);

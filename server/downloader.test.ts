@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -382,6 +382,30 @@ describe("DownloadQueue", () => {
     expect(fs.existsSync(file)).toBe(false);
     expect(libraryDb.listMedia().total).toBe(0);
     libraryDb.close();
+  });
+});
+
+describe("resolveLiveStallSeconds", () => {
+  it("bounds a live capture by 60s even when downloads keep the 120s default", () => {
+    // A silent live capture is dead, not slow: the broadcast is lost for every second waited,
+    // while a stalled VOD download resumes from where it stopped.
+    expect(resolveLiveStallSeconds(undefined, 120)).toBe(60);
+    expect(resolveLiveStallSeconds(undefined, 600)).toBe(60);
+  });
+
+  it("honours a download timeout that is already tighter than the live default", () => {
+    expect(resolveLiveStallSeconds(undefined, 30)).toBe(30);
+  });
+
+  it("lets an explicit live value win, including disabling detection", () => {
+    expect(resolveLiveStallSeconds(90, 120)).toBe(90);
+    expect(resolveLiveStallSeconds(0, 120)).toBe(0);
+    // A stored string (settings are JSON) has to work the same as a number.
+    expect(resolveLiveStallSeconds("45", 120)).toBe(45);
+  });
+
+  it("keeps 'disabled' disabled when the download timeout disables it", () => {
+    expect(resolveLiveStallSeconds(undefined, 0)).toBe(0);
   });
 });
 
