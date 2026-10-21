@@ -27,6 +27,13 @@ function modernAccountPage(): string {
   return `<script>window.PAGE_CONFIG = ${JSON.stringify({ releaseVersion: "12.3.4" })};</script>`;
 }
 
+/**
+ * The page Stripchat's static frontend pool serves instead of the SSR room: no state payload, but
+ * its loader script mentions the identifier by name. Copying that detail matters -- a fixture
+ * without it lets a substring check pass and hides exactly the bug this guards.
+ */
+const STATIC_SHELL_PAGE = '<!doctype html><html><head><!--CSP--><script>(()=>{if(!("__PRELOADED_STATE__" in window)){document.body.className="loader"}})()</script></head><body></body></html>';
+
 function pageState() {
   return `<script>window.__PRELOADED_STATE__ = ${JSON.stringify({
     viewCam: { model: { id: 42, username: "Alice", isLive: true, isOnline: true } },
@@ -87,19 +94,33 @@ describe("Stripchat direct live playback", () => {
     expect(mock.fetch).toHaveBeenCalledTimes(3);
   });
 
-  it("retries Stripchat's interstitial page instead of reporting the room offline", async () => {
+  it("retries the static shell instead of reporting a live room offline", async () => {
     const mock = context("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:123\n#EXTINF:2\nsegment.mp4\n");
-    // Production serves a JS-only interstitial with no preloaded state for the first requests of
-    // a fresh connection; the real room page only arrives once its cookies are in place. Measured
-    // against the live host: attempts 1 and 2 interstitial, attempt 3 complete.
-    const interstitial = "<!doctype html><html><head><!--CSP--><title>Stripchat</title></head></html>";
+    // Which backend answers is decided per request, so the shell can land on a room that is live
+    // right now -- measured on production for a room whose state was `isLive: true`.
     let pageRequests = 0;
     mock.runCommand.mockImplementation(async () => {
       pageRequests += 1;
-      return { exitCode: 0, stderr: "", stdout: pageRequests < 3 ? interstitial : pageState() };
+      return { exitCode: 0, stderr: "", stdout: pageRequests === 1 ? STATIC_SHELL_PAGE : pageState() };
     });
     await expect(resolveStripchatDirect(mock, "https://stripchat.com/Alice")).resolves.toMatchObject({ contentType: "application/vnd.apple.mpegurl" });
-    expect(pageRequests).toBe(3);
+    // One retry is all it takes: the shell was rejected structurally, not read as "no live room".
+    expect(pageRequests).toBe(2);
+  });
+
+  it("keeps a live room visible when its first profile page is the static shell", async () => {
+    const mock = context("");
+    let pageRequests = 0;
+    mock.runCommand.mockImplementation(async () => {
+      pageRequests += 1;
+      return { exitCode: 0, stderr: "", stdout: pageRequests === 1 ? STATIC_SHELL_PAGE : pageState() };
+    });
+    // The liveness answer is just "no cams" if the shell is read as a real page, and the room then
+    // hides for the whole offline window. Nothing else retries this path.
+    await expect(listStripchatMedia(mock, {
+      id: "s", externalId: "Alice", performerId: "p", profileUrl: "https://stripchat.com/Alice", domain: "stripchat.com",
+    })).resolves.toEqual([expect.objectContaining({ externalId: "stripchat:alice:live" })]);
+    expect(pageRequests).toBe(2);
   });
 
   it("does not retry when the room page itself says the room is offline", async () => {
@@ -118,7 +139,7 @@ describe("Stripchat direct live playback", () => {
     const mock = context("");
     mock.runCommand.mockResolvedValue({ exitCode: 0, stderr: "", stdout: "<!doctype html><html><head><!--CSP--></head></html>" });
     const error = await resolveStripchatDirect(mock, "https://stripchat.com/Alice").then(() => undefined, (failure: Error) => failure);
-    expect(error?.message).toContain("interstitial");
+    expect(error?.message).toContain("static page shell");
     // The wording has to stay clear of server/offline-error.ts, or this failure parks the room on
     // the hour-long cooldown that is meant for a room that is genuinely off.
     expect(/did not expose an hls host|no public .*hls host returned a live manifest/i.test(error?.message ?? "")).toBe(false);

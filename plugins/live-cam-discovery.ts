@@ -237,11 +237,41 @@ export function stripchatFavoriteCams(payload: unknown, online?: boolean): Array
 
 export type StripchatStreamConfig = { modelId: string; domains: string[]; playerScriptUrl?: string };
 
-function stripchatPreloadedState(html: string): Record<string, unknown> | undefined {
+export function stripchatPreloadedState(html: string): Record<string, unknown> | undefined {
   const marker = html.indexOf("window.__PRELOADED_STATE__");
   const raw = marker >= 0 ? balancedObject(html, marker) : undefined;
   if (!raw) return undefined;
   try { return record(JSON.parse(raw)); } catch { return undefined; }
+}
+
+/**
+ * Stripchat serves the same room URL from two backends. Most requests reach the SSR renderer and
+ * come back as a ~410KB page carrying `window.__PRELOADED_STATE__`; a small fraction are answered
+ * by the static frontend pool as a ~61KB client-only shell (`x-backend: ...-sc-fw...`,
+ * `cache-control: no-cache`) with no state payload at all. Measured at 6 of 210 requests across
+ * two hosts, and it hits rooms that are live right now -- where every reader below would see "the
+ * room is offline".
+ *
+ * Retrying is the whole remedy: which pool answers is decided per request, and a single retry
+ * recovered every capture. Cookies, a warm session and a real Chromium profile were all measured
+ * against production and changed nothing, so there is no state worth carrying between attempts.
+ */
+export const STRIPCHAT_PAGE_ATTEMPTS = 3;
+
+export async function stripchatSsrPage(context: PluginContext, url: string, attempts = STRIPCHAT_PAGE_ATTEMPTS): Promise<string> {
+  let shellPages = 0;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    context.signal?.throwIfAborted();
+    const html = await browserHtml(context, url);
+    // The structural test, not a substring test: the shell page contains the bare identifier
+    // `"__PRELOADED_STATE__"` inside its loader script, so asking whether the string appears
+    // answers "yes" for exactly the page this exists to reject.
+    if (stripchatPreloadedState(html)) return html;
+    shellPages += 1;
+  }
+  // Worded to stay clear of server/offline-error.ts: the room's state is unknown, not confirmed
+  // offline, so this must not park the room on the hour-long cooldown.
+  throw new Error(`Stripchat answered ${shellPages} time(s) with its static page shell instead of the room`);
 }
 
 export function stripchatStreamConfig(html: string): StripchatStreamConfig | undefined {
@@ -324,7 +354,7 @@ async function stripchatPage(context: PluginContext, query: LiveCamQuery): Promi
   };
   if (query.search) {
     const username = query.search.trim();
-    const html = await browserHtml(context, `https://stripchat.com/${encodeURIComponent(username)}`);
+    const html = await stripchatSsrPage(context, `https://stripchat.com/${encodeURIComponent(username)}`);
     return filteredPage(stripchatProfileLiveCams(html, username), { ...query, page: 1 });
   }
   // Stripchat's initial multi-block endpoint exposes only a few featured rows.

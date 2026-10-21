@@ -1,8 +1,9 @@
 import { LIVE_RECORDER_SCRIPT, retryDelay } from "../live-recorder.js";
 import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
-import { browserHtml } from "../browser-html-utils.js";
-import { stripchatFavoriteCams, stripchatProfileLiveCams, stripchatStreamConfig, type StripchatStreamConfig } from "../live-cam-discovery.js";
+import {
+  stripchatFavoriteCams, stripchatProfileLiveCams, stripchatSsrPage, stripchatStreamConfig, type StripchatStreamConfig,
+} from "../live-cam-discovery.js";
 import type { CommandDownloadRequest, LiveCam, LiveCamFavoriteSnapshot, LiveStream, MediaCandidate, MediaSource, PerformerRecord, PersonCandidate, PluginContext, SourceCandidate } from "../../packages/plugin-sdk/index.js";
 
 const plugin = createLiveCamPlugin({
@@ -235,30 +236,15 @@ function isLivePlaylist(manifest: string): boolean {
 type ResolvedStripchatHls = { masterUrl: string; mediaUrl: string; headers: Record<string, string> };
 
 /**
- * Stripchat answers the first requests of a fresh connection with a ~61KB JS interstitial that
- * carries no `window.__PRELOADED_STATE__`; a later attempt carries the session cookies it set and
- * returns the real ~410KB page. Measured against production: requests 1 and 2 were the
- * interstitial, request 3 onward were complete.
+ * The room's stream config, or undefined when the page arrived and says the room has no public
+ * show.
  *
- * Retrying here is what stops the interstitial from being read as "the room is offline". It used
- * to reach `server/offline-error.ts` through the "did not expose an HLS host" message below, which
- * parks the room for an hour -- so a page we never actually received cost a recording slot.
+ * Telling those two apart is entirely `stripchatSsrPage`'s job: it retries the static shell that
+ * Stripchat serves for a few percent of requests and throws when it keeps coming, so reaching the
+ * undefined return below means the preloaded state was there and the room really is off.
  */
-const STREAM_CONFIG_ATTEMPTS = 3;
-
 async function stripchatRoomStream(context: PluginContext, pageUrl: string): Promise<StripchatStreamConfig | undefined> {
-  for (let attempt = 0; attempt < STREAM_CONFIG_ATTEMPTS; attempt += 1) {
-    const html = await browserHtml(context, pageUrl);
-    const stream = stripchatStreamConfig(html);
-    if (stream) return stream;
-    // A page that never carried the preloaded state was not the room page at all, so ask again.
-    // One that did carry it but still yields no stream is a room that is genuinely offline, and
-    // another fetch would only spend time reaching the same answer.
-    if (html.includes("__PRELOADED_STATE__")) return undefined;
-  }
-  // Deliberately worded so it does not match offline-error's patterns: the room's state is
-  // unknown, not confirmed offline, and must not be parked on the hour-long cooldown.
-  throw new Error("Stripchat served its interstitial page instead of the room");
+  return stripchatStreamConfig(await stripchatSsrPage(context, pageUrl));
 }
 
 async function resolveStripchatHls(context: PluginContext, pageUrl: string): Promise<ResolvedStripchatHls> {
@@ -374,7 +360,9 @@ const STRIPCHAT_NON_PUBLIC_STATUSES = new Set(["private", "p2p", "groupshow", "v
 
 export async function listStripchatMedia(context: PluginContext, source: MediaSource): Promise<MediaCandidate[]> {
   const username = new URL(source.profileUrl).pathname.split("/").filter(Boolean).at(-1)?.replace(/^@/, "") ?? "live";
-  const html = await browserHtml(context, source.profileUrl);
+  // This is the liveness decision, so a shell page here reads as "no live room" and hides the room
+  // for the whole offline window. It has no other retry behind it.
+  const html = await stripchatSsrPage(context, source.profileUrl);
   const cam = stripchatProfileLiveCams(html, username)[0];
   if (!cam) { return []; }
   // "Online" is not enough: in a private, group or away state there is no public
@@ -505,7 +493,7 @@ export function stripchatModelFromPage(html: string, username: string): Stripcha
 export async function stripchatModelByUsername(context: PluginContext, username: string): Promise<StripchatModel | undefined> {
   let html: string;
   try {
-    html = await browserHtml(context, `https://stripchat.com/${encodeURIComponent(username)}`);
+    html = await stripchatSsrPage(context, `https://stripchat.com/${encodeURIComponent(username)}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/HTTP 404/.test(message)) return undefined;
