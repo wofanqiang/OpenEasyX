@@ -18,7 +18,9 @@ import { BrowserLoginManager } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
 import { LiveCamImages } from "./live-cam-images.js";
 import { LiveCamService } from "./live-cams.js";
-import { HlsProxy, isLiveProxyPath } from "./hls-proxy.js";
+import { HlsProxy } from "./hls-proxy.js";
+import { createSessionGate } from "./session-gate.js";
+import { trustProxyOption } from "./trusted-network.js";
 import { SystemStatsService } from "./system-stats.js";
 import { restoreLiveCamPerformers } from "./live-cam-restore.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
@@ -100,7 +102,13 @@ restoreLiveCamPerformers(db, plugins, liveCams, (error, providerId, username) =>
 queue.start();
 systemStats.start();
 
-const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });
+const app = Fastify({
+  loggerInstance: appLogger,
+  bodyLimit: 8 * 1024 * 1024,
+  // Without this, `request.ip` is the reverse proxy for every request: the login limiter then keeps
+  // one shared bucket, so six wrong passwords from anyone lock out everyone. See trustProxyOption.
+  trustProxy: trustProxyOption(),
+});
 const discoveryStatus = { running: false, completed: 0, total: 0, progress: 0, query: "", error: "" };
 const performerOperations = new Set<string>();
 function beginPerformerOperation(id: string) {
@@ -166,32 +174,17 @@ function cookieSecure(request: FastifyRequest): boolean {
 function sessionCookie(request: FastifyRequest): string | undefined {
   return parseCookies(request.headers.cookie)[SESSION_COOKIE];
 }
-// Global authentication gate. Added before any route registration so it wraps
-// every endpoint (including those registered via plugins) and the static UI.
-app.addHook("onRequest", (request, reply, done) => {
-  const path = new URL(request.url, "http://localhost").pathname;
-  // Endpoints that must work without a session.
-  if (path === "/api/auth/login" || path === "/api/auth/me" || path === "/api/health" || path === "/api/version") return done();
-  // Live streams are recorded by ffmpeg inside this process, which has no cookie, so the
-  // proxy route is reached by capability URL instead of by session. See `isLiveProxyPath`.
-  if (isLiveProxyPath(path)) return done();
-  // Static assets and the internal browser proxy are served without authentication so the SPA shell can render.
-  if (!path.startsWith("/api/")) return done();
-  if (!auth.verifySession(sessionCookie(request))) return reply.status(401).send({ error: "unauthorized" });
-  // CSRF protection for state-changing requests: the cookie is SameSite=Lax and a
-  // custom header that browsers cannot attach on cross-site requests is required.
-  if (request.method !== "GET" && request.method !== "OPTIONS" && request.headers["x-requested-with"] !== "EasyX") {
-    return reply.status(403).send({ error: "csrf" });
-  }
-  done();
-});
+app.addHook("onRequest", createSessionGate({ verifySession: (cookie) => auth.verifySession(cookie), readSessionCookie: sessionCookie }));
 
 await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
 const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds());
 const sourceSync = new SourceSync(db, mediaDir, ensureScraperPlugin, (id) => plugins.context(id), (ids) => queue.applyStoredMediaDates(ids));
 registerPerformerMergeRoutes(app, db, libraryDb, dataDir, (id) => performerOperations.has(id) || performerRefreshStatus.running || discoveryStatus.running || db.listSources(id).some((source) => sourceSync.active.has(source.id)));
 
-app.get("/api/health", async () => ({ ok: true, product: "Open EasyX", version: appVersion, plugins: plugins.list().length, library: libraryDb.stats().total, scan: catalog.status }));
+// Deliberately free of queries: this answers without a session, so it must not be a way to make
+// the process aggregate the whole library on demand. The caller-side statistics live on the
+// authenticated library endpoints.
+app.get("/api/health", async () => ({ ok: true, product: "Open EasyX", version: appVersion, plugins: plugins.list().length, scan: catalog.status }));
 app.get("/api/version", async () => ({ version: appVersion }));
 // Host and container resource snapshot. Sampling happens on a background timer
 // inside SystemStatsService; this handler only reads the cached snapshot.
