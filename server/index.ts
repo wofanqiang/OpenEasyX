@@ -3,7 +3,6 @@ import path from "node:path";
 import fs from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import Fastify from "fastify";
-import fastifyHttpProxy from "@fastify/http-proxy";
 import fastifyStatic from "@fastify/static";
 import pino from "pino";
 import { z } from "zod";
@@ -176,7 +175,12 @@ function sessionCookie(request: FastifyRequest): string | undefined {
 }
 app.addHook("onRequest", createSessionGate({ verifySession: (cookie) => auth.verifySession(cookie), readSessionCookie: sessionCookie }));
 
-await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
+// The noVNC viewer proxy that used to live here pointed at 127.0.0.1:6080, which nothing in this
+// deployment provides: no compose service listens there, so every request was a 500 with no way to
+// configure the upstream. It has been removed rather than given a token -- an access token on a
+// route that can only ever fail is not hardening. If a browser viewer comes back, it belongs behind
+// the session gate with its own capability token, and `isSessionExempt` already refuses to treat
+// /browser as a public path.
 const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds());
 const sourceSync = new SourceSync(db, mediaDir, ensureScraperPlugin, (id) => plugins.context(id), (ids) => queue.applyStoredMediaDates(ids));
 registerPerformerMergeRoutes(app, db, libraryDb, dataDir, (id) => performerOperations.has(id) || performerRefreshStatus.running || discoveryStatus.running || db.listSources(id).some((source) => sourceSync.active.has(source.id)));

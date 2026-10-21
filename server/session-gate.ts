@@ -14,10 +14,9 @@ const PUBLIC_ENDPOINTS = new Set(["/api/auth/login", "/api/auth/me", "/api/healt
  *    credential.
  *  * Static assets are what renders the login screen in the first place.
  *
- * The browser proxy is deliberately *not* exempt. It used to fall into "everything outside /api/"
- * and answered unauthenticated while a VNC session was running; meanwhile it is an iframe on this
- * same origin, so its cookie travels with both the page request and the websocket handshake.
- * Being outside /api/ was never the same thing as being unauthenticatable.
+ * The /browser path is deliberately *not* exempt, and the rule stays even though the noVNC proxy
+ * it gated has been removed: it sits outside /api/, so without this line any future path under it
+ * would be treated as a public static asset and answer unauthenticated.
  */
 export function isSessionExempt(path: string): boolean {
   if (PUBLIC_ENDPOINTS.has(path)) return true;
