@@ -24,7 +24,7 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
 
   const items = new Map<string, Partial<Pick<DownloadItem, "status" | "error">>>();
   let itemCounter = 0;
-  const listedItems: Array<Pick<DownloadItem, "id" | "pluginId" | "externalId" | "status" | "metadata">> = [];
+  const listedItems: Array<Pick<DownloadItem, "id" | "pluginId" | "externalId" | "status" | "metadata" | "captureEndedAt">> = [];
   const dbStub = {
     getSettings: () => db.getSettings(),
     listLiveCamFavorites: () => db.listLiveCamFavorites(),
@@ -373,6 +373,51 @@ describe("auto recorder", () => {
       }
       // The last wait is the 10-minute ceiling, not the hour a download would be given.
       expect(env.logs.some((line) => line.includes("checking liveness again in 600s"))).toBe(true);
+    } finally { env.cleanup(); vi.useRealTimers(); }
+  });
+
+  it("stops calling a room busy once its capture has ended, even while it is still packaging", async () => {
+    // The item stays `downloading` through concat/remux so the stall timer cannot kill a healthy
+    // remux, and that made the watcher -- the only remaining component keying off `status` --
+    // treat the room as occupied for the whole packaging step. The queue already allows a new
+    // capture from `capture_ended_at` onward, so the watcher has to agree or an automatic
+    // re-record waits out minutes of remux on a multi-GB file.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
+    const env: Harness = await fixture();
+    try {
+      for (const username of ["alice", "bob"]) {
+        env.db.setLiveCamFavorite("test.live", { camId: username, username, pageUrl: `https://live.test/${username}` }, true);
+        env.db.setLiveCamFavoriteAutoRecord("test.live", username, true);
+        env.cams.push(makeCam({ id: username, username, pageUrl: `https://live.test/${username}` }));
+      }
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(2);
+
+      // Both captures' ffmpeg has exited; both items are still `downloading` while they pack.
+      // Only alice's carries the capture-ended stamp, so only alice's room is free.
+      for (const [id, username] of [[0, "alice"], [1, "bob"]]) {
+        env.items.set(`item-${id}`, { status: "downloading" });
+        env.listedItems.push({
+          id: `item-${id}`, pluginId: "test.live", externalId: `auto-live:${username}:2026-09-15T11-00-00-000Z`,
+          status: "downloading", metadata: { live: true, liveRoom: username },
+          ...(username === "alice" ? { captureEndedAt: "2026-09-15T12:00:30.000Z" } : {}),
+        });
+      }
+
+      await env.recorder.tick();
+      // Alice's capture finished, so her room is free and her wait starts now -- not when the
+      // remux ends. Bob is still packaging, so he stays in flight and must not be re-recorded.
+      expect(env.logs.some((line) => line.includes("test.live:alice") && line.includes("enters cooldown"))).toBe(true);
+      expect(env.logs.some((line) => line.includes("test.live:bob") && line.includes("enters cooldown"))).toBe(false);
+      expect(env.record).toHaveBeenCalledTimes(2);
+
+      // Once the normal cooldown lapses, alice is recorded again; bob has still not finished.
+      vi.setSystemTime(new Date(Date.now() + 121_000));
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(3);
+      // ... and it is alice's room that got the slot, not bob's.
+      expect((env.record.mock.calls[2] as unknown[])[1]).toMatchObject({ username: "alice" });
     } finally { env.cleanup(); vi.useRealTimers(); }
   });
 

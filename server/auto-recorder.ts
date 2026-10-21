@@ -107,6 +107,17 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
     const liveKeys = new Map<string, string>();
     for (const item of db.listItems(300)) {
       if (!ACTIVE_STATUSES.has(item.status) || !isLiveItem(item)) continue;
+      // A capture whose ffmpeg has already exited is over as far as the room is concerned. The
+      // item stays `downloading` while it is packaged (concat / remux / re-encode), but that work
+      // no longer occupies the broadcast: the room may go live again and has to be recorded from
+      // that moment on. Ignoring it here is what moves the wait from the end of the remux -- which
+      // is minutes later on a multi-GB file -- back to the end of the capture, and it matches what
+      // the queue already does when it asks whether a room is free: `activeLiveItemForSource`
+      // filters on `capture_ended_at IS NULL`, so a new capture is allowed while the old one
+      // converts. Without this the watcher was the only thing still calling the room busy, so an
+      // automatic re-record waited out the whole packaging step that the queue had already
+      // stopped waiting for.
+      if (item.captureEndedAt) continue;
       const room = liveRoomOf(item);
       if (room) liveKeys.set(`${item.pluginId}:${room}`, item.id);
     }
