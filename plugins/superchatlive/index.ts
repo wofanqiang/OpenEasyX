@@ -17,6 +17,7 @@
 import { definePlugin, type LiveCam, type LiveCamFavoriteSnapshot, type LiveCamPage, type LiveCamQuery, type LiveStream, type MediaCandidate, type MediaSource, type PluginContext } from "../../packages/plugin-sdk/index.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
 import { ffmpegLiveCaptureCommand } from "../../packages/live-capture.js";
+import { fetchPublic, InternalAddressError } from "../../packages/public-fetch.js";
 import { LIVE_CRAWL_BUDGET_FALLBACK_MS } from "../../packages/live-budget.js";
 import { configuredArgs, testYtDlp, ytDlpLiveStream } from "../yt-dlp-utils.js";
 import {
@@ -27,6 +28,8 @@ import {
 } from "./streams.js";
 
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36";
+/** Named in the address-refusal messages so a refused hop reads as the provider's doing. */
+const SUPERCHAT_LABEL = "SuperChat";
 
 /** `primaryTag` values the API accepts. `female`/`male` return HTTP 400 and must not be sent. */
 const PRIMARY_TAG: Record<NonNullable<LiveCamQuery["gender"]>, string> = {
@@ -545,6 +548,9 @@ export async function resolveSuperchatStream(context: PluginContext, cam: LiveCa
 
   const streamNames = state.isVr === true ? [`${state.streamName}_vr`, state.streamName] : [state.streamName];
 
+  // Both the CDN host list and the playlist are remote content, so the addresses they lead to are
+  // checked hop by hop -- including wherever the CDN redirects them.
+  let rejectedInternal = false;
   for (const streamName of streamNames) {
     for (const host of hosts) {
       const master = new URL(buildSuperchatHlsUrl(config.template, host, streamName, RECORD_SUFFIX));
@@ -554,7 +560,7 @@ export async function resolveSuperchatStream(context: PluginContext, cam: LiveCa
       // paid token we deliberately never fetch.
       if (state.modelToken) master.searchParams.set("aclAuth", state.modelToken);
       try {
-        const response = await context.fetch(master, { headers: SUPERCHAT_STREAM_HEADERS, signal: requestSignal(context) });
+        const response = await fetchPublic(context, master.toString(), SUPERCHAT_LABEL, { headers: SUPERCHAT_STREAM_HEADERS, signal: requestSignal(context) });
         if (!response.ok) continue;
         const manifest = await response.text();
         if (!manifest.trimStart().startsWith("#EXTM3U") || manifest.includes("#EXT-X-MOUFLON-ADVERT")) continue;
@@ -565,7 +571,7 @@ export async function resolveSuperchatStream(context: PluginContext, cam: LiveCa
         for (const candidate of playlistUrls(manifest, master.toString())) {
           const variant = new URL(challenge ? applyMouflonChallenge(candidate, challenge) : candidate);
           if (state.modelToken && !variant.searchParams.has("aclAuth")) variant.searchParams.set("aclAuth", state.modelToken);
-          const variantResponse = await context.fetch(variant, { headers: SUPERCHAT_STREAM_HEADERS, signal: requestSignal(context) });
+          const variantResponse = await fetchPublic(context, variant.toString(), SUPERCHAT_LABEL, { headers: SUPERCHAT_STREAM_HEADERS, signal: requestSignal(context) });
           if (!variantResponse.ok) continue;
           const media = await variantResponse.text();
           if (!isLivePlaylist(media) || isMasterPlaylist(media)) continue;
@@ -577,9 +583,14 @@ export async function resolveSuperchatStream(context: PluginContext, cam: LiveCa
             contentType: "application/vnd.apple.mpegurl", playlistDecodeKey: decodeKey,
           };
         }
-      } catch { /* Try the next CDN host. */ }
+      } catch (error) {
+        if (error instanceof InternalAddressError) rejectedInternal = true;
+        /* Try the next CDN host. */
+      }
     }
   }
+  // Our own refusal, kept apart from the message below: the offline patterns would park the room.
+  if (rejectedInternal) throw new Error(`${SUPERCHAT_LABEL} returned a stream address that points inside this host's network`);
   throw new Error("No public SuperChat HLS host returned a live manifest");
 }
 

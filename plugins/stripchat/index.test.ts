@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "../../packages/plugin-sdk/index.js";
 import { STRIPCHAT_PAGE_TIMEOUT_MS, stripchatSsrPage } from "../live-cam-discovery.js";
-import { listStripchatMedia, resolveStripchatDirect, resolveStripchatDownload, setStripchatFavorite, stripchatFollowedSnapshot, stripchatPublicPlaybackKey } from "./index.js";
+import { listStripchatMedia, resolveStripchatDirect, resolveStripchatDownload, setStripchatFavorite, stripchatFollowedSnapshot, stripchatModelByUsername, stripchatPublicPlaybackKey } from "./index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -199,6 +199,36 @@ describe("Stripchat direct live playback", () => {
     expect(fetch.mock.calls.map(([input]) => String(input)).some((url) => url.includes("127.0.0.1"))).toBe(false);
     // Our own refusal, not evidence about the room: the offline patterns would park it for an hour.
     expect(/did not expose an hls host|no public .*hls host returned a live manifest/i.test(error?.message ?? "")).toBe(false);
+  });
+
+  it("refuses a manifest that redirects into the host network", async () => {
+    // The address the page named is public and passes the first check; the CDN then answers with a
+    // redirect. Following it blindly would probe the host's own network with a request the guard
+    // had already approved.
+    const fetch = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v2.12.0/main.js")) return new Response('url.searchParams.set("pkey","PublicKey123456")');
+      if (url.includes("/master/")) return new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data/" } });
+      return new Response("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2\nsegment.mp4\n");
+    });
+    const mock = { config: {}, fetch, log: vi.fn(), runCommand: vi.fn(async () => ({ exitCode: 0, stdout: pageState(), stderr: "" })) } as unknown as PluginContext;
+    const error = await resolveStripchatDirect(mock, "https://stripchat.com/Alice").then(() => undefined, (failure: Error) => failure);
+    expect(error?.message).toContain("points inside this host's network");
+    expect(fetch.mock.calls.map(([input]) => String(input)).some((url) => url.includes("169.254.169.254"))).toBe(false);
+    // Every request asked for manual redirects; letting the platform follow one hides the hop.
+    expect(fetch.mock.calls.every(([, init]) => (init as RequestInit | undefined)?.redirect === "manual")).toBe(true);
+    expect(/did not expose an hls host|no public .*hls host returned a live manifest/i.test(error?.message ?? "")).toBe(false);
+  });
+
+  it("does not let a username forge a log line", async () => {
+    const mock = context("");
+    mock.runCommand.mockResolvedValue({ exitCode: 0, stderr: "", stdout: STATIC_SHELL_PAGE });
+    const forged = "evil\n[2026-01-01T00:00:00Z] warn download: forged entry";
+    const error = await stripchatModelByUsername(mock, forged).then(() => undefined, (failure: Error) => failure);
+    expect(error?.message).toContain("profile lookup");
+    // A raw line break would end the real line and make the text after it look like its own entry.
+    expect(error?.message).not.toMatch(/[\r\n]/);
+    expect(error?.message).toContain("evil");
   });
 
   it("rejects Stripchat's finite intro advertisement playlist", async () => {
