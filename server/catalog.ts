@@ -172,7 +172,12 @@ export class Catalog {
       this.status.indexed = indexed;
       this.status.progress = 100;
       this.status.lastScanAt = new Date().toISOString();
-      return { indexed, durationMs: Date.now() - started };
+      const durationMs = Date.now() - started;
+      // node:sqlite is synchronous, so every millisecond spent in here is a millisecond the event
+      // loop is not scheduling recordings or answering the UI. Logging the outliers is what turns
+      // the cost of a scan into something observable rather than theoretical.
+      if (durationMs >= 2_000) this.warn(`Library scan indexed ${indexed} files in ${Math.round(durationMs / 1000)}s`);
+      return { indexed, durationMs };
     }).catch((error) => {
       this.status.error = error instanceof Error ? error.message : String(error);
       throw error;

@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { asJson, id, now, safeSegment } from "./utils.js";
@@ -18,6 +18,20 @@ export type Performer = {
 };
 
 export const PERFORMER_PRIORITIES = { low: -1, normal: 0, high: 1 } as const;
+
+/**
+ * Resolves a stored file to the item that produced it.
+ *
+ * Exported so the test can EXPLAIN the exact statement the server runs. An index guard that
+ * explains a hand-written copy of the query protects nothing: the copy keeps using the index
+ * while the real query quietly goes back to a full table scan per media file.
+ *
+ * The predicate must stay on `storage_path_norm` -- the generated column -- and never on
+ * `replace(storage_path, ...)`, which wraps the column and defeats every index on it.
+ */
+export const STORED_MEDIA_SQL = `SELECT p.name AS performer,s.domain AS source,i.* FROM items i
+  JOIN performers p ON p.id=i.performer_id JOIN sources s ON s.id=i.source_id
+  WHERE i.storage_path_norm=? AND i.status='completed' LIMIT 1`;
 
 export type Source = {
   id: string; performerId: string; pluginId: string; externalId: string; label: string;
@@ -184,6 +198,20 @@ export class Database {
       this.sqlite.exec("ALTER TABLE items ADD COLUMN is_live INTEGER NOT NULL DEFAULT 0");
       this.sqlite.exec("UPDATE items SET is_live=1 WHERE json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')=1");
     }
+    // storedMediaMetadata matches items by their storage path with the separator normalised, which
+    // wraps the column in replace() and therefore defeats every index on storage_path -- a library
+    // scan ran one full table scan per media file (O(files x items)). A generated column keeps the
+    // exact same semantics but is indexable, and it needs no write-path maintenance: SQLite derives
+    // it from storage_path.
+    //
+    // The probe MUST be table_xinfo. PRAGMA table_info omits generated columns, so a table_info
+    // guard would think the column was missing on every boot, re-run the ALTER, and crash the
+    // process on "duplicate column name".
+    const itemXColumns = new Set((this.sqlite.prepare("PRAGMA table_xinfo(items)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!itemXColumns.has("storage_path_norm")) {
+      this.sqlite.exec("ALTER TABLE items ADD COLUMN storage_path_norm TEXT GENERATED ALWAYS AS (replace(storage_path,'\\','/')) VIRTUAL");
+    }
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_storage_norm_idx ON items(storage_path_norm,status)");
     // (status, is_live, created_at) rather than also carrying next_retry_at: the OR in the
     // queue predicate would sever the ordering, forcing a temp b-tree sort per tick, while
     // this shape lets SQLite walk straight to the oldest eligible row and stop at LIMIT 1.
@@ -243,11 +271,15 @@ export class Database {
       .map((row) => [row.key, asJson(row.value_json, null)]));
   }
 
+  // Cached because a library scan calls this once per media file. Re-preparing the statement on
+  // every call meant one SQL compile per file, on a single-threaded event loop that is also
+  // running the recording scheduler.
+  private storedMediaStmt?: StatementSync;
+
   storedMediaMetadata(relativePath: string): Record<string, unknown> {
     const normalized = relativePath.replaceAll("\\", "/");
-    const row = this.sqlite.prepare(`SELECT p.name AS performer,s.domain AS source,i.* FROM items i
-      JOIN performers p ON p.id=i.performer_id JOIN sources s ON s.id=i.source_id
-      WHERE replace(i.storage_path,'\\','/')=? AND i.status='completed' LIMIT 1`).get(normalized) as any;
+    this.storedMediaStmt ??= this.sqlite.prepare(STORED_MEDIA_SQL);
+    const row = this.storedMediaStmt.get(normalized) as any;
     if (!row) return {};
     const live = asJson<Record<string, unknown>>(row.metadata_json, {}).live === true;
     const recordedAt = live ? firstMediaDate(row.download_started_at, row.created_at) : undefined;

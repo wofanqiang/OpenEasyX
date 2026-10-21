@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { Database } from "./database.js";
+import { Database, STORED_MEDIA_SQL } from "./database.js";
 
 const dirs: string[] = [];
 function createDb() { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir); return new Database(dir); }
@@ -322,6 +322,49 @@ describe("Database", () => {
     const third = db.listItemsPage();
     expect(third.statusCounts).toEqual({ available: 2 });
     expect(third.mediaTypes).toEqual(["image", "video"]);
+  });
+
+  it("resolves a stored media file through an index instead of scanning items", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
+    const db = new Database(dir);
+    const person = db.createPerformer({ name: "Index Creator" });
+    const source = db.addSource(person.id, "plugin.one", { externalId: "i", label: "Feed", profileUrl: "https://example.test", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "m1", title: "One", mediaType: "video" }]);
+    const item = db.listItems(10)[0];
+    db.setItemStatus(item.id, "completed", { storagePath: "Index Creator\\example.test\\one.mp4" });
+
+    // Both separators resolve to the same row, exactly as before the generated column existed.
+    expect(db.storedMediaMetadata("Index Creator/example.test/one.mp4")).toMatchObject({ performer: "Index Creator" });
+    expect(db.storedMediaMetadata("Index Creator\\example.test\\one.mp4")).toMatchObject({ performer: "Index Creator" });
+    expect(db.storedMediaMetadata("Index Creator/example.test/absent.mp4")).toEqual({});
+    db.close();
+
+    // Regression guard: the entire point of the generated column is that this lookup stays
+    // indexable. Reverting the predicate to replace(storage_path,...) would quietly restore one
+    // full table scan per media file, and every assertion above would still pass.
+    const sqlite = new DatabaseSync(path.join(dir, "easyx.sqlite"));
+    const plan = sqlite.prepare(`EXPLAIN QUERY PLAN ${STORED_MEDIA_SQL}`)
+      .all("Index Creator/example.test/one.mp4") as Array<{ detail: string }>;
+    sqlite.close();
+    expect(plan.map((row) => row.detail).join(" ")).toContain("items_storage_norm_idx");
+  });
+
+  it("reopens an existing database without duplicating the generated column", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
+    const first = new Database(dir);
+    first.setLiveCamFavorite("test.live", { camId: "a", username: "Alice", pageUrl: "https://live.test/Alice" }, true);
+    first.close();
+
+    // PRAGMA table_info omits generated columns, so a guard built on it would believe the column
+    // is missing on every boot, re-run the ALTER and crash here with "duplicate column name".
+    const second = new Database(dir);
+    expect(second.listLiveCamFavorites()).toHaveLength(1);
+    second.close();
+
+    const sqlite = new DatabaseSync(path.join(dir, "easyx.sqlite"));
+    const columns = (sqlite.prepare("PRAGMA table_xinfo(items)").all() as Array<{ name: string }>).map((column) => column.name);
+    sqlite.close();
+    expect(columns.filter((name) => name === "storage_path_norm")).toHaveLength(1);
   });
 
   it("filters activity across every source sharing a domain", () => {
