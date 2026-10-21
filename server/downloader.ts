@@ -1936,17 +1936,33 @@ export class DownloadQueue {
   async listRecovered(): Promise<Array<{
     itemId: string; title: string; performer: string; source: string;
     duration: number; width: number; height: number; size: number; recoveredAt: string; cataloged: boolean;
+    /** Salvages from an earlier capture of the same broadcast, kept by `consumeRecovered`. */
+    leftovers: Array<{ name: string; size: number }>;
   }>> {
     const entries: Array<{
       itemId: string; title: string; performer: string; source: string;
       duration: number; width: number; height: number; size: number; recoveredAt: string; cataloged: boolean;
+      leftovers: Array<{ name: string; size: number }>;
     }> = [];
     if (!fs.existsSync(this.recoveryRoot)) return entries;
     for (const name of fs.readdirSync(this.recoveryRoot)) {
       const dir = path.join(this.recoveryRoot, name);
       if (!fs.statSync(dir).isDirectory()) continue;
       const mp4 = path.join(dir, "recovered.mp4");
-      if (!fs.existsSync(mp4) || !fs.statSync(mp4).size) continue;
+      const recoveredSize = fs.existsSync(mp4) ? fs.statSync(mp4).size : 0;
+      // A folder outlives its recovered.mp4: archiving consumes that file and deliberately keeps a
+      // suffixed `recovered-*.mp4` from an earlier capture. While only `recovered.mp4` was
+      // recognised, those folders dropped out of this list entirely -- gigabytes on disk that no
+      // screen mentioned and no button could remove.
+      let leftovers: Array<{ name: string; size: number }> = [];
+      let newestLeftover = 0;
+      for (const file of fs.readdirSync(dir)) {
+        if (file === "recovered.mp4" || !/^recovered-.*\.mp4$/i.test(file)) continue;
+        const stat = fs.statSync(path.join(dir, file));
+        leftovers.push({ name: file, size: stat.size });
+        newestLeftover = Math.max(newestLeftover, stat.mtimeMs);
+      }
+      if (!recoveredSize && !leftovers.length) continue;
       const itemId = name;
       const item = this.db.getItem(itemId);
       let sidecar: Record<string, unknown> = {};
@@ -1961,8 +1977,11 @@ export class DownloadQueue {
         title: typeof sidecar.title === "string" ? sidecar.title : (item?.title ?? itemId),
         performer: performerName, source: sourceDomain,
         duration: Number(sidecar.duration ?? 0), width: Number(sidecar.width ?? 0), height: Number(sidecar.height ?? 0),
-        size: fs.statSync(mp4).size, recoveredAt: typeof sidecar.recoveredAt === "string" ? sidecar.recoveredAt : (item?.updatedAt ?? new Date().toISOString()),
-        cataloged,
+        size: recoveredSize,
+        // A leftovers-only folder has no sidecar left to date it, so the files themselves decide.
+        recoveredAt: typeof sidecar.recoveredAt === "string" ? sidecar.recoveredAt
+          : (item?.updatedAt ?? new Date(newestLeftover || Date.now()).toISOString()),
+        cataloged, leftovers,
       });
     }
     return entries.sort((a, b) => (a.recoveredAt < b.recoveredAt ? 1 : -1));

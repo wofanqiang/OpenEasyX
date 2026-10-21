@@ -7,6 +7,9 @@ import "./library.css";
 type Recovered = {
   itemId: string; title: string; performer: string; source: string;
   duration: number; width: number; height: number; size: number; recoveredAt: string; cataloged: boolean;
+  /** Suffixed salvages an earlier capture left in the same folder. They are kept on purpose, and
+   *  a folder holding only these used to be missing from this list entirely. */
+  leftovers: Array<{ name: string; size: number }>;
 };
 type CatalogResult = { cataloged: boolean; reason?: string; storagePath?: string };
 type ArchiveOutcome = { id: string; cataloged: boolean; reason?: string; failed?: boolean };
@@ -294,21 +297,30 @@ function RecoveryCard({ item, selectionMode, selected, busy, toggleSelected, ope
   item: Recovered; selectionMode: boolean; selected: boolean; busy: boolean; toggleSelected: (id: string) => void;
   open: (item: Recovered) => void; archive: (id: string) => void;
 }) {
-  const href = playUrl(item.itemId); const activate = () => selectionMode ? toggleSelected(item.itemId) : open(item);
+  const href = playUrl(item.itemId);
+  // A folder that only holds leftovers has no recovered.mp4: nothing to preview and nothing to
+  // archive, but the bytes are real and Delete is the only way to reclaim them.
+  const leftoverOnly = item.size === 0;
+  const activate = () => {
+    if (selectionMode) { toggleSelected(item.itemId); return; }
+    if (!leftoverOnly) open(item);
+  };
   return <article className={`media-card ${selected ? "selected" : ""}`}>
     {selectionMode && <button className="selection-control" aria-label={selected ? `Deselect ${item.title}` : `Select ${item.title}`} aria-pressed={selected} disabled={busy} onClick={() => toggleSelected(item.itemId)}>{selected ? <CheckSquare/> : <Square/>}</button>}
-    <a className="poster" href={href} aria-label={selectionMode ? `${selected ? "Deselect" : "Select"} ${item.title}` : `Preview ${item.title}`} onClick={(event) => internalLink(event, activate)}>
-      <span className="media-art"><img className="poster-still" src={`/api/recovery/${encodeURIComponent(item.itemId)}/thumbnail`} alt="" loading="lazy" decoding="async"/></span>
-      <span className="play"><Play/></span><span className="type"><Film/></span>
+    <a className="poster" href={href} aria-label={selectionMode ? `${selected ? "Deselect" : "Select"} ${item.title}` : leftoverOnly ? `${item.title} — leftover files only` : `Preview ${item.title}`} onClick={(event) => internalLink(event, activate)}>
+      <span className="media-art">{leftoverOnly ? <FileWarning/> : <img className="poster-still" src={`/api/recovery/${encodeURIComponent(item.itemId)}/thumbnail`} alt="" loading="lazy" decoding="async"/>}</span>
+      {!leftoverOnly && <span className="play"><Play/></span>}<span className="type"><Film/></span>
       {item.duration > 0 && <time>{formatDuration(item.duration)}</time>}
       {item.cataloged && <span className="watch-label complete">In library</span>}
+      {leftoverOnly && <span className="watch-label">Leftovers</span>}
     </a>
     <div className="media-copy">
       <a className="media-title" href={href} onClick={(event) => internalLink(event, activate)}>{item.title}</a>
       <p>{item.performer || "Unsorted"}{item.source ? ` - ${sourceDomain(item.source)}` : ""} · {formatBytes(item.size)}</p>
-      <div className="media-facts"><span>{qualityLabel(item)}</span><i/><time dateTime={item.recoveredAt}>{mediaDateLabel(item.recoveredAt)}</time></div>
+      {item.leftovers.length > 0 && <p className="leftover-line">{leftoverOnly ? "Kept from an earlier capture" : "Also keeps"}: {item.leftovers.map((file) => `${file.name} (${formatBytes(file.size)})`).join(", ")}</p>}
+      <div className="media-facts"><span>{leftoverOnly ? "No recovered.mp4" : qualityLabel(item)}</span><i/><time dateTime={item.recoveredAt}>{mediaDateLabel(item.recoveredAt)}</time></div>
     </div>
-    {!selectionMode && <button className="archive-button" aria-label={`Archive ${item.title}`} title="Archive — move into the library" disabled={busy} onClick={() => archive(item.itemId)}><Archive/></button>}
+    {!selectionMode && !leftoverOnly && <button className="archive-button" aria-label={`Archive ${item.title}`} title="Archive — move into the library" disabled={busy} onClick={() => archive(item.itemId)}><Archive/></button>}
   </article>;
 }
 

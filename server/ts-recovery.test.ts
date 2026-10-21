@@ -427,3 +427,46 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     expect(registry.list()).toHaveLength(2);
   });
 });
+
+describe.skipIf(!hasFfmpeg)("recovery folder leftovers", () => {
+  it("lists a folder that holds only a salvage left by an earlier capture", async () => {
+    const env = await harness();
+    const rescued = env.item("leftovers-only", "completed");
+    // Exactly what `consumeRecovered` leaves behind: recovered.mp4 archived away, the suffixed
+    // salvage from an earlier capture of the same broadcast kept on purpose.
+    fs.mkdirSync(env.recoveryDir(rescued.id), { recursive: true });
+    fs.writeFileSync(path.join(env.recoveryDir(rescued.id), "recovered-5f9fcf.mp4"), Buffer.alloc(2048));
+
+    const listed = await env.queue.listRecovered();
+    // Before this, the folder was not listed at all: the bytes were on disk, no screen mentioned
+    // them, and no button could reclaim them.
+    expect(listed.map((entry) => entry.itemId)).toEqual([rescued.id]);
+    expect(listed[0].size).toBe(0);
+    expect(listed[0].leftovers).toEqual([{ name: "recovered-5f9fcf.mp4", size: 2048 }]);
+  });
+
+  it("names the leftovers alongside a normal recovered recording", async () => {
+    const env = await harness();
+    const rescued = env.item("with-leftover", "failed");
+    fs.mkdirSync(env.recoveryDir(rescued.id), { recursive: true });
+    writePlayableMp4(path.join(env.recoveryDir(rescued.id), "recovered.mp4"));
+    fs.writeFileSync(path.join(env.recoveryDir(rescued.id), "recovered-abc123.mp4"), Buffer.alloc(1024));
+
+    const listed = await env.queue.listRecovered();
+    expect(listed).toHaveLength(1);
+    expect(listed[0].size).toBeGreaterThan(0);
+    expect(listed[0].leftovers).toEqual([{ name: "recovered-abc123.mp4", size: 1024 }]);
+  });
+
+  it("ignores an empty folder and a folder holding only unrelated files", async () => {
+    const env = await harness();
+    const empty = env.item("empty-folder", "failed");
+    const unrelated = env.item("unrelated-folder", "failed");
+    fs.mkdirSync(env.recoveryDir(empty.id), { recursive: true });
+    fs.mkdirSync(env.recoveryDir(unrelated.id), { recursive: true });
+    fs.writeFileSync(path.join(env.recoveryDir(unrelated.id), "notes.txt"), "nothing to rescue");
+
+    // Neither holds footage, so neither belongs on a page about reclaiming footage.
+    expect(await env.queue.listRecovered()).toEqual([]);
+  });
+});

@@ -167,3 +167,6 @@
 .recovery-busy .selection-actions button:disabled{opacity:.5;cursor:not-allowed}
 .recovery-busy .archive-button:disabled{opacity:.4}
 .card-delete-button{position:absolute;z-index:4;top:12px;right:12px;display:grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid rgba(255,255,255,.14);border-radius:9px;color:#fff;background:rgba(9,9,11,.72);backdrop-filter:blur(6px);opacity:0;transition:opacity .15s,background .15s,color .15s;cursor:pointer}.card-delete-button svg{width:15px;height:15px}.media-card:hover .card-delete-button,.card-delete-button:focus-visible{opacity:1}.card-delete-button:hover{color:#ff7082;background:rgba(40,8,14,.9);border-color:rgba(250,64,88,.45)}@media(hover:none){.card-delete-button{opacity:.85}}
+
+/* A leftovers-only row names the salvages it holds; truncating them would hide the point. */
+.media-copy p.leftover-line{white-space:normal;overflow-wrap:anywhere;color:#c09a5a}
