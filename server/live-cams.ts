@@ -680,6 +680,23 @@ export class LiveCamService {
     if (isOfflineConfirmedError(message)) this.offlineOverrides.set(key, Date.now() + OFFLINE_OVERRIDE_MS);
   }
 
+  /**
+   * Whether this room is positively known to be offline right now.
+   *
+   * Only a confirmed-offline verdict answers true. A transient failure clears the cache instead of
+   * poisoning it, so "unknown" reads as false and the caller then behaves exactly as before. The
+   * queue uses this to avoid spending a recording slot on a capture whose room ended while the item
+   * waited for that slot.
+   */
+  isKnownOffline(item: { pluginId: string; externalId: string }): boolean {
+    // Same key shape `reportLiveFailure` writes: live captures are "auto-live:<username>:<stamp>".
+    const username = /^(?:auto|manual)-live:([^:]+):/.exec(item.externalId)?.[1];
+    if (!username) return false;
+    const now = Date.now();
+    for (const [key, until] of this.offlineOverrides) if (until <= now) this.offlineOverrides.delete(key);
+    return this.offlineOverrides.has(`${item.pluginId}:${username.trim().toLowerCase()}`);
+  }
+
   favoriteChanges() {
     return this.db.listLiveCamFavoriteChanges().map(({ providerId, cam, state, error }) => ({ providerId, username: cam.username, state, error }));
   }

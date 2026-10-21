@@ -77,6 +77,9 @@ const queue = new DownloadQueue(
   // Confirmed-offline capture failures feed the live-cam status cache so the auto-recorder
   // stops re-queueing a room whose provider page says it is offline.
   (item, message) => liveCams.reportLiveFailure(item, message),
+  // ...and the same verdict keeps the queue from spending a recording slot on a room that ended
+  // while its item waited.
+  (item) => liveCams.isKnownOffline(item),
 );
 // Long-running background jobs (Library merge, Recovery sweep) live in their own registry and are
 // surfaced to the Activity page by /api/tasks, rather than being faked as download items.

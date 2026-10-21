@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -844,5 +844,63 @@ describe("live recording completeness gates", () => {
     // honest, so even that sees nothing wrong.
     expect(fs.existsSync(path.join(mediaDir, "VTrack Performer", "example.test", "live.mp4"))).toBe(true);
     expect(metadata.truncated).toBeUndefined();
+  });
+});
+
+describe("download priority", () => {
+  it("yields a backfill download but never a live capture", () => {
+    // A broadcast is the thing everything else yields to; backfill is what yields.
+    expect(downloadPriority(true)).toBeUndefined();
+    expect(downloadPriority(false)).toBe("low");
+  });
+
+  it("keeps backfill in the best-effort class rather than the idle one", () => {
+    // Idle I/O would let an hours-long capture starve a backfill completely, so the two levels are
+    // deliberately different: post-processing can sit at the bottom, a download must still move.
+    expect(COMMAND_PRIORITY_WRAPPER.low).toEqual(["-n", "10", "ionice", "-c", "2", "-n", "7"]);
+    expect(COMMAND_PRIORITY_WRAPPER.idle).toEqual(["-n", "19", "ionice", "-c", "3"]);
+  });
+});
+
+describe("queued capture for a room that ended", () => {
+  it("drops it instead of spending a recording slot on it", async () => {
+    const dataDir = temp("easyx-offline-data"); const mediaDir = temp("easyx-offline-media"); const pluginDir = temp("easyx-offline-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    // A resolver that must never be reached: the drop happens before any capture is opened.
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.offline", name: "Offline", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveLiveStream() { throw new Error("a capture must not be opened for an offline room"); } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.offline", { installed: true, enabled: true });
+    const person = db.upsertPerformer({ externalId: "person", name: "Offline Performer" }, "test.offline");
+    const source = db.addSource(person.id, "test.offline", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "auto-live:alice:2026-10-21T10-00-00-000Z", mediaType: "video", filename: "alice.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+
+    const queue = new DownloadQueue(db, manager, mediaDir, undefined, undefined, undefined, undefined, undefined, undefined, () => true);
+    queue.start();
+    await waitFor(() => db.getItem(item.id)?.status === "cancelled");
+    queue.stop();
+
+    expect(db.getItem(item.id)?.error).toMatch(/went offline/i);
+    // Nothing was staged, so no slot was spent and no capture process was spawned.
+    expect(fs.existsSync(path.join(mediaDir, ".downloads", item.id))).toBe(false);
+  });
+
+  it("still starts the capture when the room is not known to be offline", async () => {
+    const dataDir = temp("easyx-unknown-data"); const mediaDir = temp("easyx-unknown-media"); const pluginDir = temp("easyx-unknown-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.unknown", name: "Unknown", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveLiveStream() { throw new Error("provider unreachable"); } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.unknown", { installed: true, enabled: true });
+    const person = db.upsertPerformer({ externalId: "person", name: "Unknown Performer" }, "test.unknown");
+    const source = db.addSource(person.id, "test.unknown", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "auto-live:bob:2026-10-21T10-00-00-000Z", mediaType: "video", filename: "bob.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+
+    const queue = new DownloadQueue(db, manager, mediaDir, undefined, undefined, undefined, undefined, undefined, undefined, () => false);
+    queue.start();
+    // Unknown reads as "not offline": the queue behaves exactly as it did before this guard.
+    await waitFor(() => db.getItem(item.id)?.status !== "queued");
+    queue.stop();
+    expect(db.getItem(item.id)?.status).not.toBe("cancelled");
   });
 });

@@ -100,6 +100,33 @@ export function slotPlan(
   return plan;
 }
 
+/** How much a spawned command yields to the live captures it shares a machine with. */
+export type CommandPriority = "idle" | "low";
+
+/**
+ * Two levels, because they answer different questions.
+ *
+ * `idle` is for post-processing: a remux only has to finish before the next slot opens, so it can
+ * sit in the idle I/O class and at the bottom of the CPU queue. `low` is for backfill downloads:
+ * they must still make progress on a busy box, so they stay best-effort at the lowest weight rather
+ * than being starved outright by a live capture that runs for hours.
+ *
+ * On a machine without `nice`/`ionice` the caller skips the wrapper entirely.
+ */
+export const COMMAND_PRIORITY_WRAPPER: Record<CommandPriority, string[]> = {
+  idle: ["-n", "19", "ionice", "-c", "3"],
+  low: ["-n", "10", "ionice", "-c", "2", "-n", "7"],
+};
+
+/**
+ * A live capture runs at the default priority: it is the thing everything else yields to. Anything
+ * that is not live is backfill and yields -- which is the inversion this had before, where a
+ * downloaded backfill competed with a broadcast on equal terms.
+ */
+export function downloadPriority(liveItem: boolean): CommandPriority | undefined {
+  return liveItem ? undefined : "low";
+}
+
 /**
  * Whether the download stall timer should give up on the running item.
  *
@@ -292,6 +319,8 @@ export class DownloadQueue {
     private readonly liveProxy?: HlsProxy,
     private readonly selfOrigin?: string,
     private readonly onLiveFailure?: (item: DownloadItem, message: string) => void,
+    /** Answers true only when the room is positively known to be offline (see LiveCamService). */
+    private readonly isKnownOffline?: (item: DownloadItem) => boolean,
   ) {
     // Post-processing (concat fold / TS remux / re-encode) runs serialized and load-gated:
     // N workers finishing at once must not start N concurrent ffmpeg remuxes, because on a
@@ -554,7 +583,17 @@ export class DownloadQueue {
     // backfill and a backfill can never be blocked behind a broadcast. A pool whose queue
     // is empty yields nothing and the plan simply moves on to the other one.
     for (const kind of slotPlan(this.activeCounts(), limits)) {
-      const item = this.db.nextQueued(kind === "recording");
+      let item = this.db.nextQueued(kind === "recording");
+      // A queued capture can outlive the room it was queued for: the status said live when it was
+      // queued, but the broadcast may end while the item waits for a slot. Dropping it here costs
+      // nothing; opening ffmpeg costs a slot, a failed row and a retry. Only a confirmed-offline
+      // verdict counts, so an unknown room behaves exactly as before.
+      for (let dropped = 0; item && kind === "recording" && dropped < 5; dropped += 1) {
+        if (!this.isKnownOffline?.(item)) break;
+        this.db.setItemStatus(item.id, "cancelled", { error: "The room went offline while this capture waited for a slot" });
+        this.writeLog?.("info", "download", "Queued capture dropped: the room is known to be offline", { itemId: item.id, title: item.title });
+        item = this.db.nextQueued(true);
+      }
       if (!item || this.active.has(item.id)) continue;
       // One capture per room. A second live item for a source that is already capturing would
       // open another ffmpeg on the same broadcast; the two then starve each other and end
@@ -730,7 +769,10 @@ export class DownloadQueue {
         await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
-        }), temporaryDirectory, item.expectedBytes, reportProgress, control, avWatcher?.onStderr, request.requireSuccessfulExit);
+        }), temporaryDirectory, item.expectedBytes, reportProgress, control, avWatcher?.onStderr, request.requireSuccessfulExit,
+          // A backfill download yields to the broadcasts sharing this machine; a live capture is
+          // the thing they yield to, so it keeps the default priority.
+          { priority: downloadPriority(isLiveItem) });
         // Live captures land as MPEG-TS (capture.ts); remux to MP4 in place and
         // delete the TS so every downstream step only ever sees a .mp4 file.
         // Gated on the TS file actually existing so non-TS captures are untouched.
@@ -1369,7 +1411,14 @@ export class DownloadQueue {
     try { child.kill(signal); } catch { /* Signal unsupported on this platform. */ }
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, requireSuccessfulExit = false, options?: { lowPriority?: boolean }): Promise<void> {
+  private async priorityWrapper(level?: CommandPriority): Promise<string[] | undefined> {
+    if (!level) return undefined;
+    // A machine without nice/ionice must not fail every download: skip the wrapper instead.
+    return (await this.lowPrioritySupported()) ? COMMAND_PRIORITY_WRAPPER[level] : undefined;
+  }
+
+  private async runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, requireSuccessfulExit = false, options?: { priority?: CommandPriority }): Promise<void> {
+    const wrapper = await this.priorityWrapper(options?.priority);
     return new Promise((resolve, reject) => {
       // Memory guard for live recordings on small VPS: cap yt-dlp fragment concurrency
       // and buffer so a single download cannot balloon the cgroup and trip OOM.
@@ -1381,9 +1430,9 @@ export class DownloadQueue {
       // we signal -- pause/stop/kill semantics are unchanged by the wrapper.
       let spawnCommand = command;
       let spawnArgs = effectiveArgs;
-      if (options?.lowPriority) {
+      if (wrapper) {
         spawnCommand = "nice";
-        spawnArgs = ["-n", "19", "ionice", "-c", "3", command, ...effectiveArgs];
+        spawnArgs = [...wrapper, command, ...effectiveArgs];
       }
       const child = spawn(spawnCommand, spawnArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
@@ -1525,10 +1574,7 @@ export class DownloadQueue {
   }
 
   private async runPostProcessCommand(command: string, args: string[], outputDirectory: string, control: ActiveDownload, onStderr?: (text: string) => void): Promise<void> {
-    if (await this.lowPrioritySupported()) {
-      return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr, false, { lowPriority: true });
-    }
-    return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr);
+    return this.runCommandDownload(command, args, outputDirectory, undefined, () => {}, control, onStderr, false, { priority: "idle" });
   }
 
   private async withFinalizeLock<T>(key: string, operation: () => Promise<T>): Promise<T> {

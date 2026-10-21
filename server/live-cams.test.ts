@@ -865,4 +865,33 @@ describe("live-cam provider cache borrow fallback (per-query-key outage)", () =>
     expect(result.providers[0].ok).toBe(false);
     expect(result.items).toEqual([]);
   });
+
+  // The queue asks this before spending a recording slot, so it must answer "offline" only on a
+  // verdict the provider itself gave -- never on a transient kill, which deliberately clears the
+  // cache instead of poisoning it.
+  it("knows a room is offline only after a confirmed-offline verdict", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-16T12:00:00.000Z"));
+    const { plugins, service } = await fixture();
+    plugins.install("test.live");
+    try {
+      const live = { pluginId: "test.live", externalId: "auto-live:alice:2026-09-16T11-00-00-000Z" };
+      expect(service.isKnownOffline(live)).toBe(false);
+
+      service.reportLiveFailure(live as never, "ffmpeg was killed by a signal");
+      expect(service.isKnownOffline(live)).toBe(false);
+
+      service.reportLiveFailure(live as never, "No public Stripchat HLS host returned a live manifest");
+      expect(service.isKnownOffline(live)).toBe(true);
+      // Another room, and a shape that is not a live capture, must not inherit the verdict.
+      expect(service.isKnownOffline({ pluginId: "test.live", externalId: "auto-live:bob:2026-09-16T11-00-00-000Z" })).toBe(false);
+      expect(service.isKnownOffline({ pluginId: "test.live", externalId: "asset-42" })).toBe(false);
+      expect(service.isKnownOffline({ pluginId: "other.live", externalId: live.externalId })).toBe(false);
+
+      vi.setSystemTime(new Date(Date.now() + 11 * 60_000));
+      expect(service.isKnownOffline(live)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
