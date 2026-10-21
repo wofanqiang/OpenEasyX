@@ -635,16 +635,30 @@ export class LiveCamService {
     return { ok: true, cams };
   }
 
-  /** Feed a failed live capture back into the status cache. Only offline-confirmed errors
-   *  (the provider's own page/API said the room is not live) count; transient network
-   *  failures must never poison the status cache. */
+  /**
+   * Feed a failed live capture back into the status cache.
+   *
+   * Two different things happen here, and they must not be conflated:
+   *  1. The *cached online verdict* for this room is dropped on every failure. That verdict is
+   *     what queued the capture, and the failure has just contradicted it, so replaying it would
+   *     queue the same doomed capture again. Dropping it makes the next poll ask the provider --
+   *     the watcher then starts a fresh recording as soon as the room is really live.
+   *  2. Only an offline-*confirmed* error (the provider's own page/API said the room is not live)
+   *     also suppresses re-queueing for ten minutes. A transient network failure must not poison
+   *     the cache into believing a live room is offline.
+   */
   reportLiveFailure(item: DownloadItem, message: string): void {
-    if (!isOfflineConfirmedError(message)) return;
     // Live captures are keyed "auto-live:<username>:<timestamp>" / "manual-live:..." (the
     // same pattern auto-recorder uses to find a recording's room).
     const username = /^(?:auto|manual)-live:([^:]+):/.exec(item.externalId)?.[1];
     if (!username) return;
-    this.offlineOverrides.set(`${item.pluginId}:${username.toLowerCase()}`, Date.now() + OFFLINE_OVERRIDE_MS);
+    const key = `${item.pluginId}:${username.toLowerCase()}`;
+    this.favoriteStatuses.delete(key);
+    const wanted = username.trim().toLowerCase();
+    for (const [cacheKey, entry] of this.recentCams) {
+      if (cacheKey.startsWith(`${item.pluginId}:`) && entry.cam.username.trim().toLowerCase() === wanted) this.recentCams.delete(cacheKey);
+    }
+    if (isOfflineConfirmedError(message)) this.offlineOverrides.set(key, Date.now() + OFFLINE_OVERRIDE_MS);
   }
 
   favoriteChanges() {

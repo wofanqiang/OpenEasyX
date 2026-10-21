@@ -9,6 +9,11 @@ import { isOfflineConfirmedError } from "./offline-error.js";
 const ACTIVE_STATUSES = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
 // After a recording ends, wait before auto-starting another one for the same cam so a
 // flapping online/offline edge (or a stale cached snapshot) cannot trigger a loop.
+// This watcher is also the ONLY thing that restarts a failed capture: the download queue never
+// retries a live item (a broadcast cannot be backfilled, and a retry sitting in the queue would
+// compete for a recording slot with rooms that are actually on air). A failed capture ends, its
+// slot frees, its room's cached status is dropped, and the room returns here -- so the wait below
+// is a liveness-probe cadence, not a retry timer.
 // The base cooldown is configurable (autoRecordCooldownSeconds); a failed capture starts on a
 // short abnormal cooldown and then doubles for each consecutive failure.
 // The escalation has to key off a failure *count*, not a short sliding window: a room that reports
@@ -22,6 +27,12 @@ const ABNORMAL_COOLDOWN_MS = 30_000;
 // wiped by its own backoff; a cam that has been quiet for hours still starts fresh.
 const FAIL_STREAK_RESET_MS = 3 * 60 * 60_000;
 // Ceiling for the failure backoff: a persistently broken room is retried at most hourly.
+// Ceiling for the failure backoff of a room that keeps failing without the provider confirming it
+// is offline. Deliberately far below FAIL_COOLDOWN_CAP_MS: the download queue no longer retries a
+// live capture at all (see failureRetryPlan in downloader.ts), so this window is not a retry timer
+// but the cadence at which the watcher re-asks whether the room is on air. Ten minutes bounds the
+// upstream cost of a broken room while still catching a show that comes back quickly.
+const LIVE_PROBE_COOLDOWN_CAP_MS = 10 * 60_000;
 const FAIL_COOLDOWN_CAP_MS = 60 * 60_000;
 // Settings bounds for the status-check interval (seconds).
 const INTERVAL = { min: 30, max: 3600, fallback: 60 };
@@ -133,8 +144,8 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
           until = now + Math.min(cooldownMs(), ABNORMAL_COOLDOWN_MS);
           log?.(`auto-record: recording ${entry.itemId} failed; ${key} enters a short cooldown`);
         } else {
-          until = now + Math.min(ABNORMAL_COOLDOWN_MS * 2 ** (streak - 1), FAIL_COOLDOWN_CAP_MS);
-          log?.(`auto-record: ${key} has failed ${streak} captures in a row; backing off ${Math.round((until - now) / 1000)}s`);
+          until = now + Math.min(ABNORMAL_COOLDOWN_MS * 2 ** (streak - 1), LIVE_PROBE_COOLDOWN_CAP_MS);
+          log?.(`auto-record: ${key} has failed ${streak} captures in a row; checking liveness again in ${Math.round((until - now) / 1000)}s`);
         }
       } else {
         failStreak.delete(key);

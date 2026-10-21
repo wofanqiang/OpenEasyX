@@ -346,6 +346,36 @@ describe("auto recorder", () => {
     } finally { env.cleanup(); vi.useRealTimers(); }
   });
 
+  it("re-checks a repeat-failing room within ten minutes instead of writing it off for an hour", async () => {
+    // A live capture is never retried by the download queue any more: the failure ends the item,
+    // frees its slot, and the room comes back here. What the waits below measure is therefore the
+    // liveness-probe cadence -- and it must stay short enough to catch a show that comes back.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      const waits = [30_000, 60_000, 120_000, 240_000, 480_000, 600_000];
+      for (const [round, wait] of waits.entries()) {
+        env.items.set(`item-${round}`, { status: "failed" });
+        await env.recorder.tick(); // notices the failure and sets the wait
+        vi.setSystemTime(new Date(Date.now() + wait - 1_000));
+        await env.recorder.tick(); // one second early: still held
+        expect(env.record).toHaveBeenCalledTimes(round + 1);
+        vi.setSystemTime(new Date(Date.now() + 1_000));
+        await env.recorder.tick(); // wait expired: the room is re-checked and recorded again
+        expect(env.record).toHaveBeenCalledTimes(round + 2);
+      }
+      // The last wait is the 10-minute ceiling, not the hour a download would be given.
+      expect(env.logs.some((line) => line.includes("checking liveness again in 600s"))).toBe(true);
+    } finally { env.cleanup(); vi.useRealTimers(); }
+  });
+
   it("resets the failure backoff after a successful capture", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));

@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -450,6 +450,51 @@ describe("postProcessDeadlineMs", () => {
     // needed ~596s, while the old 4 MiB/s assumption granted only 576s. The budget has to
     // clear that by a wide margin, or a good recording gets killed and filed as `failed`.
     expect(postProcessDeadlineMs(Math.round(2.42 * 1024 ** 3))).toBeGreaterThan(596_000 * 3);
+  });
+});
+
+describe("failureRetryPlan", () => {
+  const download = { live: false, maxAttempts: 5, baseSeconds: 30 };
+  const live = { live: true, maxAttempts: 5, baseSeconds: 30 };
+
+  it("keeps the operator's ladder for a download, where waiting costs nothing", () => {
+    // A stalled fetch resumes from its byte offset, so the long backoff is free.
+    expect(failureRetryPlan("ETIMEDOUT", 1, download)).toEqual({ retry: true, delaySeconds: 30 });
+    expect(failureRetryPlan("ETIMEDOUT", 2, download)).toEqual({ retry: true, delaySeconds: 60 });
+    expect(failureRetryPlan("ETIMEDOUT", 4, download)).toEqual({ retry: true, delaySeconds: 240 });
+    expect(failureRetryPlan("ETIMEDOUT", 5, download)).toEqual({ retry: false, delaySeconds: 0 });
+  });
+
+  it("caps a live capture at one short reconnect, whatever the download settings say", () => {
+    // The broadcast keeps running while nothing is recorded, so the ladder's later steps are
+    // pure loss -- and each attempt re-resolves the room upstream.
+    expect(failureRetryPlan("ETIMEDOUT", 1, live)).toEqual({ retry: true, delaySeconds: 10 });
+    expect(failureRetryPlan("ETIMEDOUT", 2, live)).toEqual({ retry: false, delaySeconds: 0 });
+    expect(failureRetryPlan("ETIMEDOUT", 3, live)).toEqual({ retry: false, delaySeconds: 0 });
+  });
+
+  it("never retries a room the provider has already said is offline", () => {
+    // There is nothing to reconnect to, and re-asking spends the budget the live rooms need.
+    for (const message of [
+      "The public room did not expose an HLS host",
+      "No public Stripchat HLS host returned a live manifest",
+      "No public SuperChat HLS host returned a live manifest",
+    ]) {
+      expect(failureRetryPlan(message, 1, live)).toEqual({ retry: false, delaySeconds: 0 });
+    }
+    // The same message on a download is still retried: a page can say "offline" while the
+    // stored media URL it already handed us stays valid.
+    expect(failureRetryPlan("The public room did not expose an HLS host", 1, download)).toMatchObject({ retry: true });
+  });
+
+  it("still stops immediately on a permanent HTTP status", () => {
+    expect(failureRetryPlan("Download returned HTTP 404", 1, download)).toEqual({ retry: false, delaySeconds: 0 });
+    expect(failureRetryPlan("Download returned HTTP 404", 1, live)).toEqual({ retry: false, delaySeconds: 0 });
+  });
+
+  it("honours retries being switched off entirely", () => {
+    expect(failureRetryPlan("ETIMEDOUT", 1, { ...download, maxAttempts: 0 })).toEqual({ retry: false, delaySeconds: 0 });
+    expect(failureRetryPlan("ETIMEDOUT", 1, { ...live, maxAttempts: 0 })).toEqual({ retry: false, delaySeconds: 0 });
   });
 });
 
