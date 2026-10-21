@@ -1,6 +1,7 @@
 import { definePlugin, type MediaCandidate, type PluginContext } from "../../packages/plugin-sdk/index.js";
 import { decodeHtml, plainHtml } from "../browser-html-utils.js";
 import { positiveInteger } from "../yt-dlp-utils.js";
+import { fetchPublic } from "../../packages/public-fetch.js";
 
 const DIRTYSHIP_HOME = "https://dirtyship.com/";
 const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
@@ -57,7 +58,11 @@ async function fetchHtml(context: PluginContext, pageUrl: string): Promise<{ htm
   const requested = safeDirtyShipUrl(pageUrl);
   const timeout = AbortSignal.timeout(45_000);
   const signal = context.signal ? AbortSignal.any([context.signal, timeout]) : timeout;
-  const response = await context.fetch(requested, { headers: requestHeaders(), redirect: "follow", signal });
+  // `redirect: "follow"` used to hand the whole chain to the platform and only check the final URL
+  // afterwards -- by then the request had already gone wherever the page pointed. Following manually
+  // lets every hop pass the same dirtyship.com allowlist.
+  const response = await fetchPublic(context, requested.href, "DirtyShip", { headers: requestHeaders(), signal },
+    { assertHop: (url) => { safeDirtyShipUrl(url.toString()); } });
   if (!response.ok) throw new Error(`DirtyShip returned HTTP ${response.status}`);
   const finalUrl = safeDirtyShipUrl(response.url || requested.href).href;
   const html = await response.text();

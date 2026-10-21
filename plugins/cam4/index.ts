@@ -3,6 +3,7 @@ import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
 import { browserHtml } from "../browser-html-utils.js";
 import type { CommandDownloadRequest, DownloadRequest, LiveCam, LiveCamFavoriteSnapshot, MediaCandidate, PerformerRecord, PersonCandidate, PluginContext, SourceCandidate } from "../../packages/plugin-sdk/index.js";
+import { fetchPublic, RefusedAddressError } from "../../packages/public-fetch.js";
 
 const plugin = createLiveCamPlugin({
   id: "org.easyx.cam4", name: "CAM4 Live", prefix: "cam4", homepage: "https://www.cam4.com",
@@ -350,9 +351,17 @@ const isLivePlaylist = (text: string) => text.trimStart().startsWith("#EXTM3U") 
 
 async function playlistText(context: PluginContext, url: string): Promise<string | undefined> {
   try {
-    const response = await context.fetch(url, { headers: { ...cam4StreamHeaders(), "user-agent": USER_AGENT }, signal: accountSignal(context, 15_000) });
+    // The master and variant addresses are written by the API response, so the redirect chain is
+    // checked hop by hop rather than trusting the address we were handed.
+    const response = await fetchPublic(context, url, "Cam4", { headers: { ...cam4StreamHeaders(), "user-agent": USER_AGENT }, signal: accountSignal(context, 15_000) });
     return response.ok ? await response.text() : undefined;
-  } catch (error) { if (context.signal?.aborted) throw error; return undefined; }
+  } catch (error) {
+    if (context.signal?.aborted) throw error;
+    // A refused address is our own decision, not "this playlist is unavailable": swallowing it
+    // would report the room as not broadcasting when the truth is that we declined to go there.
+    if (error instanceof RefusedAddressError) throw error;
+    return undefined;
+  }
 }
 
 /** Current public master playlist and its best live variant; undefined while the room is not public. */

@@ -31,3 +31,16 @@ describe("Chaturbate shared request cooldown", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("Chaturbate redirect guard", () => {
+  it("refuses a redirect into the host network instead of following it", async () => {
+    // These URLs come from a page this server just read, so the address that answers is not ours to
+    // trust: with the platform default the whole chain happened in one call and only the first
+    // address was ever checked.
+    const fetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data/" } }));
+    const context = { fetch } as unknown as PluginContext;
+    await expect(chaturbateRequest(context, "https://chaturbate.com/followed", {})).rejects.toThrow(/inside this host's network/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String(fetch.mock.calls[0][0])).toBe("https://chaturbate.com/followed");
+  });
+});

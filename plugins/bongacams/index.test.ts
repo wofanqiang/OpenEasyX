@@ -49,3 +49,17 @@ describe("BongaCams room recording", () => {
     await expect(resolveBongacamsDownload({ ...context(), signal: controller.signal }, { externalId: "x", mediaType: "video", pageUrl: source.profileUrl })).rejects.toThrow("Cancelled");
   });
 });
+
+describe("BongaCams redirect guard", () => {
+  it("refuses a playlist that redirects into the host network", async () => {
+    const ctx = context("public");
+    ctx.fetch.mockImplementation(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("video.test")) return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:8080/secret.m3u8" } });
+      return new Response(master);
+    });
+    // Playlist addresses are written by the room response, so a redirect target gets the same check.
+    await expect(bongacamsLiveVariant(ctx, "https://video.test/playlist.m3u8")).rejects.toThrow(/inside this host's network/);
+    expect(ctx.fetch.mock.calls.map(([input]) => String(input)).some((url) => url.includes("127.0.0.1"))).toBe(false);
+  });
+});

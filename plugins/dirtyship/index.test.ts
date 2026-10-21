@@ -111,3 +111,25 @@ describe("DirtyShip plugin", () => {
     })).rejects.toThrow("only supports dirtyship.com URLs");
   });
 });
+
+describe("DirtyShip redirect guard", () => {
+  it("refuses a page that redirects into the host network", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(null, { status: 302, headers: { location: "http://10.0.0.1/admin" } }));
+    await expect(plugin.listMedia!(context(fetchMock as typeof fetch), {
+      id: "s", externalId: "s", performerId: "p", profileUrl: "https://dirtyship.com/performer/example/", domain: "dirtyship.com",
+    })).rejects.toThrow(/inside this host's network/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a redirect that leaves dirtyship.com", async () => {
+    // `redirect: "follow"` used to hand the chain to the platform and only check the final URL,
+    // which meant the foreign request had already been made by the time it was refused.
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(null, { status: 302, headers: { location: "https://example.test/elsewhere" } }));
+    await expect(plugin.listMedia!(context(fetchMock as typeof fetch), {
+      id: "s", externalId: "s", performerId: "p", profileUrl: "https://dirtyship.com/performer/example/", domain: "dirtyship.com",
+    })).rejects.toThrow("only supports dirtyship.com URLs");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

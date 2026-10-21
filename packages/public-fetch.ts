@@ -72,6 +72,15 @@ function isRedirect(status: number): boolean {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
 }
 
+export type FetchPublicOptions = {
+  /**
+   * Extra per-hop rule for providers that only serve from their own hosts. It runs on the address
+   * we were given and on every redirect target, so a site allowlist cannot be bypassed by a 302
+   * either.
+   */
+  assertHop?: (url: URL) => void;
+};
+
 /**
  * Fetches a URL a remote document chose, checking every hop of the redirect chain.
  *
@@ -83,8 +92,18 @@ export async function fetchPublic(
   value: string,
   label: string,
   init: RequestInit = {},
+  options: FetchPublicOptions = {},
 ): Promise<Response> {
-  let target = publicUrl(value, label);
+  const check = (target: string) => {
+    const safe = publicUrl(target, label);
+    options.assertHop?.(new URL(safe));
+    return safe;
+  };
+  let target = check(value);
+  // A caller that asked for `redirect: "manual"` inspects the 3xx itself -- Chaturbate uses that to
+  // notice a session that bounced to the login page. Following the chain here would hide exactly
+  // the signal it is looking for, and since it never follows, there is no second hop to check.
+  if (init.redirect === "manual") return fetcher.fetch(target, init);
   for (let hop = 0; hop <= PUBLIC_FETCH_REDIRECTS; hop += 1) {
     const response = await fetcher.fetch(target, { ...init, redirect: "manual" });
     const location = isRedirect(response.status) ? response.headers.get("location") : null;
@@ -97,7 +116,7 @@ export async function fetchPublic(
     // Relative Location values are legal and resolve against the hop that sent them.
     try { next = new URL(location, target).toString(); } catch { throw new RefusedAddressError(`${label} returned a redirect to an address that is not a URL`); }
     // Throws before the request is made, which is the whole point of following the chain by hand.
-    target = publicUrl(next, label);
+    target = check(next);
   }
   throw new RefusedAddressError(`${label} redirected a stream address more than ${PUBLIC_FETCH_REDIRECTS} times`);
 }

@@ -1,4 +1,5 @@
 import type { PluginContext } from "../../packages/plugin-sdk/index.js";
+import { fetchPublic } from "../../packages/public-fetch.js";
 
 type RequestState = { tail: Promise<void>; retryAt: number };
 const states = new WeakMap<typeof fetch, RequestState>();
@@ -17,7 +18,10 @@ export async function chaturbateRequest(context: PluginContext, url: string, ini
     if (Date.now() < state.retryAt) throw new Error(`Chaturbate is temporarily limiting requests (HTTP 429 or network timeout). Automatic retry in ${Math.ceil((state.retryAt - Date.now()) / 1000)} seconds. Your favorites are saved.`);
     // A network timeout is per-request: only an explicit 429/503 response earns the shared
     // cooldown, so one slow fetch under load no longer blanks the provider for a minute.
-    const response = await context.fetch(url, init);
+    // Every call goes through the address guard: some of these URLs are written by the page we just
+    // read, and the platform fetch would follow a redirect to a loopback or metadata address after
+    // the first hop had been approved.
+    const response = await fetchPublic(context, url, "Chaturbate", init);
     if (response.status === 429 || response.status === 503) {
       const retryAfter = response.headers.get("retry-after");
       const seconds = retryAfter && /^\d+(\.\d+)?$/.test(retryAfter) ? Number(retryAfter) : retryAfter ? (Date.parse(retryAfter) - Date.now()) / 1000 : 120;

@@ -91,3 +91,38 @@ describe("fetchPublic", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+describe("fetchPublic per-hop allowlist", () => {
+  it("applies the caller's own rule to every redirect target", async () => {
+    const fetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(null, { status: 302, headers: { location: "https://evil.test/x" } }));
+    const allow = (url: URL) => { if (url.hostname !== "allowed.test") throw new Error("only allowed.test"); };
+    // A site allowlist has to run per hop as well, or a 302 walks straight past it.
+    await expect(fetchPublic({ fetch }, "https://allowed.test/a", "DirtyShip", {}, { assertHop: allow })).rejects.toThrow("only allowed.test");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a chain that stays inside the allowlist", async () => {
+    let hop = 0;
+    const fetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => {
+      hop += 1;
+      return hop === 1 ? new Response(null, { status: 302, headers: { location: "/b" } }) : new Response("ok");
+    });
+    const allow = (url: URL) => { if (url.hostname !== "allowed.test") throw new Error("only allowed.test"); };
+    const response = await fetchPublic({ fetch }, "https://allowed.test/a", "DirtyShip", {}, { assertHop: allow });
+    expect(await response.text()).toBe("ok");
+  });
+});
+
+describe("fetchPublic with a caller-managed redirect", () => {
+  it("hands back the 3xx a manual caller asked for, and still checks the address", async () => {
+    const fetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(null, { status: 302, headers: { location: "/auth/login/" } }));
+    const response = await fetchPublic({ fetch }, "https://chaturbate.com/api/x", "Chaturbate", { redirect: "manual" });
+    // Chaturbate detects an expired session by seeing this 3xx; following it would return the login
+    // page with status 200 and quietly report the session as healthy.
+    expect(response.status).toBe(302);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await expect(fetchPublic({ fetch }, "http://127.0.0.1/x", "Chaturbate", { redirect: "manual" })).rejects.toThrow(InternalAddressError);
+  });
+});

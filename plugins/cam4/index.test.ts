@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "../../packages/plugin-sdk/index.js";
-import { cam4FollowedSnapshot, setCam4Favorite } from "./index.js";
+import { cam4FollowedSnapshot, cam4LiveStream, setCam4Favorite } from "./index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -73,5 +73,19 @@ describe("CAM4 account favorites", () => {
       id: "alice", username: "Alice", pageUrl: "https://www.cam4.com/Alice",
     }, true)).resolves.toEqual({ synchronized: true });
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("CAM4 redirect guard", () => {
+  it("refuses a master playlist that redirects into the host network", async () => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/streamInfo")) return new Response(JSON.stringify({ cdnURL: "https://cdn.test/master.m3u8" }));
+      if (url.includes("cdn.test")) return new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/" } });
+      return new Response("{}");
+    });
+    // The CDN address arrives inside the API response, so it is remote-authored content too.
+    await expect(cam4LiveStream(context(fetch as unknown as PluginContext["fetch"]), "alice")).rejects.toThrow(/inside this host's network/);
+    expect(fetch.mock.calls.map(([input]) => String(input)).some((url) => url.includes("169.254"))).toBe(false);
   });
 });

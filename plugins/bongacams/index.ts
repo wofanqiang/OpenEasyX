@@ -1,6 +1,7 @@
 import { LIVE_RECORDER_SCRIPT, retryDelay } from "../live-recorder.js";
 import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import type { CommandDownloadRequest, MediaCandidate, MediaSource, PluginContext } from "../../packages/plugin-sdk/index.js";
+import { fetchPublic } from "../../packages/public-fetch.js";
 
 /*
  * BongaCams fix (continuous, repeated live recording).
@@ -114,7 +115,8 @@ export async function bongacamsRoom(context: PluginContext, profileUrl: string):
 
 async function fetchText(context: PluginContext, url: string): Promise<string | undefined> {
   try {
-    const response = await context.fetch(url, { headers: { ...streamHeaders(), "user-agent": USER_AGENT }, signal: requestSignal(context, 15_000) });
+    // Playlist addresses come from the room response, so every hop is checked before it is fetched.
+    const response = await fetchPublic(context, url, "BongaCams", { headers: { ...streamHeaders(), "user-agent": USER_AGENT }, signal: requestSignal(context, 15_000) });
     if (response.status === 404) return undefined;
     if (!response.ok) throw new Error(`BongaCams playlist returned HTTP ${response.status}`);
     return await response.text();
