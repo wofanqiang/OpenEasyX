@@ -775,7 +775,13 @@ app.get<{ Querystring: Record<string, string | undefined> }>("/api/items", async
     sourceId: z.string().trim().min(1).optional(), sourceDomain: z.string().trim().min(1).optional(), performerId: z.string().trim().min(1).optional(),
     search: z.string().trim().max(200).optional(),
   }).parse(request.query);
+  const startedAt = performance.now();
   const result = db.listItemsPage(query);
+  const elapsedMs = Math.round(performance.now() - startedAt);
+  // This route is polled continuously by every open tab, so a slow query here is felt everywhere.
+  // Logging only the outliers keeps the log quiet while still giving the optimisation work a
+  // baseline to be measured against.
+  if (elapsedMs >= 50) app.log.warn({ ms: elapsedMs, total: result.total, page: query.page }, "items page query is slow");
   return { ...result, items: result.items.map((item) => ({ ...item, outputPath: queue.outputPath(item.id) })) };
 });
 app.post("/api/items/retry-failed", async () => ({ queued: db.retryFailedItems() }));
@@ -898,6 +904,9 @@ app.put<{ Body: Record<string, unknown> }>("/api/settings", async (request) => {
 });
 
 const scheduledInFlight = new Set<string>();
+// Source intervals are measured in hours (default 21600s), so a five-second resolution costs at
+// most five seconds of lateness on a sync that was going to run anyway -- while the previous
+// one-second tick re-ran this query 86,400 times a day to almost always find nothing due.
 setInterval(() => {
   for (const source of db.dueSources()) {
     if (scheduledInFlight.size >= 4) break;
@@ -907,7 +916,7 @@ setInterval(() => {
     scheduledInFlight.add(source.id);
     void syncSource(source.id).catch((error) => app.log.warn({ err: error, reason: error instanceof Error ? error.message : String(error), sourceId: source.id }, "Scheduled source sync failed")).finally(() => scheduledInFlight.delete(source.id));
   }
-}, 1000).unref();
+}, 5000).unref();
 
 // C1 retention pass, hourly. With the default dry-run it only logs what has outlived the
 // configured retention window; EASYX_RETENTION_DRY_RUN=false turns it into real deletions.

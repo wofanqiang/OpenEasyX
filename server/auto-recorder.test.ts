@@ -42,6 +42,11 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
   });
   const cams: Array<Record<string, unknown>> = [];
   const list = vi.fn(async () => ({ status: { ok: true }, providers: [{ id: "test.live", name: "Test Live", ok: true, count: cams.length }], items: cams }));
+  const autoRecordStatuses = vi.fn(async (providerId: string, targets: Array<{ username: string; pageUrl: string }>) => {
+    const wanted = new Set(targets.map((target) => target.username.toLowerCase()));
+    const items = cams.filter((cam) => String(cam.providerId) === providerId && wanted.has(String(cam.username).toLowerCase()));
+    return { ok: true, cams: items };
+  });
   const liveCamsStub = {
     list, record,
     autoRecordTargets: () => {
@@ -74,11 +79,7 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
       }
       return targets;
     },
-    autoRecordStatuses: (providerId: string, targets: Array<{ username: string; pageUrl: string }>) => {
-      const wanted = new Set(targets.map((target) => target.username.toLowerCase()));
-      const items = cams.filter((cam) => String(cam.providerId) === providerId && wanted.has(String(cam.username).toLowerCase()));
-      return Promise.resolve({ ok: true, cams: items });
-    },
+    autoRecordStatuses,
   } as unknown as LiveCamService;
   const logs: string[] = [];
   // Plenty of free space by default so the disk guard never makes an unrelated test flaky.
@@ -88,7 +89,7 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
     log: (message) => logs.push(message),
   });
   return {
-    recorder, record, list, cams, items, listedItems, logs, db,
+    recorder, record, list, cams, items, listedItems, logs, db, autoRecordStatuses,
     cleanup: () => { recorder.stop(); db.close(); try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort on Windows */ } },
   };
 }
@@ -129,6 +130,46 @@ describe("auto recorder", () => {
       await env.recorder.tick();
       await env.recorder.tick();
       expect(env.record).toHaveBeenCalledTimes(1);
+    } finally { env.cleanup(); }
+  });
+
+  it("does not ask the provider about a room it is already capturing", async () => {
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+      // Report the capture as still running, the way the queue would list it.
+      env.listedItems.push({ id: "item-0", pluginId: "test.live", externalId: "manual-live:alice:2026-10-21T00-00-00-000Z", status: "downloading", metadata: { live: true, liveRoom: "alice" } });
+      env.autoRecordStatuses.mockClear();
+      await env.recorder.tick();
+      // The only armed room is being captured, so the provider is not questioned at all.
+      expect(env.autoRecordStatuses).not.toHaveBeenCalled();
+      expect(env.record).toHaveBeenCalledTimes(1);
+    } finally { env.cleanup(); }
+  });
+
+  it("keeps polling the provider for rooms that are not being captured", async () => {
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      env.cams.push(makeCam());
+      await env.recorder.tick();
+      env.listedItems.push({ id: "item-0", pluginId: "test.live", externalId: "manual-live:alice:2026-10-21T00-00-00-000Z", status: "downloading", metadata: { live: true, liveRoom: "alice" } });
+
+      env.db.setLiveCamFavorite("test.live", { camId: "bob", username: "bob", pageUrl: "https://live.test/bob" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "bob", true);
+      env.cams.push(makeCam({ id: "bob", username: "bob", pageUrl: "https://live.test/bob" }));
+      env.autoRecordStatuses.mockClear();
+
+      await env.recorder.tick();
+      expect(env.autoRecordStatuses).toHaveBeenCalledTimes(1);
+      // The filter must drop only the capturing room, never the whole provider.
+      expect(env.autoRecordStatuses.mock.calls[0][1].map((target) => target.username)).toEqual(["bob"]);
+      expect(env.record).toHaveBeenCalledTimes(2);
     } finally { env.cleanup(); }
   });
 

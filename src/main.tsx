@@ -14,6 +14,7 @@ import { RecoveryPage } from "./RecoveryPage.js";
 import { isLibraryRoute, LibraryApp } from "./library-app.js";
 import { AuthGate } from "./AuthGate.js";
 import { AppChrome } from "./AppChrome.js";
+import { useVisibleInterval } from "./useVisibleInterval.js";
 import { SettingsPage as SubtitleSettingsPage } from "./SettingsPage.js";
 import { OutputSettings } from "./OutputSettings.js";
 import { liveCrawlBudgetDefaults, liveCrawlBudgetPresets } from "../packages/live-budget";
@@ -438,14 +439,19 @@ function ActivityPage({ performers, sources, run }: { performers: Performer[]; s
     catch (error) { if (currentRequest === requestId.current) setLoadError(error instanceof Error ? error.message : String(error)); }
     finally { if (currentRequest === requestId.current) setLoading(false); }
   }, [category, status, mediaType, performerId, sourceDomain, search, page, pageSize]);
-  useEffect(() => { setLoading(true); void loadActivity(); const timer = window.setInterval(() => void loadActivity(), 1_500); return () => window.clearInterval(timer); }, [loadActivity]);
+  // Refetch whenever the filters change, then keep the list fresh only while the tab is actually
+  // visible: this poll is the heaviest request the page makes, and a hidden tab reading it is
+  // pure server load.
+  useEffect(() => { setLoading(true); void loadActivity(); }, [loadActivity]);
+  useVisibleInterval(() => void loadActivity(), 1_500);
   useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
   // Background jobs (Library merge, Recovery sweep) run server-side on their own schedule; this
   // page only mirrors them beside the download rows. A failure here must not disturb the item list.
   const loadTasks = useCallback(async () => {
     try { setTasks((await api<{ tasks: PipelineTask[] }>("/api/tasks")).tasks); } catch { /* the item poll already reports errors */ }
   }, []);
-  useEffect(() => { void loadTasks(); const timer = window.setInterval(() => void loadTasks(), 1_500); return () => window.clearInterval(timer); }, [loadTasks]);
+  useEffect(() => { void loadTasks(); }, [loadTasks]);
+  useVisibleInterval(() => void loadTasks(), 1_500);
   const changeFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(1); };
   const counts = data?.statusCounts ?? {}; const totalTracked = Object.values(counts).reduce((sum, count) => sum + count, 0); const failedCount = counts.failed ?? 0;
   const categories = [

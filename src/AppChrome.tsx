@@ -24,7 +24,12 @@ function useLiveOperation(endpoint: string) {
   useEffect(() => {
     let disposed = false; let polling = false;
     const poll = async () => {
-      if (polling) return; polling = true;
+      if (polling) return;
+      // Deliberately kept on its own timer rather than useVisibleInterval: completion is detected
+      // by watching `running` flip to false, so going silent mid-operation would leave the
+      // progress bar stuck at 100% forever. An idle hidden tab, though, has nothing to watch.
+      if (document.hidden && !statusRef.current.running) return;
+      polling = true;
       try {
         const remote = await api<RemoteOperationStatus>(endpoint);
         if (disposed) return;

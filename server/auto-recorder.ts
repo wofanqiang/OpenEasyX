@@ -195,8 +195,14 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
 
       // Poll every favorite armed directly and every performer armed through its live-cam
       // identity, so a performer without a saved favorite is recorded just the same.
+      //
+      // A room already being captured is filtered out here rather than after the status call:
+      // it cannot be started twice, so asking the provider about it is pure traffic. syncActive
+      // has just refreshed `active`, and it only holds genuinely capturing rooms (an entry whose
+      // capture already ended is released), so nothing live can be hidden by this filter.
       const byProvider = new Map<string, Array<{ username: string; pageUrl: string }>>();
       for (const target of liveCams.autoRecordTargets()) {
+        if (active.has(keyOf(target.providerId, target.username))) continue;
         const list = byProvider.get(target.providerId) ?? [];
         list.push({ username: target.username, pageUrl: target.pageUrl });
         byProvider.set(target.providerId, list);

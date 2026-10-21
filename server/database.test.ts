@@ -300,6 +300,30 @@ describe("Database", () => {
     expect(first.mediaTypes).toEqual(["image", "video"]);
   });
 
+  it("serves the facet counters from a short snapshot instead of rescanning on every request", async () => {
+    const db = createDb(); const person = db.createPerformer({ name: "Facet Creator" });
+    db.updateSettings({ autoQueueDiscovered: false });
+    const source = db.addSource(person.id, "plugin.one", { externalId: "f", label: "Feed", profileUrl: "https://example.test", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "a", title: "A", mediaType: "video" }]);
+    const first = db.listItemsPage();
+    expect(first.statusCounts).toEqual({ available: 1 });
+
+    // Rows are never cached -- only the two counters are.
+    db.ingestItems(source, [{ externalId: "b", title: "B", mediaType: "image" }]);
+    const second = db.listItemsPage();
+    expect(second.total).toBe(2);
+    expect(second.statusCounts).toEqual({ available: 1 });
+    expect(second.mediaTypes).toEqual(["video"]);
+    // Copies, so a caller holding the result cannot corrupt the snapshot it came from.
+    expect(second.statusCounts).not.toBe(first.statusCounts);
+
+    // ...and once the snapshot expires the counters catch up on their own.
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    const third = db.listItemsPage();
+    expect(third.statusCounts).toEqual({ available: 2 });
+    expect(third.mediaTypes).toEqual(["image", "video"]);
+  });
+
   it("filters activity across every source sharing a domain", () => {
     const db = createDb();
     const firstPerson = db.createPerformer({ name: "First creator" });

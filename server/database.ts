@@ -727,6 +727,28 @@ export class Database {
       ORDER BY COALESCE(download_started_at,published_at,created_at) ASC LIMIT ?`).all(...statuses, limit) as any[]).map(this.mapItem);
   }
 
+  // The sidebar facet counts below do not depend on the requested page or filter, yet they were
+  // recomputed with two full table scans on every single request -- and /api/items is polled every
+  // 1.5s by every open tab. A two-second snapshot is short enough that no UI can notice, and short
+  // enough that no invalidation hook is needed, which matters: item rows are mutated from the
+  // queue, retention, merge and cleanup paths, and one missed hook would leave a counter wrong
+  // until the process restarted.
+  private facetCache?: { statusCounts: Record<string, number>; mediaTypes: string[] };
+  private facetCachedAt = 0;
+
+  private facets(): { statusCounts: Record<string, number>; mediaTypes: string[] } {
+    if (!this.facetCache || Date.now() - this.facetCachedAt >= 2000) {
+      this.facetCache = {
+        statusCounts: Object.fromEntries((this.sqlite.prepare("SELECT status,count(*) count FROM items GROUP BY status").all() as Array<{ status: string; count: number }>)
+          .map((row) => [row.status, Number(row.count)])),
+        mediaTypes: (this.sqlite.prepare("SELECT DISTINCT media_type value FROM items ORDER BY media_type").all() as Array<{ value: string }>).map((row) => row.value),
+      };
+      this.facetCachedAt = Date.now();
+    }
+    // Shallow copies: the caller gets the numbers, never the snapshot itself.
+    return { statusCounts: { ...this.facetCache.statusCounts }, mediaTypes: [...this.facetCache.mediaTypes] };
+  }
+
   listItemsPage(options: ItemPageOptions = {}): ItemPage {
     const pageSize = Math.min(100, Math.max(1, Math.floor(options.pageSize ?? 50)));
     const requestedPage = Math.max(1, Math.floor(options.page ?? 1));
@@ -759,9 +781,7 @@ export class Database {
     const rows = this.sqlite.prepare(`SELECT i.* ${joins} ${where}
       ORDER BY CASE i.status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1 WHEN 'available' THEN 2 WHEN 'failed' THEN 3 WHEN 'completed' THEN 4 ELSE 5 END,
       i.updated_at DESC LIMIT ? OFFSET ?`).all(...parameters, pageSize, (page - 1) * pageSize) as any[];
-    const statusCounts = Object.fromEntries((this.sqlite.prepare("SELECT status,count(*) count FROM items GROUP BY status").all() as Array<{ status: string; count: number }>)
-      .map((row) => [row.status, Number(row.count)]));
-    const mediaTypes = (this.sqlite.prepare("SELECT DISTINCT media_type value FROM items ORDER BY media_type").all() as Array<{ value: string }>).map((row) => row.value);
+    const { statusCounts, mediaTypes } = this.facets();
     return { items: rows.map(this.mapItem), page, pageSize, total, totalPages, statusCounts, mediaTypes };
   }
 

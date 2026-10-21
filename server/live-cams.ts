@@ -123,6 +123,23 @@ export class LiveCamService {
     }
   }
 
+  // Readers already treat an expired row as a miss (every lookup checks `expiresAt > Date.now()`),
+  // so dropping expired rows changes no behaviour -- it only stops the maps from retaining every
+  // room ever looked at. The sweep is throttled because it walks both maps, and it rides on the
+  // existing write paths instead of owning its own timer: a timer would need unref'ing and would
+  // still fire during tests.
+  private camCacheSweptAt = 0;
+
+  private sweepCamCaches(): void {
+    const now = Date.now();
+    if (now - this.camCacheSweptAt < 60_000) return;
+    this.camCacheSweptAt = now;
+    for (const cache of [this.favoriteStatuses, this.recentCams]) {
+      for (const [key, entry] of cache) if (entry.expiresAt <= now) cache.delete(key);
+    }
+    for (const [key, until] of this.offlineOverrides) if (until <= now) this.offlineOverrides.delete(key);
+  }
+
   private findPerformer(providerId: string, cam: Pick<LiveCam, "id" | "username">, performers = this.db.listPerformers()): Performer | undefined {
     const identities = new Set([cam.username, cam.id, `live:${cam.username}`].map((value) => value.trim().toLowerCase()));
     return performers.find((performer) => {
@@ -361,6 +378,7 @@ export class LiveCamService {
         .map((cam) => this.linkPerformer({ ...cam, providerId: entry.manifest.id, providerName: entry.manifest.name, favorite: this.db.isLiveCamFavorite(entry.manifest.id, cam.username), autoRecord: autoRecordMap.get(cam.username.toLowerCase()) ?? false }, performers));
       // A rendered favorite may itself come from a cache or an offline placeholder.
       if (!favoritesOnly && epoch === this.favoriteEpoch.get(entry.manifest.id)) for (const cam of normalized) this.recentCams.set(`${entry.manifest.id}:${cam.id.toLowerCase()}`, { cam, expiresAt: Date.now() + 120_000 });
+      this.sweepCamCaches();
       return {
         items: normalized,
         total,
@@ -617,6 +635,7 @@ export class LiveCamService {
             cam = match ? { ...match, online: match.online !== false } : offline;
           }
           this.favoriteStatuses.set(key, { cam, expiresAt: Date.now() + statusTtlMs(Boolean(plugin.getLiveCam), cam) });
+          this.sweepCamCaches();
           return cam;
         } catch {
           return { ...(cached?.cam ?? offline), statusUnavailable: true };
