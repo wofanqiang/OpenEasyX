@@ -2,7 +2,7 @@ import { LIVE_RECORDER_SCRIPT, retryDelay } from "../live-recorder.js";
 import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
 import { browserHtml } from "../browser-html-utils.js";
-import { stripchatFavoriteCams, stripchatProfileLiveCams, stripchatStreamConfig } from "../live-cam-discovery.js";
+import { stripchatFavoriteCams, stripchatProfileLiveCams, stripchatStreamConfig, type StripchatStreamConfig } from "../live-cam-discovery.js";
 import type { CommandDownloadRequest, LiveCam, LiveCamFavoriteSnapshot, LiveStream, MediaCandidate, MediaSource, PerformerRecord, PersonCandidate, PluginContext, SourceCandidate } from "../../packages/plugin-sdk/index.js";
 
 const plugin = createLiveCamPlugin({
@@ -234,8 +234,35 @@ function isLivePlaylist(manifest: string): boolean {
 
 type ResolvedStripchatHls = { masterUrl: string; mediaUrl: string; headers: Record<string, string> };
 
+/**
+ * Stripchat answers the first requests of a fresh connection with a ~61KB JS interstitial that
+ * carries no `window.__PRELOADED_STATE__`; a later attempt carries the session cookies it set and
+ * returns the real ~410KB page. Measured against production: requests 1 and 2 were the
+ * interstitial, request 3 onward were complete.
+ *
+ * Retrying here is what stops the interstitial from being read as "the room is offline". It used
+ * to reach `server/offline-error.ts` through the "did not expose an HLS host" message below, which
+ * parks the room for an hour -- so a page we never actually received cost a recording slot.
+ */
+const STREAM_CONFIG_ATTEMPTS = 3;
+
+async function stripchatRoomStream(context: PluginContext, pageUrl: string): Promise<StripchatStreamConfig | undefined> {
+  for (let attempt = 0; attempt < STREAM_CONFIG_ATTEMPTS; attempt += 1) {
+    const html = await browserHtml(context, pageUrl);
+    const stream = stripchatStreamConfig(html);
+    if (stream) return stream;
+    // A page that never carried the preloaded state was not the room page at all, so ask again.
+    // One that did carry it but still yields no stream is a room that is genuinely offline, and
+    // another fetch would only spend time reaching the same answer.
+    if (html.includes("__PRELOADED_STATE__")) return undefined;
+  }
+  // Deliberately worded so it does not match offline-error's patterns: the room's state is
+  // unknown, not confirmed offline, and must not be parked on the hour-long cooldown.
+  throw new Error("Stripchat served its interstitial page instead of the room");
+}
+
 async function resolveStripchatHls(context: PluginContext, pageUrl: string): Promise<ResolvedStripchatHls> {
-  const stream = stripchatStreamConfig(await browserHtml(context, pageUrl));
+  const stream = await stripchatRoomStream(context, pageUrl);
   if (!stream?.domains.length) throw new Error("The public room did not expose an HLS host");
   if (!stream.playerScriptUrl) throw new Error("The public room did not expose its player module");
   const headers = { referer: "https://stripchat.com/", origin: "https://stripchat.com" };

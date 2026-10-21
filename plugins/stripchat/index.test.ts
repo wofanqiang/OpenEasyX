@@ -87,6 +87,44 @@ describe("Stripchat direct live playback", () => {
     expect(mock.fetch).toHaveBeenCalledTimes(3);
   });
 
+  it("retries Stripchat's interstitial page instead of reporting the room offline", async () => {
+    const mock = context("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:123\n#EXTINF:2\nsegment.mp4\n");
+    // Production serves a JS-only interstitial with no preloaded state for the first requests of
+    // a fresh connection; the real room page only arrives once its cookies are in place. Measured
+    // against the live host: attempts 1 and 2 interstitial, attempt 3 complete.
+    const interstitial = "<!doctype html><html><head><!--CSP--><title>Stripchat</title></head></html>";
+    let pageRequests = 0;
+    mock.runCommand.mockImplementation(async () => {
+      pageRequests += 1;
+      return { exitCode: 0, stderr: "", stdout: pageRequests < 3 ? interstitial : pageState() };
+    });
+    await expect(resolveStripchatDirect(mock, "https://stripchat.com/Alice")).resolves.toMatchObject({ contentType: "application/vnd.apple.mpegurl" });
+    expect(pageRequests).toBe(3);
+  });
+
+  it("does not retry when the room page itself says the room is offline", async () => {
+    const mock = context("");
+    mock.runCommand.mockResolvedValue({
+      exitCode: 0, stderr: "",
+      stdout: pageState().replace('"isLive":true', '"isLive":false').replace('"isOnline":true', '"isOnline":false'),
+    });
+    // The preloaded state came through, so the answer is about the room, not about the fetch.
+    // Asking again would only spend another full fetch to reach the same verdict.
+    await expect(resolveStripchatDirect(mock, "https://stripchat.com/Alice")).rejects.toThrow("The public room did not expose an HLS host");
+    expect(mock.runCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a page that never arrives as transient, not as a confirmed offline room", async () => {
+    const mock = context("");
+    mock.runCommand.mockResolvedValue({ exitCode: 0, stderr: "", stdout: "<!doctype html><html><head><!--CSP--></head></html>" });
+    const error = await resolveStripchatDirect(mock, "https://stripchat.com/Alice").then(() => undefined, (failure: Error) => failure);
+    expect(error?.message).toContain("interstitial");
+    // The wording has to stay clear of server/offline-error.ts, or this failure parks the room on
+    // the hour-long cooldown that is meant for a room that is genuinely off.
+    expect(/did not expose an hls host|no public .*hls host returned a live manifest/i.test(error?.message ?? "")).toBe(false);
+    expect(mock.runCommand).toHaveBeenCalledTimes(3);
+  });
+
   it("rejects Stripchat's finite intro advertisement playlist", async () => {
     const mock = context("#EXTM3U\n#EXT-X-MOUFLON-ADVERT\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-ENDLIST\n");
     await expect(resolveStripchatDirect(mock, "https://stripchat.com/Alice")).rejects.toThrow("No public Stripchat HLS host returned a live manifest");
