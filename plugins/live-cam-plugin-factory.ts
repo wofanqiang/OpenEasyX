@@ -102,6 +102,11 @@ export function createLiveCamPlugin(options: LiveCamPluginOptions): EasyXPlugin 
       try {
         const info = await runYtDlpJson(context, [
           "--skip-download", "--dump-single-json", "--socket-timeout", "20", "--referer", referer,
+          // The same fingerprint the stream path already sends (see resolveLiveStream): providers
+          // such as CamSoda answer 403 to yt-dlp's default client, and a probe that cannot even
+          // fetch the page reports the room as broken on every polling interval instead of just
+          // finding it offline.
+          "--impersonate", "chrome",
           ...configuredArgs(context.config), source.profileUrl,
         ], 90_000);
         const candidate = genericLiveCandidate(info, source.profileUrl, options.prefix);

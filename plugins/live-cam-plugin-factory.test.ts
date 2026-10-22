@@ -37,6 +37,16 @@ describe("live cam plugin factory", () => {
     })).resolves.toEqual([]);
   });
 
+  it("probes the room with a browser fingerprint", async () => {
+    // CamSoda answers 403 to yt-dlp's default client; without this the probe reports the room as
+    // broken on every polling interval instead of simply finding it offline.
+    const runCommand = vi.fn(async () => ({ exitCode: 0, stdout: JSON.stringify({ id: "alice", is_live: false }), stderr: "" }));
+    await plugin.listMedia!(context(runCommand), {
+      id: "source", externalId: "alice", performerId: "performer", profileUrl: "https://live.test/alice", domain: "live.test",
+    });
+    expect(runCommand).toHaveBeenCalledWith("yt-dlp", expect.arrayContaining(["--impersonate", "chrome"]), expect.any(Object));
+  });
+
   it("falls back to Chromium network capture when yt-dlp cannot resolve the live", async () => {
     const runCommand = vi.fn(async (command: string) => command === "yt-dlp"
       ? { exitCode: 1, stdout: "", stderr: "Unsupported URL" }
