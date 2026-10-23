@@ -1,7 +1,11 @@
 .profile-url-row {
-  /* 8 direct children: favicon | copy | scraper-controls | auto-scrape | auto-record | badge | refresh | delete. */
-  grid-template-columns: 38px minmax(0, 1fr) minmax(230px, 300px) auto auto auto 40px 40px;
+  /* 9 direct children: favicon | copy | scraper-controls | enabled | auto-scrape | auto-record | badge | refresh | delete. */
+  grid-template-columns: 38px minmax(0, 1fr) minmax(230px, 300px) auto auto auto auto 40px 40px;
 }
+
+/* A source the operator switched off: dimmed, so the row reads as parked rather than gone. */
+.profile-url-row.source-disabled { opacity: .55; }
+.profile-url-row.source-disabled .source-favicon { filter: grayscale(1); }
 
 .source-scraper-controls {
   display: grid;
@@ -32,7 +36,7 @@
 .plugin-source-support strong { color: #b8b8c1; }
 
 @media (max-width: 900px) {
-  .profile-url-row { grid-template-columns: 38px minmax(0, 1fr) auto auto auto 40px 40px; }
+  .profile-url-row { grid-template-columns: 38px minmax(0, 1fr) auto auto auto auto 40px 40px; }
   .source-scraper-controls {
     grid-column: 2 / -1;
     grid-row: 2;
@@ -42,7 +46,7 @@
 }
 
 @media (max-width: 720px) {
-  .profile-url-row { grid-template-columns: 34px minmax(0, 1fr) auto auto 40px; }
+  .profile-url-row { grid-template-columns: 34px minmax(0, 1fr) auto auto auto 40px; }
   .source-scraper-controls {
     display: grid;
     grid-column: 2 / -1;

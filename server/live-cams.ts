@@ -548,10 +548,16 @@ export class LiveCamService {
       for (const [pluginId, externalId] of Object.entries(performer.externalRefs)) {
         if (!providers.has(pluginId)) continue;
         const source = sources.find((entry) => entry.performerId === performer.id && entry.pluginId === pluginId);
+        // `enabled` is the per-URL switch: a source the operator switched off is never polled
+        // and never auto-recorded, even though the performer stays armed. The scheduled scanner
+        // has always skipped these (dueSources filters enabled=1); the watcher has to agree, or
+        // a disabled URL keeps recording.
+        if (source && !source.enabled) continue;
         push(pluginId, externalId, source?.profileUrl ?? "");
       }
       for (const source of sources) {
         if (source.performerId !== performer.id) continue;
+        if (!source.enabled) continue;
         // Adding a performer by pasting its URL parks the placeholder manual plugin in
         // plugin_id and records the real scraper in scraper_plugin_id. Consulting plugin_id
         // alone silently dropped every such performer: it stayed armed in the UI, yet

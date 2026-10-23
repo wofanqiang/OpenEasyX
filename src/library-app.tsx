@@ -1,7 +1,7 @@
 import { firstMediaDate, validMediaDate } from "../packages/media-date";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Aperture, BarChart3, ChevronLeft, ChevronRight, Clock3, Eye, EyeOff, Film, FolderSearch2, HardDrive, Heart, History, Image as ImageIcon,
+  Aperture, BarChart3, ChevronLeft, ChevronRight, Clock3, Download, Eye, EyeOff, Film, FolderSearch2, HardDrive, Heart, History, Image as ImageIcon,
   Layers, Library as LibraryIcon, ListChecks, LoaderCircle, Play, Search, SlidersHorizontal, Sparkles,
   Radio, Settings as SettingsIcon, Square, CheckSquare, Trash2, UserRound, Users, X,
 } from "lucide-react";
@@ -286,10 +286,10 @@ export function LibraryApp() {
       {routeMedia ? selected ? <PlayerViewer media={selected.media} context={selected.context} autoStart={selected.autoStart} close={() => { const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); void refresh(); }} favorite={updateFavorite} advance={(media) => { const from = location.state?.easyx?.from ?? "/library"; setSelected({ media, context: selected.context, autoStart: true }); navigate(mediaUrl(media), { state: playbackLocationState(from, selected.context, true) }); }} setNotice={setNotice} remove={async (media) => { const response = await deleteMedia([media.id]); if (!response.deleted.some((item) => item.id === media.id)) return false; const target = location.state?.easyx?.from ?? "/library"; setSelected(null); navigate(target, { replace: true }); return true; }}/> : <div className="loading"><LoaderCircle className="spin"/>Loading media…</div> : routeLiveCam ? <LiveCamViewer providerId={routeLiveCam.providerId} camId={routeLiveCam.camId} close={() => navigate(location.state?.easyx?.from ?? "/live-cam", { replace: true })}/> : <div className="content">
         {page === "home" && <Home dashboard={dashboard} open={openMedia} go={go} favorite={updateFavorite}/>}
         {page === "live-cam" && <LiveCamPage preset={liveCamPreset} open={openLiveCam} route={(preset) => navigate(liveCamListUrl(preset), { replace: true })}/>}
-        {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("library", preset), { replace: true })} refreshToken={refreshToken}/>}
+        {page === "library" && <Library preset={routePreset} open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("library", preset), { replace: true })} refreshToken={refreshToken} notice={setNotice}/>}
         {page === "performers" && <Performers performers={performers} go={go} query={routePreset.query ?? ""} route={(query) => navigate(pageUrl("performers", { query }), { replace: true })}/>}
-        {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })} refreshToken={refreshToken}/>}
-        {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("history", preset), { replace: true })} refreshToken={refreshToken}/>}
+        {page === "favorites" && <Library preset={routePreset} favoriteOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("favorites", preset), { replace: true })} refreshToken={refreshToken} notice={setNotice}/>}
+        {page === "history" && <Library preset={routePreset} historyOnly open={openMedia} favorite={updateFavorite} remove={deleteMedia} merge={mergeMedia} mergeLocks={mergeLocks} route={(preset) => navigate(pageUrl("history", preset), { replace: true })} refreshToken={refreshToken} notice={setNotice}/>}
         {page === "statistics" && <Statistics stats={dashboard.stats}/>}
         {page === "hidden" && <HiddenMediaPage setNotice={setNotice} refresh={() => void refresh()}/>}
         {page === "settings" && <SettingsPage setNotice={setNotice}/>}
@@ -366,7 +366,7 @@ function Shelf({ title, subtitle, items, open, favorite, all }: { title: string;
   return <section className="shelf"><div className="section-head"><div><h2>{title}</h2><p>{subtitle}</p></div><button onClick={all}>View all</button></div><div className="media-row">{items.map((media) => <MediaCard key={media.id} media={media} open={(item) => open(item, { ids: items.map((entry) => entry.id) })} favorite={favorite}/>)}</div></section>;
 }
 
-function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open, favorite, remove, merge, mergeLocks, route, refreshToken = 0 }: { preset?: LibraryPreset; favoriteOnly?: boolean; historyOnly?: boolean; open: OpenMedia; favorite: (media: Media, value: boolean) => void; remove: DeleteMedia; merge: MergeMedia; mergeLocks: Set<string>; route: (preset: LibraryPreset) => void; refreshToken?: number }) {
+function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open, favorite, remove, merge, mergeLocks, route, refreshToken = 0, notice }: { preset?: LibraryPreset; favoriteOnly?: boolean; historyOnly?: boolean; open: OpenMedia; favorite: (media: Media, value: boolean) => void; remove: DeleteMedia; merge: MergeMedia; mergeLocks: Set<string>; route: (preset: LibraryPreset) => void; refreshToken?: number; notice: (message: string) => void }) {
   const [query, setQuery] = useState(preset.query ?? "");
   const [kind, setKind] = useState(preset.kind ?? "");
   const [performer, setPerformer] = useState(preset.performer ?? "");
@@ -447,7 +447,22 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
   // a video a running merge is already streaming from is held out of both: deleting it would fail
   // that join halfway, and merging it again would duplicate the work.
   const selectedVideos = (result?.items ?? []).filter((item) => selectedIds.has(item.id) && item.kind === "video" && !mergeLocks.has(item.id));
+  // Export has no such reservation: a link is just a URL, so a video a merge is streaming from is
+  // exported like any other.
+  const selectedLinks = (result?.items ?? []).filter((item) => selectedIds.has(item.id) && item.kind === "video");
   const lockedSelection = [...selectedIds].some((id) => mergeLocks.has(id));
+  const exportLinks = () => {
+    if (!selectedLinks.length) return;
+    // Absolute URLs so the file works from any machine, one per line so it drops straight into
+    // `wget -i`, aria2c or a download manager's import box.
+    const blob = new Blob([linkExportText(selectedLinks, window.location.origin)], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = linkExportName(new Date());
+    anchor.click();
+    URL.revokeObjectURL(url);
+    notice(`${selectedLinks.length} link${selectedLinks.length === 1 ? "" : "s"} exported.`);
+  };
   const submitMerge = async (removeSources: boolean) => {
     setMerging(true);
     try {
@@ -456,7 +471,7 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
     } catch { /* the app-level notice reports the failure; the dialog and the selection stay put */ }
     finally { setMerging(false); }
   };
-  return <section className="library-page"><div className="library-intro"><div><p>COLLECTION</p><h2>{title}</h2><span>{result?.total ?? 0} matching items</span></div><div className="selection-actions">{selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectPage}>{result?.items.every((item) => selectedIds.has(item.id)) ? "Clear page" : "Select page"}</button><button className="merge-selection" disabled={selectedVideos.length < 2 || deleting || merging} title={selectedVideos.length < 2 ? "Select at least two videos to merge" : `Merge ${selectedVideos.length} videos into one file`} onClick={() => setMergeOpen(true)}><Layers/>Merge{selectedVideos.length >= 2 ? ` (${selectedVideos.length})` : ""}</button><button className="delete-selection" disabled={!selectedIds.size || deleting || lockedSelection} title={lockedSelection ? "A merge is still running over one of these files — wait for it to finish" : undefined} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!result?.items.length} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}</div></div>
+  return <section className="library-page"><div className="library-intro"><div><p>COLLECTION</p><h2>{title}</h2><span>{result?.total ?? 0} matching items</span></div><div className="selection-actions">{selectionMode ? <><span>{selectedIds.size} selected</span><button className="quiet" onClick={selectPage}>{result?.items.every((item) => selectedIds.has(item.id)) ? "Clear page" : "Select page"}</button><button className="merge-selection" disabled={selectedVideos.length < 2 || deleting || merging} title={selectedVideos.length < 2 ? "Select at least two videos to merge" : `Merge ${selectedVideos.length} videos into one file`} onClick={() => setMergeOpen(true)}><Layers/>Merge{selectedVideos.length >= 2 ? ` (${selectedVideos.length})` : ""}</button><ExportLinksButton count={selectedLinks.length} disabled={!selectedLinks.length} onExport={exportLinks}/><button className="delete-selection" disabled={!selectedIds.size || deleting || lockedSelection} title={lockedSelection ? "A merge is still running over one of these files — wait for it to finish" : undefined} onClick={() => void deleteSelected()}>{deleting ? <LoaderCircle className="spin"/> : <Trash2/>}Delete</button><button className="quiet" disabled={deleting} onClick={cancelSelection}><X/>Cancel</button></> : <button className="quiet" disabled={!result?.items.length} onClick={() => setSelectionMode(true)}><ListChecks/>Select</button>}</div></div>
     <div className="filters">
       <label><Search/><input value={query} onChange={(event) => resetPage(setQuery, event.target.value)} placeholder="Search titles, performers, or sources…"/></label>
       <div className="filter-buttons"><button className={!kind ? "active" : ""} onClick={() => resetPage(setKind, "")}>All</button><button className={kind === "video" ? "active" : ""} onClick={() => resetPage(setKind, "video")}><Film/>Videos</button><button className={kind === "image" ? "active" : ""} onClick={() => resetPage(setKind, "image")}><ImageIcon/>Photos</button></div>
@@ -479,6 +494,21 @@ function clockDuration(seconds: number): string {
   const whole = Math.max(0, Math.floor(seconds || 0));
   const hours = Math.floor(whole / 3600); const minutes = Math.floor((whole % 3600) / 60);
   return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}` : `${minutes}:${String(whole % 60).padStart(2, "0")}`;
+}
+
+/** One absolute stream URL per line, so the export drops straight into `wget -i` or a manager. */
+export function linkExportText(items: Array<Pick<Media, "streamUrl">>, origin: string): string {
+  return `${items.map((item) => `${origin}${item.streamUrl}`).join("\n")}\n`;
+}
+
+/** The file is named after the export day, not the first video: exports mix performers freely. */
+export function linkExportName(now: Date): string {
+  return `open-easyx-links-${now.toISOString().slice(0, 10)}.txt`;
+}
+
+/** One-click export of the selected videos' stream URLs as a text file. */
+export function ExportLinksButton({ count, disabled, onExport }: { count: number; disabled: boolean; onExport: () => void }) {
+  return <button className="export-selection" disabled={disabled} title={disabled ? "Select at least one video" : `Export ${count} video link${count === 1 ? "" : "s"} to a text file`} onClick={onExport}><Download/>Links{count ? ` (${count})` : ""}</button>;
 }
 
 /**

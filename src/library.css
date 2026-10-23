@@ -47,13 +47,17 @@
 
 .selection-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.selection-actions>span{color:#8b8b95;font-size:10px;font-weight:750;margin-right:3px}.selection-actions button{min-height:39px}.delete-selection{border:1px solid rgba(250,64,88,.35);border-radius:10px;background:rgba(250,64,88,.13);color:#ff7183;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 14px;font-weight:750}.delete-selection:hover:not(:disabled){background:var(--red);color:white}.delete-selection:disabled{opacity:.4;cursor:not-allowed}.delete-selection svg,.selection-actions .quiet svg{width:16px}.media-grid.selecting .media-card{cursor:pointer}.media-card.selected{background:rgba(250,64,88,.08);border-color:rgba(250,64,88,.58);transform:translateY(-2px)}.media-card.selected .poster{border-color:rgba(250,64,88,.75);box-shadow:0 0 0 2px rgba(250,64,88,.12)}.selection-control{position:absolute;z-index:6;right:14px;top:14px;width:32px;height:32px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:rgba(5,5,7,.86);color:#d2d2d7;display:grid;place-items:center;backdrop-filter:blur(8px)}.selection-control[aria-pressed=true]{background:var(--red);border-color:#ff7183;color:white}.selection-control svg{width:17px}.media-grid.selecting .poster .play,.media-grid.selecting .poster .watch-label{display:none}
 @media(max-width:800px){.selection-actions{width:100%;justify-content:flex-start}.selection-actions>span{width:100%}.selection-actions button{flex:1}.library-intro:has(.selection-actions){gap:12px}}
-@media(max-width:480px){.selection-actions{display:grid;grid-template-columns:1fr 1fr}/* The media toolbar carries Select page / Merge / Delete plus Cancel, so a two-column split leaves Delete alone on a half-empty row. The recovery toolbar keeps two. */.library-page:not(.recovery-page) .selection-actions{grid-template-columns:repeat(3,1fr)}.selection-actions>span,.selection-actions button:last-child{grid-column:1/-1}.selection-actions button{width:100%;padding-left:8px;padding-right:8px}.selection-control{right:11px;top:11px}}
+@media(max-width:480px){.selection-actions{display:grid;grid-template-columns:1fr 1fr}/* The media toolbar carries Select page / Links / Merge / Delete plus Cancel: two columns pair them evenly, and Cancel closes the stack. The recovery toolbar keeps two. */.selection-actions>span,.selection-actions button:last-child{grid-column:1/-1}.selection-actions button{width:100%;padding-left:8px;padding-right:8px}.selection-control{right:11px;top:11px}}
 
 /* Merge: the toolbar entry sits between Select page and Delete, and the confirmation is the only
    place the join order, the total runtime, the target name and the (default-off) source deletion
    are shown. The job itself runs in the background, so this dialog never owns a progress bar. */
 .merge-selection{border:1px solid rgba(84,156,255,.32);border-radius:10px;background:rgba(84,156,255,.13);color:#8fb9ff;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 14px;font-weight:750}
 .merge-selection:hover:not(:disabled){background:#549cff;border-color:#549cff;color:#fff}
+.export-selection{border:1px solid rgba(52,199,123,.32);border-radius:10px;background:rgba(52,199,123,.12);color:#4fd398;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 14px;font-weight:750}
+.export-selection:hover:not(:disabled){background:#34c77b;border-color:#34c77b;color:#fff}
+.export-selection:disabled{opacity:.4;cursor:not-allowed}
+.export-selection svg{width:16px}
 .merge-selection:disabled{opacity:.4;cursor:not-allowed}
 .merge-selection svg{width:16px}
 .merge-modal{width:min(560px,100%)}

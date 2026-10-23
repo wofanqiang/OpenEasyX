@@ -67,6 +67,42 @@ describe("Open EasyX live cams", () => {
     expect(targets[0]).toMatchObject({ providerId: "test.live", username: "alice" });
   });
 
+  // `enabled` is the per-URL switch: a disabled source is neither polled nor auto-recorded,
+  // while the performer's other sources keep working. The scheduled scanner has always
+  // skipped disabled sources; the watcher has to agree.
+  it("stops watching a source the operator switched off", async () => {
+    const { database, plugins, service } = await fixture();
+    plugins.install("test.live");
+    const performer = database.createPerformer({ name: "Alice" });
+    const source = database.addSource(performer.id, "test.live", {
+      externalId: "alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test",
+    });
+    database.setPerformerAutoRecord(performer.id, true);
+    expect(service.autoRecordTargets()).toHaveLength(1);
+    database.updateSource(source.id, { enabled: false });
+    expect(service.autoRecordTargets()).toHaveLength(0);
+    database.updateSource(source.id, { enabled: true });
+    expect(service.autoRecordTargets()).toHaveLength(1);
+  });
+
+  // A pasted URL keeps working through the same switch: disabling it has to reach the watcher
+  // through the scraper-plugin resolution too, not just the plugin_id path.
+  it("stops watching a disabled source that was added by pasting its URL", async () => {
+    const { database, plugins, service } = await fixture();
+    plugins.install("test.live");
+    const performer = database.createPerformer({ name: "Alice" });
+    const source = database.addSource(performer.id, "org.easyx.manual", {
+      externalId: "https://live.test/alice", label: "alice", profileUrl: "https://live.test/alice", domain: "live.test",
+    });
+    database.updateSource(source.id, { scraperPluginId: "test.live" });
+    database.setPerformerAutoRecord(performer.id, true);
+    expect(service.autoRecordTargets()).toMatchObject([
+      { providerId: "test.live", username: "alice", pageUrl: "https://live.test/alice" },
+    ]);
+    database.updateSource(source.id, { enabled: false });
+    expect(service.autoRecordTargets()).toHaveLength(0);
+  });
+
   it("ignores a performer that was never armed", async () => {
     const { database, plugins, service } = await fixture();
     plugins.install("test.live");
