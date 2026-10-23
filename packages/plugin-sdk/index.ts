@@ -196,6 +196,17 @@ export type LiveStream = {
    */
   playlistDecodeKey?: string;
   /**
+   * Ask for the playlist to be rewritten without claiming to know the CDN's key.
+   *
+   * MOUFLON's two layers are separable: the URI substitution (a decoy on the URI line, the real
+   * address on a `#EXT-X-MOUFLON:URI:` hint) needs no key at all, while the token encryption
+   * inside that address does. Setting this routes the stream through the live proxy so the
+   * substitution happens even when the CDN advertises no key we can name -- which is the case on
+   * Stripchat, where the `pkey` the room's player echoes back is not one of the keymap entries.
+   * Set `playlistDecodeKey` as well when a key *is* known; either one alone is enough to route.
+   */
+  playlistRewrite?: boolean;
+  /**
    * The CDN gates on the client's TLS fingerprint: it answers 403 to ffmpeg's OpenSSL stack for
    * this very URL while a Chrome fingerprint gets 200 (measured on CamSoda's edge, playlist and
    * segments alike). Set it when the stream was resolved through an impersonating client, and

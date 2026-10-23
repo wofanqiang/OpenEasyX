@@ -5,7 +5,7 @@ import { listDiscoveredLiveCams, type LiveCamDiscoveryProvider } from "./live-ca
 import { configuredArgs, ffmpegLiveCaptureCommand, runYtDlpJson, testYtDlp, ytDlpDownload, ytDlpLiveStream } from "./yt-dlp-utils.js";
 
 const OFFLINE_MARKERS = [
-  "channel is not currently live", "model is offline", "model is in private show", "no active streams",
+  "channel is not currently live", "model is offline", "model is in a private show", "no active streams",
   "not currently broadcasting", "not currently live", "not live", "offline", "room is private", "user not live",
 ];
 
@@ -157,6 +157,12 @@ export function createLiveCamPlugin(options: LiveCamPluginOptions): EasyXPlugin 
         try {
           stream = await ytDlpLiveStream(context, cam, { referer, impersonate: "chrome" });
         } catch (error) {
+          const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+          // An offline or private room is not a resolution failure a browser can fix: the page
+          // says there is no public broadcast, and Chromium will say the same, forty seconds and
+          // a full render later. Let the error through instead -- the downloader's offline
+          // classifier turns it into the back-off that stops the auto-recorder re-queueing.
+          if (OFFLINE_MARKERS.some((marker) => message.includes(marker))) throw error;
           context.log("debug", `${options.name} live resolution failed for capture; falling back to browser capture`, error instanceof Error ? error.message : String(error));
           stream = await browserCapturedLiveStream(context, pageUrl);
         }

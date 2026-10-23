@@ -161,6 +161,23 @@ export function resolveLiveStallSeconds(liveValue: unknown, downloadSeconds: num
 }
 
 /**
+ * Whether a capture has to travel through the server's own HLS proxy instead of going straight to
+ * the provider. Three reasons, each fatal to a direct ffmpeg:
+ *
+ *  - `playlistDecodeKey` — the playlist hides its segment addresses and the key to decrypt them is
+ *    known. ffmpeg cannot unwrap either half.
+ *  - `playlistRewrite` — the same hiding, without a key we can name. The address substitution still
+ *    has to happen, and only the proxy performs it between the CDN and ffmpeg.
+ *  - `requiresTlsFingerprint` — the CDN answers 403 to ffmpeg's OpenSSL stack for the very same URL
+ *    while a Chrome fingerprint gets 200, so the proxy has to carry every byte.
+ *
+ * Providers that ask for none of this are untouched and keep the direct path.
+ */
+export function requiresLiveProxy(stream: LiveStream): boolean {
+  return Boolean(stream.playlistDecodeKey || stream.playlistRewrite || stream.requiresTlsFingerprint);
+}
+
+/**
  * Whether a failed attempt gets another try, and after how long.
  *
  * Downloads keep the operator's configured ladder because waiting is free for them: a stalled
@@ -331,17 +348,15 @@ export class DownloadQueue {
   }
 
   /**
-   * Record through the app's own HLS proxy when a plugin asks for it by setting
-   * `playlistDecodeKey`. ffmpeg cannot de-obfuscate a playlist itself, and it does not send a
+   * Record through the app's own HLS proxy when a plugin asks for it -- by naming a
+   * `playlistDecodeKey`, by asking for a `playlistRewrite`, or by flagging that the CDN gates on
+   * the TLS fingerprint. ffmpeg cannot de-obfuscate a playlist itself, and it does not send a
    * provider's private headers, so for those streams the proxy is not an optimisation but the
    * only thing that makes recording possible. Providers that do not opt in are untouched.
    */
   private recordThroughProxy(stream: LiveStream): string | undefined {
     if (!this.liveProxy || !this.selfOrigin) return undefined;
-    // Two reasons a capture cannot talk to the provider directly: an obfuscated playlist only the
-    // proxy can decode, and a CDN that gates on the TLS fingerprint (ffmpeg cannot impersonate,
-    // so the proxy -- which fetches with a Chrome fingerprint -- has to carry every byte).
-    if (!stream.playlistDecodeKey && !stream.requiresTlsFingerprint) return undefined;
+    if (!requiresLiveProxy(stream)) return undefined;
     return this.selfOrigin + this.liveProxy.register(stream);
   }
 
@@ -704,11 +719,23 @@ export class DownloadQueue {
     const configuredStallSeconds = Math.max(0, Number(this.db.getSettings().downloadStallTimeoutSeconds ?? 120));
     const liveStallSeconds = resolveLiveStallSeconds(this.db.getSettings().liveStallTimeoutSeconds, configuredStallSeconds);
     const stallTimeoutMs = (isLiveRecording ? liveStallSeconds : configuredStallSeconds) * 1000;
-    const stallTimer = stallTimeoutMs > 0 ? setInterval(() => {
-      if (!stalledDownload(control, lastByteGrowthAt, Date.now(), stallTimeoutMs)) return;
-      control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");
-    }, 5000) : undefined;
-    stallTimer?.unref();
+    // The stall clock measures the capture, not the attempt. Resolving a room can legitimately
+    // take longer than the live bound -- yt-dlp against a provider slow to answer, then the
+    // Chromium fallback -- and a timer armed before that work kills the resolve itself and files
+    // the failure as a "download stall" for a capture that never started, with the resolver's
+    // abort as the only clue. So it is armed once the request is in hand, anchor reset: whatever
+    // the resolve cost, the capture gets the whole budget. The resolve has its own bounds
+    // (yt-dlp's socket timeout, the browser fetch's), so nothing is left unbounded.
+    let stallTimer: NodeJS.Timeout | undefined;
+    const armStallTimer = () => {
+      lastByteGrowthAt = Date.now();
+      if (stallTimeoutMs <= 0 || stallTimer) return;
+      stallTimer = setInterval(() => {
+        if (!stalledDownload(control, lastByteGrowthAt, Date.now(), stallTimeoutMs)) return;
+        control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");
+      }, 5000);
+      stallTimer.unref();
+    };
     try {
       const plugin = this.plugins.get(item.pluginId);
       const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
@@ -729,6 +756,8 @@ export class DownloadQueue {
       const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream)))
         ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
       if (!request) throw new Error("This plugin cannot resolve downloads");
+      // The resolve is done; from here on the clock is the capture's.
+      armStallTimer();
       const fallback = `${item.externalId}.${item.mediaType === "image" ? "jpg" : item.mediaType === "video" ? "mp4" : "bin"}`;
       const requestUrl = request.kind === "command" ? item.pageUrl ?? item.externalId : request.url;
       const filename = safeSegment(request.filename ?? item.filename ?? filenameFromUrl(requestUrl, fallback), fallback);

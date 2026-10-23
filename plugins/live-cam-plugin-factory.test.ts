@@ -58,6 +58,21 @@ describe("live cam plugin factory", () => {
     expect(runCommand).toHaveBeenLastCalledWith("easyx-browser-fetch", ["--capture-media", "https://live.test/alice", "/data/sessions/live.txt"], expect.any(Object));
   });
 
+  it("does not spend a Chromium render on a private show", async () => {
+    // A private room has no public broadcast, so the browser fallback can only fail -- forty
+    // seconds and a full page render later, once per polling interval. The error has to reach
+    // the downloader's offline classifier instead, which backs the room off like an offline one.
+    const runCommand = vi.fn(async (command: string) => command === "yt-dlp"
+      ? { exitCode: 1, stdout: "", stderr: "ERROR: [Stripchat] creampussyy: Model is in a private show" }
+      : { exitCode: 0, stdout: JSON.stringify({ url: "https://cdn.test/live.m3u8" }), stderr: "" });
+    const browserContext = { ...context(runCommand), config: { cookiesFile: "/data/sessions/live.txt" } };
+    await expect(plugin.resolveDownload!(browserContext, {
+      externalId: "test:creampussyy:live", title: "creampussyy live", pageUrl: "https://live.test/creampussyy",
+      mediaType: "video", metadata: { live: true },
+    })).rejects.toThrow(/private show/i);
+    expect(runCommand).not.toHaveBeenCalledWith("easyx-browser-fetch", expect.anything(), expect.anything());
+  });
+
   it("explains when playback requires an account session", async () => {
     const sessionPlugin = createLiveCamPlugin({
       id: "test.session", name: "Session Live", prefix: "session", homepage: "https://session.test",

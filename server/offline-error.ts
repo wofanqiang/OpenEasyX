@@ -15,6 +15,11 @@
 const OFFLINE_CONFIRMED_PATTERNS: RegExp[] = [
   /did not expose an hls host/i,
   /no public .*hls host returned a live manifest/i,
+  // A private show is the model being in the room without a public broadcast: there is nothing
+  // to record, exactly like an offline room, and the status API happily reports "online" for
+  // it. Without this the auto-recorder re-queued a private room on the short cooldown forever,
+  // burning a full resolve (yt-dlp, then Chromium) each time.
+  /is in a private show/i,
 ];
 
 /** True when the error message confirms the room is offline (not merely unreachable). */

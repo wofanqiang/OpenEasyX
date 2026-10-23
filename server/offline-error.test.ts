@@ -6,6 +6,11 @@ describe("isOfflineConfirmedError", () => {
     expect(isOfflineConfirmedError("The public room did not expose an HLS host")).toBe(true);
     expect(isOfflineConfirmedError("No public Stripchat HLS host returned a live manifest")).toBe(true);
     expect(isOfflineConfirmedError("No public SuperChat HLS host returned a live manifest")).toBe(true);
+    // A private show is the model in the room with no public broadcast: nothing to record, and
+    // the status API still reports the room online, so it must back off like an offline room
+    // instead of being retried on the short cooldown forever.
+    expect(isOfflineConfirmedError("ERROR: [Stripchat] creampussyy: Model is in a private show")).toBe(true);
+    expect(isOfflineConfirmedError("ERROR: [Chaturbate] alice: alice is in a private show")).toBe(true);
   });
 
   it("rejects transient failures and unrelated messages", () => {

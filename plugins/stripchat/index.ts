@@ -5,6 +5,7 @@ import {
   stripchatFavoriteCams, stripchatProfileLiveCams, stripchatSsrPage, stripchatStreamConfig, type StripchatStreamConfig,
 } from "../live-cam-discovery.js";
 import { fetchPublic, InternalAddressError } from "../../packages/public-fetch.js";
+import { isMouflonObfuscated, mouflonDecryptKey, selectMouflonChallenge } from "../../packages/hls-mouflon.js";
 import type { CommandDownloadRequest, LiveCam, LiveCamFavoriteSnapshot, LiveStream, MediaCandidate, MediaSource, PerformerRecord, PersonCandidate, PluginContext, SourceCandidate } from "../../packages/plugin-sdk/index.js";
 
 const plugin = createLiveCamPlugin({
@@ -234,7 +235,13 @@ function isLivePlaylist(manifest: string): boolean {
     && (manifest.includes("#EXT-X-MEDIA-SEQUENCE:") || manifest.includes("#EXT-X-PART:"));
 }
 
-type ResolvedStripchatHls = { masterUrl: string; mediaUrl: string; headers: Record<string, string> };
+type ResolvedStripchatHls = {
+  masterUrl: string; mediaUrl: string; headers: Record<string, string>;
+  /** Set when the CDN hides segment addresses behind MOUFLON; see `resolveStripchatDirect`. */
+  obfuscated?: boolean;
+  /** The key the CDN's own player would use to decrypt them, when it advertises one we know. */
+  decodeKey?: string;
+};
 
 /**
  * The room's stream config, or undefined when the page arrived and says the room has no public
@@ -280,15 +287,26 @@ async function resolveStripchatHls(context: PluginContext, pageUrl: string): Pro
       if (!response.ok) continue;
       const manifest = await response.text();
       if (!manifest.trimStart().startsWith("#EXTM3U") || manifest.includes("#EXT-X-MOUFLON-ADVERT")) continue;
+      // The master advertises the CDN's PSCH challenges; the player settles on the first pair
+      // whose key it shares with the CDN, and that shared key is what decrypts segment
+      // addresses further down. Any token answers the challenge, but only a keymapped one
+      // decrypts -- see `packages/hls-mouflon.ts`.
+      const challenge = selectMouflonChallenge(manifest);
+      const decodeKey = challenge ? mouflonDecryptKey(challenge) : undefined;
       for (const candidate of playlistUrls(manifest, master.toString())) {
         const variant = new URL(candidate);
         if (!variant.searchParams.has("pkey")) variant.searchParams.set("pkey", playbackKey);
         // The manifest is remote content too, so its segment URLs get the same check -- including
         // wherever they redirect to, which is why the fetch runs through the guard as well.
         const variantResponse = await fetchPublic(context, variant.toString(), LABEL, { headers, signal: timeout() });
-        if (variantResponse.ok && isLivePlaylist(await variantResponse.text())) {
-          return { masterUrl: master.toString(), mediaUrl: variant.toString(), headers };
+        if (!variantResponse.ok) continue;
+        const media = await variantResponse.text();
+        if (!isLivePlaylist(media)) continue;
+        const obfuscated = isMouflonObfuscated(media);
+        if (obfuscated && !decodeKey) {
+          context.log("warn", `Stripchat playlist for ${stream.modelId} obfuscates its segment addresses but advertises no key we know; the CDN may have rotated its keymap`);
         }
+        return { masterUrl: master.toString(), mediaUrl: variant.toString(), headers, obfuscated, decodeKey };
       }
     } catch (error) {
       if (error instanceof InternalAddressError) rejectedInternal = true;
@@ -301,9 +319,29 @@ async function resolveStripchatHls(context: PluginContext, pageUrl: string): Pro
   throw new Error("No public Stripchat HLS host returned a live manifest");
 }
 
+/**
+ * Stripchat's public HLS is served by the same MOUFLON-fronted CDN as SuperChat's
+ * (`media-hls.doppiocdn.media`), and a media playlist from it writes a decoy address on the URI
+ * line while the real one rides an `#EXT-X-MOUFLON:URI:` hint. ffmpeg knows none of that: it
+ * parses the playlist as written, fetches the decoy and dies on a 404 from the very first
+ * segment -- the 19:31 failure, where the 720p init section came back 404 and took the capture
+ * with it.
+ *
+ * So an obfuscated stream is not handed to ffmpeg directly: it is flagged `playlistRewrite` so
+ * the recorder routes it through the server's live proxy, the only place a playlist can be
+ * rewritten between the CDN and ffmpeg. That alone is the layer that matters here -- measured on
+ * a captured failure, Stripchat's segment tokens are already clear 16-character names and are
+ * neither decryptable with a keymap entry nor with the `pkey` the room's player echoes back, so
+ * the key is reported only when the CDN advertises one we actually know.
+ */
 export async function resolveStripchatDirect(context: PluginContext, pageUrl: string): Promise<LiveStream> {
   const stream = await resolveStripchatHls(context, pageUrl);
-  return { url: stream.masterUrl, headers: stream.headers, contentType: "application/vnd.apple.mpegurl" };
+  return {
+    url: stream.masterUrl, headers: stream.headers, contentType: "application/vnd.apple.mpegurl",
+    ...(stream.obfuscated
+      ? { playlistRewrite: true, ...(stream.decodeKey ? { playlistDecodeKey: stream.decodeKey } : {}) }
+      : {}),
+  };
 }
 
 // A room that has just (re)started often needs a few seconds before its public HLS
@@ -347,6 +385,10 @@ const STRIPCHAT_MERGE_POLL_MS = 20_000;
 export async function resolveStripchatDownload(context: PluginContext, item: MediaCandidate): Promise<CommandDownloadRequest> {
   if (!item.pageUrl) throw new Error("Stripchat recording is missing its public room URL");
   const stream = await resolveStripchatHlsWithRetry(context, item.pageUrl);
+  // The standalone recorder talks to the CDN itself, so it would parse the decoys and record
+  // nothing. Refuse here with the reason rather than spending a capture on a playlist that
+  // cannot work: the live capture path reaches the proxy, this one does not.
+  if (stream.obfuscated) throw new Error("Stripchat live streams can only be recorded through the live capture path; this playlist hides its segment addresses and must be rewritten by the server's HLS proxy");
   return {
     kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: item.filename ?? "stripchat-live.mp4",
     args: [

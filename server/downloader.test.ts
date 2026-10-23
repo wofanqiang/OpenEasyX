@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, requiresLiveProxy, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -301,6 +301,33 @@ describe("DownloadQueue", () => {
     expect(fs.statSync(completed).mtime.toISOString()).toBe("2021-03-04T12:30:00.000Z");
   });
 
+  it("does not file a slow live resolve as a download stall", async () => {
+    // The stall clock bounds the capture, not the attempt. Arming it before resolution killed a
+    // resolver that needed longer than the bound, and the failure was then relabelled as
+    // "Download timed out ... This operation was aborted" for a capture ffmpeg never started --
+    // which is how most Stripchat failures on VPS2 were being reported. The resolver here honours
+    // its abort signal, so with the old ordering the 5s stall tick aborts it at ~5s.
+    const dataDir = temp("easyx-slowresolve-data"); const mediaDir = temp("easyx-slowresolve-media"); const pluginDir = temp("easyx-slowresolve-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    const resolve = "async resolveDownload(context) { await new Promise((resolve, reject) => { "
+      + "const timer = setTimeout(resolve, 7000); "
+      + "(context.signal || new AbortController().signal).addEventListener('abort', () => { clearTimeout(timer); reject(new Error('This operation was aborted')); }); }); "
+      + "return { kind: 'command', command: process.execPath, args: ['-e', \"require('node:fs').writeFileSync(process.argv[1], 'slow resolve media')\", '{output}'], filename: 'slow.mp4' }; }";
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.slowresolve", name: "Slow", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, ${resolve} };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.slowresolve", { installed: true, enabled: true });
+    db.updateSettings({ downloadStallTimeoutSeconds: 1 });
+    const person = db.upsertPerformer({ externalId: "person", name: "Slow Performer" }, "test.slowresolve");
+    const source = db.addSource(person.id, "test.slowresolve", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "slow", pageUrl: "https://example.test/slow", mediaType: "video", filename: "slow.mp4" }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    await waitFor(() => ["completed", "failed", "queued"].includes(db.getItem(item.id)!.status), 30000); queue.stop();
+    expect(db.getItem(item.id)?.error ?? "").not.toContain("timed out");
+    expect(db.getItem(item.id)?.status).toBe("completed");
+    expect(fs.readFileSync(path.join(mediaDir, "Slow Performer", "example.test", "slow.mp4"), "utf8")).toBe("slow resolve media");
+  }, 60000);
+
   it("persists command extractor percentage and downloaded bytes while running", async () => {
     const dataDir = temp("easyx-progress-data"); const mediaDir = temp("easyx-progress-media"); const pluginDir = temp("easyx-progress-plugins");
     const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
@@ -406,6 +433,21 @@ describe("resolveLiveStallSeconds", () => {
 
   it("keeps 'disabled' disabled when the download timeout disables it", () => {
     expect(resolveLiveStallSeconds(undefined, 0)).toBe(0);
+  });
+});
+
+describe("requiresLiveProxy", () => {
+  it("routes every stream ffmpeg cannot fetch on its own", () => {
+    expect(requiresLiveProxy({ url: "https://cdn.test/a.m3u8", playlistDecodeKey: "key" })).toBe(true);
+    // Stripchat's CDN hides its addresses behind MOUFLON without advertising a key we can name,
+    // so `playlistRewrite` is the only thing that sends the capture through the proxy.
+    expect(requiresLiveProxy({ url: "https://cdn.test/a.m3u8", playlistRewrite: true })).toBe(true);
+    expect(requiresLiveProxy({ url: "https://cdn.test/a.m3u8", requiresTlsFingerprint: true })).toBe(true);
+  });
+
+  it("leaves a provider that asks for nothing on the direct path", () => {
+    expect(requiresLiveProxy({ url: "https://cdn.test/a.m3u8" })).toBe(false);
+    expect(requiresLiveProxy({ url: "https://cdn.test/a.m3u8", headers: { referer: "https://live.test/" } })).toBe(false);
   });
 });
 
