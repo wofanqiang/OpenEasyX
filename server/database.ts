@@ -605,6 +605,18 @@ export class Database {
     return this.getSource(sourceId);
   }
 
+  /**
+   * Push a source's next scan out without pretending a scan happened.
+   *
+   * Used when a live room is already being captured: the scan has nothing to learn, but the
+   * source is still "due", so without this it would be re-evaluated on every tick of the
+   * scheduler's five-second loop. `last_synced_at` is deliberately left alone -- nothing was read.
+   */
+  postponeSource(sourceId: string, intervalSeconds: number): void {
+    const next = new Date(Date.now() + Math.max(1, intervalSeconds) * 1000).toISOString();
+    this.sqlite.prepare("UPDATE sources SET next_sync_at=?,updated_at=? WHERE id=?").run(next, now(), sourceId);
+  }
+
   markSourceSynced(sourceId: string, intervalSeconds: number, error?: string) {
     const stamp = now(); const next = new Date(Date.now() + intervalSeconds * 1000).toISOString();
     this.sqlite.prepare("UPDATE sources SET last_synced_at=?,next_sync_at=?,last_error=?,updated_at=? WHERE id=?").run(stamp, next, error ?? null, stamp, sourceId);

@@ -40,7 +40,7 @@ import { isLiveCandidate } from "../packages/live-capture.js";
 import { AuthService } from "./auth.js";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { exportBackup, importBackup, parseBackup } from "./backup.js";
-import { SourceSync } from "./source-sync.js";
+import { SourceSync, deferLiveScanWhileCapturing } from "./source-sync.js";
 import { PerformerConflictError } from "./performer-conflict.js";
 import { registerPerformerMergeRoutes } from "./performer-merge-routes.js";
 
@@ -927,6 +927,12 @@ setInterval(() => {
     if (scheduledInFlight.has(source.id) || sourceSync.active.has(source.id)) continue;
     const owner = plugins.list().find((entry) => entry.manifest.id === source.scraperPluginId);
     if (!owner?.installed || !owner.enabled || !owner.manifest.capabilities.includes("media-listing")) continue;
+    // A live room that is already being captured has nothing to tell the scanner. Postpone rather
+    // than skip silently, or the source stays due and is re-evaluated on every tick of this loop.
+    if (deferLiveScanWhileCapturing(owner.manifest, Boolean(db.activeLiveItemForSource(source.id)))) {
+      db.postponeSource(source.id, source.syncIntervalSeconds);
+      continue;
+    }
     scheduledInFlight.add(source.id);
     void syncSource(source.id).catch((error) => app.log.warn({ err: error, reason: error instanceof Error ? error.message : String(error), sourceId: source.id }, "Scheduled source sync failed")).finally(() => scheduledInFlight.delete(source.id));
   }

@@ -141,6 +141,24 @@ export function camsLiveCams(html: string): LiveCam[] {
   }).filter((cam): cam is LiveCam => Boolean(cam));
 }
 
+/**
+ * A CamSoda room's own status, normalised to the shared vocabulary.
+ *
+ * `online` is what this provider calls a public show, and it is reported as `public` so the
+ * recorder has one word to test for every provider. Verified against live rooms: a public one
+ * answers `online`, a room in a private show answers `private`, an offline one answers `offline`.
+ *
+ * The homepage catalogue cannot answer this question: all three appear in it, so a private room
+ * was being recorded and then failed with "model is in a private show". The model's own record is
+ * the only object on the page that carries this field, and `subjectText` is its next key, which
+ * makes the pair unique on the page.
+ */
+export function camsodaRoomStatus(html: string): string | undefined {
+  const status = /"status"\s*:\s*"([^"]+)"\s*,\s*"subjectText"/i.exec(html)?.[1]?.trim().toLowerCase();
+  if (!status) return undefined;
+  return status === "online" ? "public" : status;
+}
+
 export function camsodaLiveCams(html: string): LiveCam[] {
   const cams: LiveCam[] = [];
   for (const match of html.matchAll(/<a\b([^>]*data-username\s*=\s*["'][^"']+["'][^>]*)>([\s\S]*?)(?=<a\b[^>]*data-username\s*=|<\/main>|<footer|$)/gi)) {

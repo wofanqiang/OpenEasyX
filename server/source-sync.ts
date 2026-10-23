@@ -3,8 +3,25 @@ import path from "node:path";
 import type { Database } from "./database.js";
 import type { PluginContext, EasyXPlugin } from "../packages/plugin-sdk/index.js";
 
-export class SourceSync {
-  readonly active = new Set<string>();
+/**
+ * Whether a scheduled scan can be deferred because the room it watches is already being captured.
+ *
+ * Only live-cam sources qualify. The capture is itself the proof that the room is in a public
+ * show, so asking the provider again cannot change the answer -- it only spends a full resolve per
+ * poll on a room that is, by definition, already being recorded. A live plugin also returns
+ * nothing but the live candidate, so nothing else is lost by waiting.
+ *
+ * A media scraper keeps its schedule: what it finds is published items, which have nothing to do
+ * with whether a broadcast is being recorded.
+ */
+export function deferLiveScanWhileCapturing(
+  manifest: { polling?: { mode?: string } } | undefined,
+  capturing: boolean,
+): boolean {
+  return capturing && manifest?.polling?.mode === "live";
+}
+
+export class SourceSync {  readonly active = new Set<string>();
   constructor(private db: Database, private mediaRoot: string,
     private scraper: (pluginId: string, url: string) => EasyXPlugin,
     private context: (pluginId: string) => PluginContext,

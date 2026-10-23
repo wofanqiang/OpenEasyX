@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Database } from "./database.js";
-import { SourceSync } from "./source-sync.js";
+import { SourceSync, deferLiveScanWhileCapturing } from "./source-sync.js";
 import type { MediaCandidate, EasyXPlugin } from "../packages/plugin-sdk/index.js";
 const cleanup: Array<() => unknown> = [];
 afterEach(() => { for (const fn of cleanup.splice(0).reverse()) fn(); });
@@ -63,5 +63,42 @@ describe("source hard refresh", () => {
     await expect(service.sync(source.id)).rejects.toThrow("already being scanned");
     reject(new Error("Site unavailable")); await expect(first).rejects.toThrow("Site unavailable");
     expect(service.active.size).toBe(0); expect(item("deleted").status).toBe("deleted");
+  });
+});
+
+describe("live scans while a room is being captured", () => {
+  it("defers only a live source whose room is already being recorded", () => {
+    const live = { polling: { mode: "live" } };
+    expect(deferLiveScanWhileCapturing(live, true)).toBe(true);
+    // No capture: the scan is the only way to learn the room went live in the first place.
+    expect(deferLiveScanWhileCapturing(live, false)).toBe(false);
+    // A media scraper keeps its schedule: what it finds is published items, which have nothing to
+    // do with whether a broadcast is being recorded.
+    expect(deferLiveScanWhileCapturing({ polling: { mode: "schedule" } }, true)).toBe(false);
+    expect(deferLiveScanWhileCapturing({}, true)).toBe(false);
+    expect(deferLiveScanWhileCapturing(undefined, true)).toBe(false);
+  });
+
+  it("postpones a deferred scan without claiming one happened", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-postpone-"));
+    const db = new Database(dir);
+    try {
+      const performer = db.createPerformer({ name: "Deferred" });
+      const source = db.addSource(performer.id, "test", { externalId: "deferred", label: "Deferred", profileUrl: "https://site.test/deferred", domain: "site.test" });
+      db.updateSource(source.id, { scraperPluginId: "test", scrapeEnabled: true, syncIntervalSeconds: 30 });
+      db.resetSourceSchedule(source.id);
+      expect(db.dueSources().some((entry) => entry.id === source.id)).toBe(true);
+
+      db.postponeSource(source.id, 600);
+      const after = db.getSource(source.id)!;
+      // Still due next interval, not on the next tick of the five-second scheduler...
+      expect(db.dueSources()).toHaveLength(0);
+      // ...and the audit trail says the scan did not run, because it did not.
+      expect(after.lastSyncedAt).toBeUndefined();
+      expect(Date.parse(after.nextSyncAt!)).toBeGreaterThan(Date.now() + 500_000);
+    } finally {
+      db.close();
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows keeps the tree briefly */ }
+    }
   });
 });

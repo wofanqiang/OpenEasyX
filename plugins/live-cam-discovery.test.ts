@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  bongacamsLiveCams, cam4LiveCams, camsLiveCams, camsodaLiveCams, listDiscoveredLiveCams,
+  bongacamsLiveCams, cam4LiveCams, camsLiveCams, camsodaLiveCams, camsodaRoomStatus, listDiscoveredLiveCams,
   livejasminLiveCams, myfreecamsExplorerLiveCams, myfreecamsLiveCams, stripchatLiveCams, stripchatProfileLiveCams, stripchatStreamConfig, twitchLiveCams, xcamsLiveCams,
 } from "./live-cam-discovery.js";
 
@@ -32,6 +32,19 @@ describe("public live-cam discovery parsers", () => {
     expect(camsodaLiveCams(soda)).toEqual([expect.objectContaining({ username: "alice", viewers: 123 })]);
     const performers = [{ display_name: "Jasmin", status: 1, main_category: "girls", viewers: 8 }, { display_name: "Offline", status: 0 }];
     expect(livejasminLiveCams(`<script>listPagePerformers = ${JSON.stringify(performers)};</script>`)).toEqual([expect.objectContaining({ username: "Jasmin", viewers: 8, gender: "female" })]);
+  });
+
+  it("reads the CamSoda room status and normalises online to public", () => {
+    // The model's own record is the object whose `status` is followed by `subjectText`, which makes
+    // the pair unique on a page carrying dozens of other objects with a `status` field. Measured
+    // against live rooms: a public show answers "online", a private one "private", an offline one
+    // "offline" -- and all three are still listed on the homepage, so the catalogue cannot tell
+    // them apart.
+    const page = (status: string) => `<script>{"id":1,"available":false,"lastOnlineAt":"2026-10-23T18:17:36+0000","status":"${status}","subjectText":"hi"}</script>`;
+    expect(camsodaRoomStatus(page("online"))).toBe("public");
+    expect(camsodaRoomStatus(page("private"))).toBe("private");
+    expect(camsodaRoomStatus(page("offline"))).toBe("offline");
+    expect(camsodaRoomStatus("<html><body>no model record here</body></html>")).toBeUndefined();
   });
 
   it("reads rendered MyFreeCams, Twitch, and Xcams cards", () => {
