@@ -1,6 +1,11 @@
 import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
+import { authorizedMediaLink, mediaLinkUrl } from "./media-links.js";
 import { createSessionGate, isSessionExempt } from "./session-gate.js";
+
+const mediaSecret = "gate-test-secret-0123456789";
+const mediaId = "a99ed9c782b49ce372d1c857";
+const otherMediaId = "b11fe0d893c5adf483e2d968";
 
 /** A bare app with the real gate in front of a few stand-in routes. */
 async function appWithGate() {
@@ -8,8 +13,9 @@ async function appWithGate() {
   app.addHook("onRequest", createSessionGate({
     verifySession: (cookie) => cookie === "valid",
     readSessionCookie: (request) => (request.headers.cookie ?? "").split(";").map((part) => part.trim()).find((part) => part.startsWith("oe="))?.slice(3),
+    verifyMediaLink: (request) => Boolean(authorizedMediaLink(request, mediaSecret)),
   }));
-  for (const route of ["/", "/browser/vnc.html", "/api/items", "/api/health", "/api/live-cams/proxy/abc.ts"]) {
+  for (const route of ["/", "/browser/vnc.html", "/api/items", "/api/health", "/api/live-cams/proxy/abc.ts", `/api/media/${mediaId}/stream`]) {
     app.get(route, async () => ({ ok: true }));
   }
   app.post("/api/items", async () => ({ ok: true }));
@@ -82,5 +88,21 @@ describe("session gate", () => {
     for (const path of ["/api/items", "/api/media/x", "/api/settings", "/api/plugins/stripchat/browser-login/start"]) {
       expect(isSessionExempt(path), path).toBe(false);
     }
+  });
+
+  // An exported stream link has to answer without a session -- that is the whole point of the
+  // export -- but the token is scoped to one media id, so nothing else under /api/ opens up.
+  it("serves a stream URL that carries a valid media-link token, and only that one", async () => {
+    const app = await appWithGate();
+    expect((await app.inject({ method: "GET", url: `/api/media/${mediaId}/stream` })).statusCode).toBe(401);
+    const linked = await app.inject({ method: "GET", url: mediaLinkUrl(mediaId, mediaSecret) });
+    expect(linked.statusCode).toBe(200);
+    // The same token re-pointed at another id is not a credential for it.
+    const foreign = mediaLinkUrl(mediaId, mediaSecret).replace(`/media/${mediaId}/`, `/media/${otherMediaId}/`);
+    expect((await app.inject({ method: "GET", url: foreign })).statusCode).toBe(401);
+    // A token on a non-stream API path buys nothing.
+    const onItems = mediaLinkUrl(mediaId, mediaSecret).replace(`/media/${mediaId}/stream`, "/items");
+    expect((await app.inject({ method: "GET", url: onItems })).statusCode).toBe(401);
+    await app.close();
   });
 });

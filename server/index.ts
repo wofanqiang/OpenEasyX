@@ -20,6 +20,7 @@ import { LiveCamImages } from "./live-cam-images.js";
 import { LiveCamService } from "./live-cams.js";
 import { HlsProxy } from "./hls-proxy.js";
 import { createSessionGate } from "./session-gate.js";
+import { authorizedMediaLink, mediaLinkUrl } from "./media-links.js";
 import { trustProxyOption } from "./trusted-network.js";
 import { SystemStatsService } from "./system-stats.js";
 import { restoreLiveCamPerformers } from "./live-cam-restore.js";
@@ -174,7 +175,13 @@ function cookieSecure(request: FastifyRequest): boolean {
 function sessionCookie(request: FastifyRequest): string | undefined {
   return parseCookies(request.headers.cookie)[SESSION_COOKIE];
 }
-app.addHook("onRequest", createSessionGate({ verifySession: (cookie) => auth.verifySession(cookie), readSessionCookie: sessionCookie }));
+app.addHook("onRequest", createSessionGate({
+  verifySession: (cookie) => auth.verifySession(cookie),
+  readSessionCookie: sessionCookie,
+  // A stream URL with a valid media-link token is its own credential, so an exported link works
+  // without a session; every other endpoint still authenticates.
+  verifyMediaLink: (request) => Boolean(authorizedMediaLink(request, auth.sessionSecret)),
+}));
 
 // The noVNC viewer for the integrated browser login. browser-login.ts starts websockify on
 // 127.0.0.1:6080 only while a browser session is active, and the service is gated behind
@@ -186,7 +193,7 @@ app.addHook("onRequest", createSessionGate({ verifySession: (cookie) => auth.ver
 if (browserLoginEnabled()) {
   await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
 }
-const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds());
+const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds(), (id) => mediaLinkUrl(id, auth.sessionSecret));
 const sourceSync = new SourceSync(db, mediaDir, ensureScraperPlugin, (id) => plugins.context(id), (ids) => queue.applyStoredMediaDates(ids));
 registerPerformerMergeRoutes(app, db, libraryDb, dataDir, (id) => performerOperations.has(id) || performerRefreshStatus.running || discoveryStatus.running || db.listSources(id).some((source) => sourceSync.active.has(source.id)));
 

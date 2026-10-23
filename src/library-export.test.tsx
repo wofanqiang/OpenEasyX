@@ -14,6 +14,12 @@ describe("library link export", () => {
     );
   });
 
+  it("keeps a token query string intact, because that is what makes the link downloadable", () => {
+    const streamUrl = "/api/media/aaaaaaaaaaaaaaaaaaaaaaa/stream?exp=1799999999&token=Zm9vYmFy";
+    expect(linkExportText([{ streamUrl }], "https://open-easyx.example"))
+      .toBe("https://open-easyx.example/api/media/aaaaaaaaaaaaaaaaaaaaaaa/stream?exp=1799999999&token=Zm9vYmFy\n");
+  });
+
   it("stays a single newline for an empty selection, so the file is never malformed", () => {
     expect(linkExportText([], "http://open-easyx.local:3210")).toBe("\n");
   });

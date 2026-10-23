@@ -73,6 +73,12 @@ export class AuthService {
     return `${payload}.${sig}`;
   }
 
+  /**
+   * The signing secret, read-only. Media-link tokens are keyed by it so the session gate and the
+   * library routes cannot drift apart (see media-links.ts); it is never sent to a client.
+   */
+  get sessionSecret(): string { return this.secret; }
+
   verifySession(value?: string): boolean {
     if (!value) return false;
     const dot = value.lastIndexOf(".");

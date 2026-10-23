@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { parseMediaRange, registerLibraryRoutes } from "./library-routes";
+import { authorizedMediaLink, mediaLinkUrl } from "./media-links.js";
 
 const roots: string[] = [];
 
@@ -61,6 +62,28 @@ describe("media thumbnails", () => {
     expect(response.json()).toEqual({ error: "Thumbnail is not available" });
     // A poster that cannot be drawn must never cost the item its visibility.
     expect(db.getMedia(item.id)).toBeDefined();
+    await app.close();
+    db.close();
+  });
+});
+
+describe("media link payload", () => {
+  it("hands out a stream URL the session gate accepts without a session", async () => {
+    const { data, media, db } = libraryFixture();
+    fs.writeFileSync(path.join(media, "Example Performer", "example.com", "clip.mp4"), "video");
+    await new Catalog(db, media, data, false).scan();
+    const item = db.listMedia().items[0];
+
+    const secret = "payload-test-secret-0123456789";
+    const catalog = { thumbnail: async () => { throw new Error("FFmpeg produced an empty thumbnail"); } } as unknown as Catalog;
+    const downloadDb = { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3];
+    const app = Fastify();
+    // The production wiring passes the signer; this asserts the two halves agree.
+    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => [], (id) => mediaLinkUrl(id, secret));
+
+    const streamUrl: string = (await app.inject({ method: "GET", url: `/api/media/${item.id}` })).json().streamUrl;
+    expect(streamUrl.startsWith(`/api/media/${item.id}/stream?exp=`)).toBe(true);
+    expect(authorizedMediaLink({ url: streamUrl }, secret)).toBe(item.id);
     await app.close();
     db.close();
   });

@@ -22,15 +22,15 @@ function libraryQuery(value: Record<string, string | undefined>): LibraryQuery {
   };
 }
 
-function payload<T extends { id: string }>(media: T) {
-  const version = "modifiedAt" in media && "size" in media
-    ? `${Date.parse(String(media.modifiedAt)).toString(36)}-${Number(media.size).toString(36)}` : "1";
-  return {
-    ...media,
-    thumbnailUrl: `/api/media/${media.id}/thumbnail?v=${version}`,
-    previewUrl: "kind" in media && media.kind === "video" ? `/api/media/${media.id}/preview.gif?v=${version}` : "",
-    streamUrl: `/api/media/${media.id}/stream`,
-  };
+/**
+ * How a stream URL is built. Production passes the media-link signer, so every stream URL the
+ * library hands out is directly fetchable without a session (that is what makes an exported link
+ * work in a download manager); tests and callers that do not care get the plain path.
+ */
+type MediaLink = (id: string) => string;
+
+function plainMediaLink(id: string): string {
+  return `/api/media/${id}/stream`;
 }
 
 export function parseMediaRange(value: string, size: number): { start: number; end: number } | undefined {
@@ -47,7 +47,17 @@ export function parseMediaRange(value: string, size: number): { start: number; e
   return { start, end: Math.min(requestedEnd, size - 1) };
 }
 
-export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, libraryDb: LibraryDatabase, catalog: Catalog, downloadDb: Database, dataDir: string, mergingIds: () => string[] = () => []) {
+export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, libraryDb: LibraryDatabase, catalog: Catalog, downloadDb: Database, dataDir: string, mergingIds: () => string[] = () => [], mediaLink: MediaLink = plainMediaLink) {
+  const payload = <T extends { id: string }>(media: T) => {
+    const version = "modifiedAt" in media && "size" in media
+      ? `${Date.parse(String(media.modifiedAt)).toString(36)}-${Number(media.size).toString(36)}` : "1";
+    return {
+      ...media,
+      thumbnailUrl: `/api/media/${media.id}/thumbnail?v=${version}`,
+      previewUrl: "kind" in media && media.kind === "video" ? `/api/media/${media.id}/preview.gif?v=${version}` : "",
+      streamUrl: mediaLink(media.id),
+    };
+  };
   const requiredMedia = (id: string) => {
     const media = libraryDb.getMedia(id);
     if (!media) throw Object.assign(new Error("Media not found"), { statusCode: 404 });
