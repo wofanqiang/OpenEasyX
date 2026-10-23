@@ -337,7 +337,11 @@ export class DownloadQueue {
    * only thing that makes recording possible. Providers that do not opt in are untouched.
    */
   private recordThroughProxy(stream: LiveStream): string | undefined {
-    if (!stream.playlistDecodeKey || !this.liveProxy || !this.selfOrigin) return undefined;
+    if (!this.liveProxy || !this.selfOrigin) return undefined;
+    // Two reasons a capture cannot talk to the provider directly: an obfuscated playlist only the
+    // proxy can decode, and a CDN that gates on the TLS fingerprint (ffmpeg cannot impersonate,
+    // so the proxy -- which fetches with a Chrome fingerprint -- has to carry every byte).
+    if (!stream.playlistDecodeKey && !stream.requiresTlsFingerprint) return undefined;
     return this.selfOrigin + this.liveProxy.register(stream);
   }
 

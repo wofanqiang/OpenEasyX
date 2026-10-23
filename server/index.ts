@@ -21,6 +21,7 @@ import { LiveCamService } from "./live-cams.js";
 import { HlsProxy } from "./hls-proxy.js";
 import { createSessionGate } from "./session-gate.js";
 import { authorizedMediaLink, mediaLinkUrl } from "./media-links.js";
+import { fingerprintedFetch } from "./tls-fingerprint.js";
 import { trustProxyOption } from "./trusted-network.js";
 import { SystemStatsService } from "./system-stats.js";
 import { restoreLiveCamPerformers } from "./live-cam-restore.js";
@@ -69,7 +70,10 @@ await plugins.load();
 // Streams whose playlists must be rewritten are recorded through the app's own HLS proxy, so
 // ffmpeg needs an absolute origin it can reach from inside this process or container.
 const selfOrigin = process.env.EASYX_SELF_ORIGIN ?? `http://127.0.0.1:${port}`;
-const liveProxy = new HlsProxy(fetch);
+// The live proxy fetches upstream with a Chrome TLS fingerprint where that is possible (see
+// tls-fingerprint.ts): some CDNs answer 403 to ffmpeg's OpenSSL stack no matter the headers, and
+// both the player and the recorder reach providers only through this proxy.
+const liveProxy = new HlsProxy(fingerprintedFetch);
 const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
 const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); }, liveProxy);
 const queue = new DownloadQueue(

@@ -195,6 +195,15 @@ export type LiveStream = {
    * See `packages/hls-mouflon.ts`.
    */
   playlistDecodeKey?: string;
+  /**
+   * The CDN gates on the client's TLS fingerprint: it answers 403 to ffmpeg's OpenSSL stack for
+   * this very URL while a Chrome fingerprint gets 200 (measured on CamSoda's edge, playlist and
+   * segments alike). Set it when the stream was resolved through an impersonating client, and
+   * the recorder routes the capture through the HLS proxy, which fetches with that fingerprint
+   * (see server/tls-fingerprint.ts). Left unset, nothing changes: the capture goes straight to
+   * the provider as before.
+   */
+  requiresTlsFingerprint?: boolean;
 };
 
 export interface EasyXPlugin {

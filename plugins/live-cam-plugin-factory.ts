@@ -24,6 +24,14 @@ type LiveCamPluginOptions = {
   discovery?: LiveCamDiscoveryProvider;
   sessionHelp?: string;
   sessionRequiredForPlaybackMessage?: string;
+  /**
+   * The provider's CDN gates on the client's TLS fingerprint, so a resolved stream URL cannot be
+   * fetched by ffmpeg's OpenSSL stack no matter which headers it carries. The factory stamps
+   * `requiresTlsFingerprint` on the stream, and the recorder routes the capture through the HLS
+   * proxy, which fetches with a Chrome fingerprint. Leave it unset for providers whose CDN
+   * answers plain TLS (the recorder then captures directly, as before).
+   */
+  fingerprintGated?: boolean;
 };
 
 function text(value: unknown): string | undefined {
@@ -118,10 +126,14 @@ export function createLiveCamPlugin(options: LiveCamPluginOptions): EasyXPlugin 
       }
     },
     async resolveLiveStream(context, cam) {
-      try { return await ytDlpLiveStream(context, cam, { referer, impersonate: "chrome" }); }
+      // A provider that answered the impersonating resolver can still refuse ffmpeg's TLS stack,
+      // so a plugin that knows its CDN gates on the fingerprint stamps the stream; the recorder
+      // then captures through the proxy, which fetches with that fingerprint.
+      const stamp = (stream: LiveStream): LiveStream => options.fingerprintGated ? { ...stream, requiresTlsFingerprint: true } : stream;
+      try { return stamp(await ytDlpLiveStream(context, cam, { referer, impersonate: "chrome" })); }
       catch (error) {
         context.log("debug", `${options.name} yt-dlp live resolution failed; trying browser capture`, error instanceof Error ? error.message : String(error));
-        try { return await browserCapturedLiveStream(context, cam.pageUrl); }
+        try { return stamp(await browserCapturedLiveStream(context, cam.pageUrl)); }
         catch (captureError) {
           if (options.sessionRequiredForPlaybackMessage && !text(context.config.cookiesFile)) {
             throw new Error(options.sessionRequiredForPlaybackMessage, { cause: captureError });

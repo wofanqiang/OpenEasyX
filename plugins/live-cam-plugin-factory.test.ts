@@ -72,4 +72,22 @@ describe("live cam plugin factory", () => {
       id: "alice", username: "alice", pageUrl: "https://session.test/alice",
     })).rejects.toThrow("An account session is required for playback.");
   });
+
+  // A CDN that gates on the TLS fingerprint answers 403 to ffmpeg for the very URL the resolver
+  // just fetched. The plugin that knows this stamps the stream, and the recorder routes the
+  // capture through the proxy, which fetches with a Chrome fingerprint.
+  it("stamps a stream a fingerprint-gated provider resolved, and leaves others alone", async () => {
+    const runCommand = vi.fn(async () => ({ exitCode: 0, stdout: JSON.stringify({ id: "alice", is_live: true, formats: [{ url: "https://cdn.test/alice/master.m3u8?token=one", vcodec: "h264", acodec: "aac" }] }), stderr: "" }));
+    const gated = createLiveCamPlugin({
+      id: "test.gated", name: "Gated Live", prefix: "gated", homepage: "https://gated.test",
+      description: "Test", sourceUrlPatterns: ["https://gated.test/*"], cookieDomains: ["gated.test"],
+      fingerprintGated: true,
+    });
+
+    const stamped = await gated.resolveLiveStream!(context(runCommand), { id: "alice", username: "alice", pageUrl: "https://gated.test/alice" });
+    expect(stamped.requiresTlsFingerprint).toBe(true);
+
+    const plain = await plugin.resolveLiveStream!(context(runCommand), { id: "alice", username: "alice", pageUrl: "https://live.test/alice" });
+    expect(plain.requiresTlsFingerprint).toBeUndefined();
+  });
 });
