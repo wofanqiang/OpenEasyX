@@ -19,8 +19,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from curl_cffi import requests
 
-# Headers the caller (the HLS proxy) needs to make its own decisions with.
-PASSTHROUGH_HEADERS = ("content-type", "content-range", "accept-ranges", "content-length")
+# Headers the caller (the HLS proxy) needs to make its own decisions with. content-length is
+# deliberately absent: the body goes back chunked, and a length header beside a chunked stream
+# makes strict clients (undici) reject the whole response.
+PASSTHROUGH_HEADERS = ("content-type", "content-range", "accept-ranges")
 CHUNK = 65536
 
 
