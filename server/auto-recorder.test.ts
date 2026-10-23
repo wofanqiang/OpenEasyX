@@ -35,9 +35,17 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
     },
   } as unknown as Database;
 
-  const record = vi.fn(async () => {
+  // Mirrors the real `LiveCamService.record`: the capture becomes a row immediately, so the next
+  // status pass must find it and leave the room alone. The harness has to model that or the
+  // watcher looks like it re-records the same room on every pass.
+  const record = vi.fn(async (_providerId: string, cam: { username: string }) => {
     const itemId = `item-${itemCounter++}`;
-    items.set(itemId, { status: "downloading" });
+    const room = cam.username.trim().toLowerCase();
+    items.set(itemId, { status: "queued" });
+    listedItems.push({
+      id: itemId, pluginId: "test.live", externalId: `auto-live:${room}:2026-09-15T12-00-00-000Z`,
+      status: "queued", metadata: { live: true, liveRoom: room },
+    });
     return { itemId, status: "queued" };
   });
   const cams: Array<Record<string, unknown>> = [];
@@ -94,6 +102,15 @@ async function fixture({ freeSpace: probe }: { freeSpace?: (dir: string) => Prom
   };
 }
 
+/** Ends a capture the way the database does: the item settles, and optionally frees the room. */
+function finishCapture(env: Harness, id: string, status: string, freeRoom = false) {
+  env.items.set(id, { status });
+  const listed = env.listedItems.find((entry) => entry.id === id);
+  if (!listed) return;
+  listed.status = status;
+  if (freeRoom) listed.captureEndedAt = "2026-09-15T12-00-30.000Z";
+}
+
 describe("auto recorder", () => {
   it("records an online auto-record favorite with the auto origin", async () => {
     const env: Harness = await fixture();
@@ -141,8 +158,7 @@ describe("auto recorder", () => {
       env.cams.push(makeCam());
       await env.recorder.tick();
       expect(env.record).toHaveBeenCalledTimes(1);
-      // Report the capture as still running, the way the queue would list it.
-      env.listedItems.push({ id: "item-0", pluginId: "test.live", externalId: "manual-live:alice:2026-10-21T00-00-00-000Z", status: "downloading", metadata: { live: true, liveRoom: "alice" } });
+      // `record` already listed the capture as an in-flight row, the way the queue would.
       env.autoRecordStatuses.mockClear();
       await env.recorder.tick();
       // The only armed room is being captured, so the provider is not questioned at all.
@@ -158,8 +174,6 @@ describe("auto recorder", () => {
       env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
       env.cams.push(makeCam());
       await env.recorder.tick();
-      env.listedItems.push({ id: "item-0", pluginId: "test.live", externalId: "manual-live:alice:2026-10-21T00-00-00-000Z", status: "downloading", metadata: { live: true, liveRoom: "alice" } });
-
       env.db.setLiveCamFavorite("test.live", { camId: "bob", username: "bob", pageUrl: "https://live.test/bob" }, true);
       env.db.setLiveCamFavoriteAutoRecord("test.live", "bob", true);
       env.cams.push(makeCam({ id: "bob", username: "bob", pageUrl: "https://live.test/bob" }));
@@ -194,7 +208,7 @@ describe("auto recorder", () => {
     } finally { env.cleanup(); }
   });
 
-  it("puts a cam on cooldown after its recording finishes instead of re-recording", async () => {
+  it("records the room again as soon as the previous capture ends and it is still public", async () => {
     const env: Harness = await fixture();
     try {
       env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
@@ -202,11 +216,11 @@ describe("auto recorder", () => {
       env.cams.push(makeCam());
       await env.recorder.tick();
       expect(env.record).toHaveBeenCalledTimes(1);
-      // The recording ends (db reports completed) while the cam still looks online.
-      env.items.set("item-0", { status: "completed" });
+      // The recording ends while the cam is still in a public show: the room is free again and
+      // the next pass starts a fresh one. There is no cooldown to wait out.
+      finishCapture(env, "item-0", "completed");
       await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-      expect(env.logs.some((line) => line.includes("enters cooldown"))).toBe(true);
+      expect(env.record).toHaveBeenCalledTimes(2);
     } finally { env.cleanup(); }
   });
 
@@ -234,58 +248,33 @@ describe("auto recorder", () => {
       await env.recorder.tick();
       expect(env.record).not.toHaveBeenCalled();
 
-      // When that capture ends, the room is still on air: the watcher must record it normally
-      // after the usual cooldown rather than treating the ended capture as its own recording.
+      // When that capture ends the room is still on air, so the watcher records it on the next
+      // pass instead of treating the ended capture as its own recording.
       env.listedItems.splice(0, env.listedItems.length);
       await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(1);
+    } finally { env.cleanup(); }
+  });
+
+  it("records nothing but a room the provider reports as public", async () => {
+    const env: Harness = await fixture();
+    try {
+      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
+      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
+      // A provider answers isOnline/isLive for a group show too (measured on Stripchat: 60 of 60
+      // rooms online, four of them groupShow), so the flag alone cannot be trusted. Nothing but
+      // an openly watchable show may start a capture.
+      env.cams.push(makeCam({ online: true, status: "groupShow" }));
+      await env.recorder.tick();
       expect(env.record).not.toHaveBeenCalled();
-      expect(env.logs.some((line) => line.includes("enters cooldown"))).toBe(true);
-    } finally { env.cleanup(); }
-  });
-
-  it("keeps a manually stopped cam paused until the room goes offline", async () => {
-    const env: Harness = await fixture();
-    try {
-      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      const cam = makeCam();
-      env.cams.push(cam);
+      env.cams.length = 0;
+      env.cams.push(makeCam({ online: true, status: "private" }));
+      await env.recorder.tick();
+      expect(env.record).not.toHaveBeenCalled();
+      env.cams.length = 0;
+      env.cams.push(makeCam({ online: true, status: "public" }));
       await env.recorder.tick();
       expect(env.record).toHaveBeenCalledTimes(1);
-
-      // The user stops the recording by hand while the room is still live.
-      env.recorder.suppress("test.live", "alice");
-      for (let attempt = 0; attempt < 3; attempt++) await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-      expect(env.logs.some((line) => line.includes("stays paused until the room goes offline"))).toBe(true);
-
-      // Going offline ends this session and lifts the pause.
-      cam.online = false;
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-      expect(env.logs.some((line) => line.includes("went offline"))).toBe(true);
-
-      // The next session records again immediately (no leftover cooldown).
-      cam.online = true;
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(2);
-    } finally { env.cleanup(); }
-  });
-
-  it("lifts the pause when the auto-record switch is enabled again", async () => {
-    const env: Harness = await fixture();
-    try {
-      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      env.cams.push(makeCam());
-      await env.recorder.tick();
-      env.recorder.suppress("test.live", "alice");
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-      expect(env.recorder.clearSuppression("test.live", "alice")).toBe(true);
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(2);
-      expect(env.recorder.clearSuppression("test.live", "alice")).toBe(false);
     } finally { env.cleanup(); }
   });
 
@@ -345,77 +334,30 @@ describe("auto recorder", () => {
     } finally { env.cleanup(); }
   });
 
-  it("backs off further for each consecutive failure instead of restarting forever", async () => {
-    // Only Date is faked: the recorder reads Date.now() for its cooldowns, and leaving the real
-    // timers in place keeps the recorder's unref'd setTimeout untouched.
+  it("starts a fresh capture on the very next pass after a failure, with no cooldown to wait out", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
     const env: Harness = await fixture();
     try {
       env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
       env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      // The room reports "live" but its capture always fails (e.g. no public stream).
+      // The room reports a public show but its capture keeps failing.
       env.cams.push(makeCam());
 
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-
-      // The first failure keeps the short cooldown, so a one-off blip still recovers quickly.
-      env.items.set("item-0", { status: "failed" });
-      await env.recorder.tick();
-      expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1); // held by the cooldown
-
-      vi.setSystemTime(new Date(Date.now() + 31_000));
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(2); // cooldown expired: retried
-
-      // A second failure in a row doubles the wait instead of restarting on the flat cooldown.
-      env.items.set("item-1", { status: "failed" });
-      await env.recorder.tick();
-      expect(env.logs.some((line) => line.includes("failed 2 captures in a row"))).toBe(true);
-
-      // 31s later the old flat 30s cooldown would already have fired; the escalated one has not.
-      vi.setSystemTime(new Date(Date.now() + 31_000));
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(2);
-
-      vi.setSystemTime(new Date(Date.now() + 30_000));
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(3); // past the 60s escalated wait
-    } finally { env.cleanup(); vi.useRealTimers(); }
-  });
-
-  it("re-checks a repeat-failing room within ten minutes instead of writing it off for an hour", async () => {
-    // A live capture is never retried by the download queue any more: the failure ends the item,
-    // frees its slot, and the room comes back here. What the waits below measure is therefore the
-    // liveness-probe cadence -- and it must stay short enough to catch a show that comes back.
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
-    const env: Harness = await fixture();
-    try {
-      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      env.cams.push(makeCam());
-
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-      const waits = [30_000, 60_000, 120_000, 240_000, 480_000, 600_000];
-      for (const [round, wait] of waits.entries()) {
-        env.items.set(`item-${round}`, { status: "failed" });
-        await env.recorder.tick(); // notices the failure and sets the wait
-        vi.setSystemTime(new Date(Date.now() + wait - 1_000));
-        await env.recorder.tick(); // one second early: still held
+      for (let round = 0; round < 4; round += 1) {
+        await env.recorder.tick();
         expect(env.record).toHaveBeenCalledTimes(round + 1);
+        // The capture fails and the room stays public: "should this be recording" is answered by
+        // the room's status, not by a timer, so the next pass starts another one immediately.
+        finishCapture(env, `item-${round}`, "failed");
         vi.setSystemTime(new Date(Date.now() + 1_000));
-        await env.recorder.tick(); // wait expired: the room is re-checked and recorded again
-        expect(env.record).toHaveBeenCalledTimes(round + 2);
       }
-      // The last wait is the 10-minute ceiling, not the hour a download would be given.
-      expect(env.logs.some((line) => line.includes("checking liveness again in 600s"))).toBe(true);
+      await env.recorder.tick();
+      expect(env.record).toHaveBeenCalledTimes(5);
+      expect(env.logs.some((line) => line.includes("cooldown"))).toBe(false);
     } finally { env.cleanup(); vi.useRealTimers(); }
   });
+
 
   it("stops calling a room busy once its capture has ended, even while it is still packaging", async () => {
     // The item stays `downloading` through concat/remux so the stall timer cannot kill a healthy
@@ -438,101 +380,20 @@ describe("auto recorder", () => {
       // Both captures' ffmpeg has exited; both items are still `downloading` while they pack.
       // Only alice's carries the capture-ended stamp, so only alice's room is free.
       for (const [id, username] of [[0, "alice"], [1, "bob"]]) {
-        env.items.set(`item-${id}`, { status: "downloading" });
-        env.listedItems.push({
-          id: `item-${id}`, pluginId: "test.live", externalId: `auto-live:${username}:2026-09-15T11-00-00-000Z`,
-          status: "downloading", metadata: { live: true, liveRoom: username },
-          ...(username === "alice" ? { captureEndedAt: "2026-09-15T12:00:30.000Z" } : {}),
-        });
+        const listed = env.listedItems.find((entry) => entry.id === `item-${id}`);
+        expect(listed?.metadata).toMatchObject({ liveRoom: username });
+        if (username === "alice") finishCapture(env, `item-${id}`, "downloading", true);
       }
 
       await env.recorder.tick();
-      // Alice's capture finished, so her room is free and her wait starts now -- not when the
-      // remux ends. Bob is still packaging, so he stays in flight and must not be re-recorded.
-      expect(env.logs.some((line) => line.includes("test.live:alice") && line.includes("enters cooldown"))).toBe(true);
-      expect(env.logs.some((line) => line.includes("test.live:bob") && line.includes("enters cooldown"))).toBe(false);
-      expect(env.record).toHaveBeenCalledTimes(2);
-
-      // Once the normal cooldown lapses, alice is recorded again; bob has still not finished.
-      vi.setSystemTime(new Date(Date.now() + 121_000));
-      await env.recorder.tick();
+      // Alice's capture ended, so her room is free right away and her next recording starts on
+      // this very pass -- not when the packaging finishes. Bob is still capturing, so he stays in
+      // flight: not re-recorded, and not even asked about.
       expect(env.record).toHaveBeenCalledTimes(3);
-      // ... and it is alice's room that got the slot, not bob's.
       expect((env.record.mock.calls[2] as unknown[])[1]).toMatchObject({ username: "alice" });
+      const recorded = env.record.mock.calls.map((call) => ((call as unknown[])[1] as { username?: string } | undefined)?.username);
+      expect(recorded.filter((name) => name === "bob")).toHaveLength(1);
     } finally { env.cleanup(); vi.useRealTimers(); }
   });
 
-  it("resets the failure backoff after a successful capture", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
-    const env: Harness = await fixture();
-    try {
-      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      env.cams.push(makeCam());
-
-      await env.recorder.tick();
-      env.items.set("item-0", { status: "failed" });
-      await env.recorder.tick();
-
-      vi.setSystemTime(new Date(Date.now() + 31_000));
-      await env.recorder.tick();
-      env.items.set("item-1", { status: "completed" }); // a capture that actually recorded
-      await env.recorder.tick();
-      expect(env.logs.some((line) => line.includes("enters cooldown"))).toBe(true);
-
-      // The next failure is graded as the first of a fresh streak, not the third in a row.
-      vi.setSystemTime(new Date(Date.now() + 121_000));
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(3);
-      env.items.set("item-2", { status: "failed" });
-      await env.recorder.tick();
-      expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
-    } finally { env.cleanup(); vi.useRealTimers(); }
-  });
-
-  it("caps the cooldown when a failure confirms the room is offline", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
-    const env: Harness = await fixture();
-    try {
-      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      // The status API still says "live", but the provider's own page proves otherwise.
-      env.cams.push(makeCam());
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-
-      env.items.set("item-0", { status: "failed", error: "The public room did not expose an HLS host" });
-      await env.recorder.tick();
-      expect(env.logs.some((line) => line.includes("confirmed-offline"))).toBe(true);
-
-      // Long past where the first-failure 30s cooldown would have fired: still held.
-      vi.setSystemTime(new Date(Date.now() + 10 * 60_000));
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(1);
-
-      // Past the 1h ceiling the room gets one more attempt (and the status cache, fed by the
-      // same verdict, is what should keep it quiet in production).
-      vi.setSystemTime(new Date(Date.now() + 61 * 60_000));
-      await env.recorder.tick();
-      expect(env.record).toHaveBeenCalledTimes(2);
-    } finally { env.cleanup(); vi.useRealTimers(); }
-  });
-
-  it("does not cap the cooldown for ordinary transient failures", async () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(new Date("2026-09-15T12:00:00.000Z"));
-    const env: Harness = await fixture();
-    try {
-      env.db.setLiveCamFavorite("test.live", { camId: "alice", username: "alice", pageUrl: "https://live.test/alice" }, true);
-      env.db.setLiveCamFavoriteAutoRecord("test.live", "alice", true);
-      env.cams.push(makeCam());
-      await env.recorder.tick();
-      env.items.set("item-0", { status: "failed", error: "ffmpeg was killed by a signal" });
-      await env.recorder.tick();
-      expect(env.logs.some((line) => line.includes("enters a short cooldown"))).toBe(true);
-      expect(env.logs.every((line) => !line.includes("confirmed-offline"))).toBe(true);
-    } finally { env.cleanup(); vi.useRealTimers(); }
-  });
 });

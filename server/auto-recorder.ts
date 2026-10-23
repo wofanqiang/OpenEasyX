@@ -2,51 +2,40 @@ import type { Database, DownloadItem } from "./database.js";
 import type { LiveCamService } from "./live-cams.js";
 import type { LiveCam } from "../packages/plugin-sdk/index.js";
 import { freeBytes, recordingDiskGuard, type FreeSpaceProbe } from "./disk-space.js";
-import { isOfflineConfirmedError } from "./offline-error.js";
 
 // Download statuses that mean "a recording for this cam is still in flight".
 // Mirrors the buckets used by Database.listItems(); kept local to avoid coupling.
 const ACTIVE_STATUSES = new Set(["queued", "downloading", "paused", "stopping", "cancelling"]);
-// After a recording ends, wait before auto-starting another one for the same cam so a
-// flapping online/offline edge (or a stale cached snapshot) cannot trigger a loop.
-// This watcher is also the ONLY thing that restarts a failed capture: the download queue never
-// retries a live item (a broadcast cannot be backfilled, and a retry sitting in the queue would
-// compete for a recording slot with rooms that are actually on air). A failed capture ends, its
-// slot frees, its room's cached status is dropped, and the room returns here -- so the wait below
-// is a liveness-probe cadence, not a retry timer.
-// The base cooldown is configurable (autoRecordCooldownSeconds); a failed capture starts on a
-// short abnormal cooldown and then doubles for each consecutive failure.
-// The escalation has to key off a failure *count*, not a short sliding window: a room that reports
-// "live" but never yields a recordable stream burns minutes per attempt (the download retries with
-// exponential backoff before failing), so a 3-failures-in-5-minutes rule can never fire and the
-// watcher would restart such a room forever on the flat cooldown.
-const COOLDOWN_FALLBACK_MS = 120_000;
-const ABNORMAL_COOLDOWN_MS = 30_000;
-// A failure this long after the previous one starts a fresh streak. It has to comfortably exceed the
-// cooldown cap above plus one capture attempt (minutes of download retries) so a streak is not
-// wiped by its own backoff; a cam that has been quiet for hours still starts fresh.
-const FAIL_STREAK_RESET_MS = 3 * 60 * 60_000;
-// Ceiling for the failure backoff: a persistently broken room is retried at most hourly.
-// Ceiling for the failure backoff of a room that keeps failing without the provider confirming it
-// is offline. Deliberately far below FAIL_COOLDOWN_CAP_MS: the download queue no longer retries a
-// live capture at all (see failureRetryPlan in downloader.ts), so this window is not a retry timer
-// but the cadence at which the watcher re-asks whether the room is on air. Ten minutes bounds the
-// upstream cost of a broken room while still catching a show that comes back quickly.
-const LIVE_PROBE_COOLDOWN_CAP_MS = 10 * 60_000;
-const FAIL_COOLDOWN_CAP_MS = 60 * 60_000;
+const LIVE_ITEM = /^(?:auto|manual)-live:([^:]+):/;
 // Settings bounds for the status-check interval (seconds).
 const INTERVAL = { min: 30, max: 3600, fallback: 60 };
-const LIVE_ITEM = /^(?:auto|manual)-live:([^:]+):/;
 
 export type AutoRecorder = {
   stop: () => void;
   tick: () => Promise<void>;
-  // A manual stop means "not this session": the cam stays paused until the room goes
-  // offline, so the watcher never fights the user by restarting the same broadcast.
-  suppress: (providerId: string, username: string) => void;
-  clearSuppression: (providerId: string, username: string) => boolean;
 };
 
+/**
+ * The auto-record watcher.
+ *
+ * One rule, asked once per interval: is this room in a public show? If it is, record it; if it is
+ * not, do nothing. There is no retry ladder and no cooldown between attempts, because the answer
+ * to "should this be recording" is the room's own status rather than a timer -- a room that
+ * finishes a session and is still public is recorded again on the next pass, and one that has
+ * gone private is simply skipped.
+ *
+ * The switch is the performer's auto-record flag: arming is the only thing that puts a room into
+ * this loop, and disarming is the only thing that takes it out. Stopping a recording by hand
+ * therefore disarms the performer (see `disarmAutoRecordForItem` in index.ts) instead of leaving
+ * behind a pause the user cannot see.
+ *
+ * Two guards remain, and neither of them delays a genuinely public room:
+ *  - a room already being captured is filtered out before the status call, so no provider request
+ *    is spent on a question whose answer cannot change anything;
+ *  - a room whose capture just failed with the provider's own "not live" verdict is reported
+ *    offline for ten minutes by the status cache (see `reportLiveFailure` in live-cams.ts), so a
+ *    status API that lags reality cannot make the watcher re-queue it every single minute.
+ */
 export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = freeBytes }: {
   db: Database;
   liveCams: LiveCamService;
@@ -58,16 +47,9 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
 }): AutoRecorder {
   // providerId:usernameLower -> itemId of the recording we are tracking.
   const active = new Map<string, { itemId: string }>();
-  const cooldowns = new Map<string, number>();
-  // providerId:usernameLower -> cams the user stopped by hand. Cleared once the room
-  // goes offline so the next session is recorded again.
-  const suppressed = new Set<string>();
   let running = false;
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
-  // Consecutive failed captures per cam, used to escalate the cooldown instead of restarting a
-  // broken room on the flat abnormal cooldown forever.
-  const failStreak = new Map<string, { count: number; at: number }>();
   // Tracks the disk guard so the log gets one line per transition, not one per tick.
   let diskPaused = false;
 
@@ -79,22 +61,6 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
     return Math.min(INTERVAL.max, Math.max(INTERVAL.min, raw));
   };
 
-  // Configurable base cooldown between auto-recordings of the same cam. Falls back to
-  // COOLDOWN_FALLBACK_MS when unset, and is clamped so a huge value cannot stall the watcher.
-  const cooldownMs = (): number => {
-    const raw = Number(db.getSettings().autoRecordCooldownSeconds);
-    if (!Number.isFinite(raw) || raw < 0) return COOLDOWN_FALLBACK_MS;
-    return Math.min(3600_000, raw * 1000);
-  };
-
-  // Reconcile the in-memory active set with the DB on every tick: recordings that were
-  // in flight when the process (re)started keep blocking new auto-starts for the same cam,
-  // and recordings that finished (or vanished) move their cam onto the cooldown list.
-  // A live item is identified by the same metadata the downloader keys on, with the
-  // external-id prefix kept as a fallback for rows written before that field existed. The room
-  // key covers every entry point, so a capture a scraper queued blocks an auto-start just like
-  // one the watcher itself started (it used to be invisible, which let the watcher stack a
-  // second recording onto the same broadcast).
   const isLiveItem = (item: DownloadItem) =>
     (item.metadata as Record<string, unknown> | undefined)?.live === true || LIVE_ITEM.test(item.externalId);
   const liveRoomOf = (item: DownloadItem): string | undefined => {
@@ -103,72 +69,35 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
     return (declared ?? LIVE_ITEM.exec(item.externalId)?.[1])?.trim().toLowerCase();
   };
 
+  // Reconcile the in-memory active set with the DB on every tick: recordings that are genuinely
+  // capturing, and nothing else. A capture whose ffmpeg has already exited is over as far as the
+  // room is concerned -- the item stays `downloading` while it is packaged, but that work no
+  // longer occupies the broadcast, so the room is free to be recorded again from that moment.
   const syncActive = () => {
     const liveKeys = new Map<string, string>();
     for (const item of db.listItems(300)) {
       if (!ACTIVE_STATUSES.has(item.status) || !isLiveItem(item)) continue;
-      // A capture whose ffmpeg has already exited is over as far as the room is concerned. The
-      // item stays `downloading` while it is packaged (concat / remux / re-encode), but that work
-      // no longer occupies the broadcast: the room may go live again and has to be recorded from
-      // that moment on. Ignoring it here is what moves the wait from the end of the remux -- which
-      // is minutes later on a multi-GB file -- back to the end of the capture, and it matches what
-      // the queue already does when it asks whether a room is free: `activeLiveItemForSource`
-      // filters on `capture_ended_at IS NULL`, so a new capture is allowed while the old one
-      // converts. Without this the watcher was the only thing still calling the room busy, so an
-      // automatic re-record waited out the whole packaging step that the queue had already
-      // stopped waiting for.
       if (item.captureEndedAt) continue;
       const room = liveRoomOf(item);
       if (room) liveKeys.set(`${item.pluginId}:${room}`, item.id);
     }
     for (const [key, itemId] of liveKeys) if (!active.has(key)) active.set(key, { itemId });
-    const now = Date.now();
-    for (const [key, entry] of [...active]) {
-      if (liveKeys.has(key)) continue;
-      active.delete(key);
-      // A manually stopped recording is guarded by the suppression flag, which is cleared
-      // by an offline transition. Adding a cooldown too would delay the next session.
-      if (suppressed.has(key)) {
-        log?.(`auto-record: recording ${entry.itemId} stopped by hand; ${key} stays paused until the room goes offline`);
-        continue;
-      }
-      // Grade the cooldown by how the recording ended. A failed run is "abnormal": the
-      // stream likely blipped, so a short cooldown lets a quick recovery retry soon without
-      // hammering a cam that is genuinely offline. Each additional failure in a row doubles the
-      // wait (capped), because a room that keeps reporting "live" without ever yielding a
-      // recordable capture would otherwise churn the queue at the flat cooldown forever.
-      const ended = db.getItem(entry.itemId);
-      const failed = ended?.status === "failed";
-      let until: number;
-      if (failed) {
-        const previous = failStreak.get(key);
-        const streak = previous && now - previous.at <= FAIL_STREAK_RESET_MS ? previous.count + 1 : 1;
-        failStreak.set(key, { count: streak, at: now });
-        // A provider-confirmed offline (the room page itself said so) is not a stream blip:
-        // starting the wait at the short abnormal cooldown would re-render the room page and
-        // re-fail every 30s. Jump straight to the back-off ceiling; the status-cache override
-        // (see live-cams.reportLiveFailure) keeps the poll from queueing one at all.
-        if (isOfflineConfirmedError(ended?.error)) {
-          until = now + FAIL_COOLDOWN_CAP_MS;
-          log?.(`auto-record: ${key} failed with a confirmed-offline error; cooling down ${Math.round(FAIL_COOLDOWN_CAP_MS / 60000)}m`);
-        } else if (streak === 1) {
-          until = now + Math.min(cooldownMs(), ABNORMAL_COOLDOWN_MS);
-          log?.(`auto-record: recording ${entry.itemId} failed; ${key} enters a short cooldown`);
-        } else {
-          until = now + Math.min(ABNORMAL_COOLDOWN_MS * 2 ** (streak - 1), LIVE_PROBE_COOLDOWN_CAP_MS);
-          log?.(`auto-record: ${key} has failed ${streak} captures in a row; checking liveness again in ${Math.round((until - now) / 1000)}s`);
-        }
-      } else {
-        failStreak.delete(key);
-        until = now + cooldownMs();
-        log?.(`auto-record: recording ${entry.itemId} finished; ${key} enters cooldown`);
-      }
-      cooldowns.set(key, until);
-    }
-    for (const [key, until] of cooldowns) if (until < now) cooldowns.delete(key);
-    // Drop streaks that have gone quiet so the map cannot grow unbounded across many cams, and so a
-    // cam that fails only rarely always restarts from the short first-failure cooldown.
-    for (const [key, entry] of failStreak) if (now - entry.at > FAIL_STREAK_RESET_MS) failStreak.delete(key);
+    for (const key of [...active.keys()]) if (!liveKeys.has(key)) active.delete(key);
+  };
+
+  /**
+   * Whether this room is in a public show right now.
+   *
+   * A provider that publishes a room status is trusted over its `online` flag: Stripchat answers
+   * `isOnline`/`isLive` for private and group-show rooms alike (measured: 60 of 60 rooms online,
+   * four of them `groupShow`), so the flag alone queues captures that can only fail. Where a
+   * provider has no status vocabulary, `online` stays the only signal -- and an uncertain status
+   * is still never good enough to start from.
+   */
+  const isPublicRoom = (cam: LiveCam): boolean => {
+    if (cam.statusUnavailable) return false;
+    if (cam.online === false) return false;
+    return cam.status === undefined || cam.status === "public";
   };
 
   const tick = async () => {
@@ -193,13 +122,11 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
         log?.(`auto-record: resumed; ${(disk.freeGb ?? 0).toFixed(2)} GB free on the media disk`);
       }
 
-      // Poll every favorite armed directly and every performer armed through its live-cam
-      // identity, so a performer without a saved favorite is recorded just the same.
-      //
-      // A room already being captured is filtered out here rather than after the status call:
-      // it cannot be started twice, so asking the provider about it is pure traffic. syncActive
-      // has just refreshed `active`, and it only holds genuinely capturing rooms (an entry whose
-      // capture already ended is released), so nothing live can be hidden by this filter.
+      // Poll every armed performer, resolved through its live-cam identities. A room already
+      // being captured is filtered out here rather than after the status call: it cannot be
+      // started twice, so asking the provider about it is pure traffic. syncActive has just
+      // refreshed `active`, and it only holds genuinely capturing rooms, so nothing live can be
+      // hidden by this filter.
       const byProvider = new Map<string, Array<{ username: string; pageUrl: string }>>();
       for (const target of liveCams.autoRecordTargets()) {
         if (active.has(keyOf(target.providerId, target.username))) continue;
@@ -211,8 +138,6 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
       for (const [providerId, targets] of byProvider) {
         let items: LiveCam[];
         try {
-          // Shares the per-cam status cache with the favorites path (getLiveCam TTL 60s), so the
-          // watcher adds no extra provider traffic beyond refreshing stale snapshots.
           const result = await liveCams.autoRecordStatuses(providerId, targets);
           if (!result.ok) {
             log?.(`auto-record: ${providerId} status check failed: ${result.error ?? "unknown error"}`);
@@ -228,19 +153,7 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
           if (!targets.some((target) => target.username.trim().toLowerCase() === usernameKey)) continue;
           const key = keyOf(providerId, cam.username);
           if (active.has(key)) continue;
-          if (suppressed.has(key)) {
-            // Only a real offline transition ends the current session; an uncertain
-            // status must not silently lift the pause the user asked for.
-            if (cam.online === false) {
-              suppressed.delete(key);
-              log?.(`auto-record: ${cam.username} went offline; auto-record resumes with the next session`);
-            }
-            continue;
-          }
-          if ((cooldowns.get(key) ?? 0) > Date.now()) continue;
-          // Never auto-start from an uncertain status; missing a few minutes is better
-          // than recording a room that is actually offline.
-          if (cam.online === false || cam.statusUnavailable) continue;
+          if (!isPublicRoom(cam)) continue;
           try {
             const { itemId } = await liveCams.record(providerId, cam, { origin: "auto" });
             active.set(key, { itemId });
@@ -270,24 +183,6 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
     timer.unref();
   };
 
-  const suppress = (providerId: string, username: string) => {
-    const key = keyOf(providerId, username);
-    suppressed.add(key);
-    log?.(`auto-record: manual stop for ${key}; skipped until the room goes offline`);
-  };
-
-  const clearSuppression = (providerId: string, username: string) => {
-    const key = keyOf(providerId, username);
-    if (!suppressed.delete(key)) return false;
-    log?.(`auto-record: ${key} pause lifted; auto-record can start again`);
-    return true;
-  };
-
   schedule();
-  return {
-    stop: () => { stopped = true; if (timer) clearTimeout(timer); timer = undefined; },
-    tick,
-    suppress,
-    clearSuppression,
-  };
+  return { stop: () => { stopped = true; if (timer) clearTimeout(timer); timer = undefined; }, tick };
 }

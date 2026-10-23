@@ -242,12 +242,17 @@ app.get("/api/auth/me", async (request, reply) => {
 function publicPerformer(performer: Performer) {
   return { ...performer, autoRecord: liveCams.performerAutoRecord(performer) };
 }
-// Stopping a live recording by hand means "not this session": the watcher keeps the cam
-// paused until the room goes offline instead of restarting the same broadcast.
-function pauseAutoRecordForItem(itemId: string) {
+// Stopping a live recording by hand means "not this room any more". The switch that put it on
+// air is the performer's auto-record flag, so stopping turns that flag off -- leaving a hidden
+// pause behind would have the watcher restart the same broadcast on its next pass, which is
+// exactly what the user just asked it not to do. Nothing records again until it is armed again.
+function disarmAutoRecordForItem(itemId: string) {
   const item = db.getItem(itemId);
-  const username = item ? /^(?:auto|manual)-live:([^:]+):/.exec(item.externalId)?.[1] : undefined;
-  if (item && username) autoRecorder.suppress(item.pluginId, username);
+  if (!item?.performerId) return;
+  const performer = db.getPerformer(item.performerId);
+  if (!performer?.autoRecord) return;
+  db.setPerformerAutoRecord(performer.id, false);
+  appLogger.info({ scope: "auto-record", performerId: performer.id }, `auto-record disarmed for ${performer.name}: the recording was stopped by hand`);
 }
 app.get("/api/dashboard", async () => ({ stats: db.stats(), performers: db.listPerformers().map(publicPerformer), sources: db.listSources(), items: db.listItems(30) }));
 app.get<{ Querystring: Record<string, string | undefined> }>("/api/logs", async (request) => {
@@ -427,7 +432,6 @@ app.patch<{ Body: unknown }>("/api/live-cams/favorites/auto-record", async (requ
   }).parse(request.body);
   const item = liveCams.setFavoriteAutoRecord(body.providerId, body.username, body.autoRecord);
   if (!item) throw Object.assign(new Error("Favorite not found"), { statusCode: 404 });
-  if (body.autoRecord) autoRecorder.clearSuppression(body.providerId, body.username);
   app.log.info({ scope: "auto-record", providerId: body.providerId, username: body.username }, body.autoRecord ? "Favorite auto-record enabled" : "Favorite auto-record disabled");
   return item;
 });
@@ -612,9 +616,6 @@ app.get<{ Params: { id: string } }>("/api/performers/:id", async (request) => {
 app.patch<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/auto-record", async (request) => {
   const body = z.object({ autoRecord: z.boolean() }).parse(request.body);
   const result = liveCams.setPerformerAutoRecord(request.params.id, body.autoRecord);
-  // Re-enabling the switch is an explicit request to record again, so lift any pause
-  // left behind by a manual stop.
-  if (body.autoRecord) for (const favorite of result.favorites) autoRecorder.clearSuppression(favorite.providerId, favorite.username);
   app.log.info({ scope: "auto-record", performerId: request.params.id, matched: result.matched }, body.autoRecord ? `Performer auto-record enabled (${result.matched} favorite${result.matched === 1 ? "" : "s"})` : "Performer auto-record disabled");
   return { performer: publicPerformer(result.performer), matched: result.matched };
 });
@@ -820,11 +821,11 @@ app.post<{ Params: { id: string } }>("/api/items/:id/queue", async (request) => 
 app.post<{ Params: { id: string } }>("/api/items/:id/pause", async (request) => queue.pause(request.params.id));
 app.post<{ Params: { id: string } }>("/api/items/:id/resume", async (request) => queue.resume(request.params.id));
 app.post<{ Params: { id: string } }>("/api/items/:id/stop", async (request) => {
-  pauseAutoRecordForItem(request.params.id);
+  disarmAutoRecordForItem(request.params.id);
   return queue.stopRecording(request.params.id);
 });
 app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) => {
-  pauseAutoRecordForItem(request.params.id);
+  disarmAutoRecordForItem(request.params.id);
   return queue.cancel(request.params.id);
 });
 app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queue.delete(request.params.id));

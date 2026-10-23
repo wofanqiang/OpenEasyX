@@ -160,6 +160,17 @@ export type LiveCam = {
   gender?: string;
   tags?: string[];
   online?: boolean;
+  /**
+   * The provider's own room status, when it publishes one.
+   *
+   * Only `"public"` means an openly watchable show that a recorder may capture. Everything else
+   * the providers name -- `private`, `groupShow`, `p2p`, `away`, `password`, `hidden`,
+   * `notconnected`, `offline` -- describes a room that is on air but has nothing to record, and
+   * Stripchat answers `isOnline: true` for all of them (measured: 60 of 60 rooms online, four of
+   * them `groupShow`), so the `online` flag alone cannot make that distinction. Providers with no
+   * such vocabulary leave this unset, and then `online` remains the only signal.
+   */
+  status?: string;
   statusUnavailable?: boolean;
 };
 

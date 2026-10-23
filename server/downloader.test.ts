@@ -507,12 +507,12 @@ describe("failureRetryPlan", () => {
     expect(failureRetryPlan("ETIMEDOUT", 5, download)).toEqual({ retry: false, delaySeconds: 0 });
   });
 
-  it("caps a live capture at one short reconnect, whatever the download settings say", () => {
-    // The broadcast keeps running while nothing is recorded, so the ladder's later steps are
-    // pure loss -- and each attempt re-resolves the room upstream.
-    expect(failureRetryPlan("ETIMEDOUT", 1, live)).toEqual({ retry: true, delaySeconds: 10 });
-    expect(failureRetryPlan("ETIMEDOUT", 2, live)).toEqual({ retry: false, delaySeconds: 0 });
-    expect(failureRetryPlan("ETIMEDOUT", 3, live)).toEqual({ retry: false, delaySeconds: 0 });
+  it("never retries a live capture, whatever the download settings say", () => {
+    // The broadcast keeps running while nothing is recorded, so any wait is pure loss -- and each
+    // attempt re-resolves the room upstream and holds a recording slot. The capture ends, frees
+    // its slot, and the watcher starts a fresh one if the room is still in a public show.
+    for (const attempt of [1, 2, 3]) expect(failureRetryPlan("ETIMEDOUT", attempt, live)).toEqual({ retry: false, delaySeconds: 0 });
+    expect(failureRetryPlan("ETIMEDOUT", 1, { ...live, maxAttempts: 32, baseSeconds: 1 })).toEqual({ retry: false, delaySeconds: 0 });
   });
 
   it("never retries a room the provider has already said is offline", () => {

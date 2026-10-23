@@ -223,7 +223,7 @@ function stripchatCams(payload: unknown, includeOffline: boolean): LiveCam[] {
     let thumbnailUrl = id && stamp ? `https://img.doppiocdn.net/snapshot/${id}/${stamp}` : text(item.previewUrlThumbBig ?? item.previewUrl ?? item.avatarUrl);
     if (thumbnailUrl?.startsWith("//")) thumbnailUrl = `https:${thumbnailUrl}`;
     else if (thumbnailUrl?.startsWith("/")) thumbnailUrl = `https://img.doppiocdn.net${thumbnailUrl}`;
-    return { id: username.toLowerCase(), username, title: text(item.groupShowTopic ?? item.name) ?? username, pageUrl: `https://stripchat.com/${encodeURIComponent(username)}`, thumbnailUrl, profileImageUrl: text(item.avatarUrl ?? item.profileImageUrl), viewers: online ? whole(item.viewersCount ?? item.viewers ?? item.usersCount) ?? 0 : 0, age: whole(item.age), gender, tags: tagList([gender, item.country, item.isHd ? "hd" : "", item.isVr ? "vr" : "", ...(Array.isArray(item.tags) ? item.tags : [])]), ...(includeOffline ? { online } : {}) } satisfies LiveCam;
+    return { id: username.toLowerCase(), username, title: text(item.groupShowTopic ?? item.name) ?? username, pageUrl: `https://stripchat.com/${encodeURIComponent(username)}`, thumbnailUrl, profileImageUrl: text(item.avatarUrl ?? item.profileImageUrl), viewers: online ? whole(item.viewersCount ?? item.viewers ?? item.usersCount) ?? 0 : 0, age: whole(item.age), gender, tags: tagList([gender, item.country, item.isHd ? "hd" : "", item.isVr ? "vr" : "", ...(Array.isArray(item.tags) ? item.tags : [])]), ...(includeOffline ? { online } : {}), ...(status ? { status } : {}) } satisfies LiveCam;
   }).filter((cam): cam is LiveCam => Boolean(cam)));
 }
 

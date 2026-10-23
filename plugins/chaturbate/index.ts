@@ -380,7 +380,7 @@ export default definePlugin({
     const username = text(room.broadcaster_username);
     if (username && username.toLowerCase() !== cam.username.toLowerCase()) throw new Error("Chaturbate returned a different room");
     const online = status === "public";
-    return { ...cam, online, statusUnavailable: false, title: text(room.room_title) ?? cam.title,
+    return { ...cam, online, status, statusUnavailable: false, title: text(room.room_title) ?? cam.title,
       viewers: online ? whole(room.num_viewers) ?? 0 : 0,
       gender: text(room.broadcaster_gender) ?? cam.gender,
       thumbnailUrl: cam.thumbnailUrl ?? `https://roomimg.stream.highwebmedia.com/ri/${encodeURIComponent(cam.username)}.jpg`,

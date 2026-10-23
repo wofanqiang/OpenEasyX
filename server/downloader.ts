@@ -58,15 +58,13 @@ const MAX_RECORDINGS = 32;
 // resolveLiveStallSeconds). Kept above the 15s ffmpeg read timeout in packages/live-capture.ts so
 // a reconnect attempt is always given time to land before the capture is written off.
 const LIVE_STALL_DEFAULT_SECONDS = 60;
-// Live captures do NOT use the download retry ladder. A broadcast cannot be backfilled, so the
-// five-step schedule (~930s by default) only guarantees that the rest of the show is lost, and
-// every attempt re-resolves the room upstream -- on a provider that rate-limits per IP, five
-// attempts per dead room starve the checks for the rooms that really are live. What is left is a
-// single short reconnect: it absorbs a stream blip without splitting the recording, and anything
-// longer than that is handed back to the auto-recorder's watcher, which re-asks the provider and
-// starts a fresh capture the moment the room is confirmed live again.
-const LIVE_RETRY_ATTEMPTS = 2;
-const LIVE_RETRY_BASE_SECONDS = 10;
+// Live captures do NOT use the download retry ladder, in fact they get no retry at all. A
+// broadcast cannot be backfilled, so the five-step schedule (~930s by default) only guarantees
+// that the rest of the show is lost, and every attempt re-resolves the room upstream -- on a
+// provider that rate-limits per IP, five attempts per dead room starve the checks for the rooms
+// that really are live. A failed capture ends, frees its slot, and is handed straight back to
+// the auto-recorder's watcher, which re-asks the provider and starts a fresh capture the moment
+// the room is in a public show again. See `failureRetryPlan`.
 // A stale staging directory that still holds media is worth rescuing (A10); anything else
 // in .downloads is scaffolding (sidecars, empty dirs) and is simply removed.
 const MEDIA_EXTENSIONS = new Set([".ts", ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".mp3", ".m4a", ".jpg", ".jpeg", ".png", ".webp"]);
@@ -182,22 +180,23 @@ export function requiresLiveProxy(stream: LiveStream): boolean {
  *
  * Downloads keep the operator's configured ladder because waiting is free for them: a stalled
  * fetch resumes from the byte offset it stopped at, and the media is still on the server.
- * A live capture is the opposite -- the broadcast keeps running while nothing is recorded, and
- * the ladder's later steps are minutes long. Live therefore gets a hard ceiling of a single
- * short reconnect, whatever the download settings say. A failure the provider has already
- * confirmed as "offline" gets no retry at all: there is nothing to reconnect to, and re-asking
- * only spends the provider budget the genuinely live rooms need.
+ *
+ * A live capture is never retried here. The broadcast keeps running while a retry waits, so
+ * every second of the backoff is content lost, and re-resolving the room spends the provider
+ * budget the genuinely live rooms need. Retrying would also hold a recording slot for a room
+ * that has just proved unrecordable. Restarting a capture is the watcher's job instead: once
+ * this attempt ends, the next status pass records the room again if it is still in a public
+ * show, which is both cheaper and driven by the provider's own answer rather than by a timer.
  */
 export function failureRetryPlan(
   message: string,
   attempts: number,
   options: { live: boolean; maxAttempts: number; baseSeconds: number },
 ): { retry: boolean; delaySeconds: number } {
-  if (options.live && isOfflineConfirmedError(message)) return { retry: false, delaySeconds: 0 };
+  if (options.live) return { retry: false, delaySeconds: 0 };
   if (retryDisposition(message, attempts) !== "retry") return { retry: false, delaySeconds: 0 };
-  const maxAttempts = options.live ? Math.min(options.maxAttempts, LIVE_RETRY_ATTEMPTS) : options.maxAttempts;
-  if (attempts >= maxAttempts) return { retry: false, delaySeconds: 0 };
-  const base = Math.max(1, options.live ? Math.min(options.baseSeconds, LIVE_RETRY_BASE_SECONDS) : options.baseSeconds);
+  if (attempts >= options.maxAttempts) return { retry: false, delaySeconds: 0 };
+  const base = Math.max(1, options.baseSeconds);
   return { retry: true, delaySeconds: Math.min(base * 2 ** (attempts - 1), 3600) };
 }
 
@@ -1274,13 +1273,13 @@ export class DownloadQueue {
     });
     // A deterministic HTTP failure (gone media, or a forbidden URL that already survived one
     // retry) must not burn the whole exponential-backoff schedule: fail it now so the slot
-    // frees up. A live capture never gets the full schedule at all (see failureRetryPlan).
+    // frees up. A live capture never enters this branch at all (see failureRetryPlan).
     if (plan.retry) {
       const delay = plan.delaySeconds * 1000;
       const jitter = Math.floor(Math.random() * Math.min(delay, 30_000));
       const nextRetryAt = new Date(Date.now() + delay + jitter).toISOString();
       this.db.scheduleRetry(itemId, message, attempts, nextRetryAt);
-      this.writeLog?.("warn", "download", "Download failed, scheduling automatic retry", { itemId, attempt: attempts, maxAttempts: live ? LIVE_RETRY_ATTEMPTS : settings.downloadRetryAttempts, nextRetryAt, error: message });
+      this.writeLog?.("warn", "download", "Download failed, scheduling automatic retry", { itemId, attempt: attempts, maxAttempts: settings.downloadRetryAttempts, nextRetryAt, error: message });
       return "retry";
     } else {
       const status = httpStatusFromError(message);
