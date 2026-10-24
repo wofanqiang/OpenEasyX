@@ -62,11 +62,15 @@
 .merge-selection svg{width:16px}
 .merge-modal{width:min(560px,100%)}
 .merge-order{list-style:none;margin:0;padding:0;max-height:min(46vh,340px);overflow:auto;border:1px solid #292930;border-radius:11px;background:#111115}
-.merge-order li{display:grid;grid-template-columns:26px minmax(0,1fr);align-items:center;gap:11px;padding:11px 13px;border-top:1px solid #222227}
+.merge-order li{display:grid;grid-template-columns:26px minmax(0,1fr) auto;align-items:center;gap:11px;padding:11px 13px;border-top:1px solid #222227}
 .merge-order li:first-child{border-top:0}
 .merge-order li>span{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:#232329;color:#9a9aa4;font:750 10px 'Manrope'}
 .merge-order li:first-child>span{background:rgba(84,156,255,.16);color:#8fb9ff}
 .merge-order li>div{min-width:0}
+.merge-move{display:flex;gap:5px}
+.merge-move button{width:25px;height:25px;padding:0;border:1px solid #2b2b33;border-radius:7px;background:#191920;color:#8b8b95;font-size:11px;line-height:1;display:grid;place-items:center;cursor:pointer}
+.merge-move button:hover:not(:disabled){background:#232329;color:#d2d2da}
+.merge-move button:disabled{opacity:.3;cursor:default}
 .merge-order strong{display:block;font-size:11px;font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .merge-order small{display:block;margin-top:3px;color:#6f6f79;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .merge-summary{margin:13px 0 0;color:#8b8b95;font-size:10px;line-height:1.6}

@@ -38,7 +38,7 @@ type OpenMedia = (media: Media, context?: PlaybackContext) => void;
 type DeletionResult = { deleted: Array<{ id: string; bytes: number; downloaderTracked: boolean }>; failed: Array<{ id: string; error: string }> };
 type DeleteMedia = (ids: string[]) => Promise<DeletionResult>;
 /** Submits a merge as a background job; the Activity page is where its progress lives. */
-type MergeMedia = (ids: string[], removeSources: boolean) => Promise<{ taskId: string }>;
+type MergeMedia = (ids: string[], removeSources: boolean, order?: string[]) => Promise<{ taskId: string }>;
 type MergeTask = { status: string; error?: string; result?: Record<string, unknown> };
 type Selection = { media: Media; context: PlaybackContext; autoStart: boolean };
 type LocationState = { pathname: string; search: string; state: EasyXLocationState | null };
@@ -261,8 +261,10 @@ export function LibraryApp() {
       return;
     }
   };
-  const mergeMedia: MergeMedia = async (ids, removeSources) => {
-    const result = await api<{ taskId: string }>("/api/media/merge", { method: "POST", body: JSON.stringify({ ids, removeSources }) });
+  const mergeMedia: MergeMedia = async (ids, removeSources, order) => {
+    // The order is sent explicitly: the dialog shows the operator the exact sequence, so the server
+    // joins exactly that. Without it the server falls back to its own content-date order.
+    const result = await api<{ taskId: string }>("/api/media/merge", { method: "POST", body: JSON.stringify({ ids, removeSources, ...(order ? { order } : {}) }) });
     setMergeLocks(new Set(ids));
     setNotice(`Merging ${ids.length} videos in the background — follow the progress on the Activity page.`);
     void watchMerge(result.taskId);
@@ -463,10 +465,10 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
     URL.revokeObjectURL(url);
     notice(`${selectedLinks.length} link${selectedLinks.length === 1 ? "" : "s"} exported.`);
   };
-  const submitMerge = async (removeSources: boolean) => {
+  const submitMerge = async (removeSources: boolean, order?: string[]) => {
     setMerging(true);
     try {
-      await merge(selectedVideos.map((item) => item.id), removeSources);
+      await merge(selectedVideos.map((item) => item.id), removeSources, order);
       setMergeOpen(false); setSelectionMode(false); setSelectedIds(new Set());
     } catch { /* the app-level notice reports the failure; the dialog and the selection stay put */ }
     finally { setMerging(false); }
@@ -512,13 +514,45 @@ export function ExportLinksButton({ count, disabled, onExport }: { count: number
 }
 
 /**
- * The merge confirmation. It shows the order that will be used (the library orders by ingest time,
- * so the operator can see what comes first), the total runtime, the exact target file name, and the
- * one irreversible choice: whether the originals go once the merged copy is safely in the library.
+ * The date a library row is ordered by: its content date, else the file's modified time, else when
+ * it was ingested. The ingest time is the last resort because a rescan rewrites it to the moment
+ * of the scan, which would order an imported library by import time instead of by content.
+ * Mirrors the server's rule so the list on screen is the list that gets merged.
  */
-function MergeDialog({ items, busy, close, submit }: { items: Media[]; busy: boolean; close: () => void; submit: (removeSources: boolean) => Promise<void> }) {
+export function mediaOrderKey(item: Media): number {
+  for (const value of [item.mediaDate, item.modifiedAt, item.addedAt]) {
+    const stamp = Date.parse(value ?? "");
+    if (Number.isFinite(stamp) && stamp > 0) return stamp;
+  }
+  return 0;
+}
+
+/** The merge order the dialog starts from: oldest content first, path as the tie-break. */
+export function orderedForMerge(items: Media[]): Media[] {
+  return [...items].sort((left, right) => mediaOrderKey(left) - mediaOrderKey(right) || left.relativePath.localeCompare(right.relativePath));
+}
+
+/** Move one item a place up or down. The ends do not move, and the list is left alone. */
+export function moveInOrder<T>(list: T[], index: number, delta: -1 | 1): T[] {
+  const target = index + delta;
+  if (!Number.isInteger(index) || index < 0 || index >= list.length || target < 0 || target >= list.length) return list;
+  const next = [...list];
+  const moved = next[index];
+  next[index] = next[target];
+  next[target] = moved;
+  return next;
+}
+
+/**
+ * The merge confirmation. It shows the order that will be used (the library orders by content
+ * date, so the operator can see what comes first), the total runtime, the exact target file name,
+ * and the one irreversible choice: whether the originals go once the merged copy is safely in the
+ * library. The order can be changed here: the join reads the files in the order listed, so the
+ * operator decides what comes first rather than the timestamps.
+ */
+export function MergeDialog({ items, busy, close, submit }: { items: Media[]; busy: boolean; close: () => void; submit: (removeSources: boolean, order: string[]) => Promise<void> }) {
   const [removeSources, setRemoveSources] = useState(false);
-  const ordered = [...items].sort((left, right) => (Date.parse(left.addedAt ?? "") || 0) - (Date.parse(right.addedAt ?? "") || 0) || left.relativePath.localeCompare(right.relativePath));
+  const [ordered, setOrdered] = useState<Media[]>(() => orderedForMerge(items));
   const totalSeconds = ordered.reduce((sum, item) => sum + (Number(item.duration) || 0), 0);
   const first = ordered[0];
   const extension = first ? first.relativePath.slice(first.relativePath.lastIndexOf(".")) || ".mp4" : ".mp4";
@@ -526,11 +560,11 @@ function MergeDialog({ items, busy, close, submit }: { items: Media[]; busy: boo
   return <div className="modal-backdrop elevated" onMouseDown={(event) => event.target === event.currentTarget && !busy && close()}><div className="modal merge-modal">
     <div className="modal-head"><div><p>MERGE VIDEOS</p><h2>Join {ordered.length} videos into one</h2></div><button className="icon-button" aria-label="Close" disabled={busy} onClick={close}><X/></button></div>
     <div className="form-stack">
-      <ol className="merge-order">{ordered.map((item, index) => <li key={item.id}><span>{index + 1}</span><div><strong>{item.title || item.relativePath}</strong><small>{item.performer}{item.duration ? ` · ${clockDuration(item.duration)}` : ""}</small></div></li>)}</ol>
+      <ol className="merge-order">{ordered.map((item, index) => <li key={item.id}><span>{index + 1}</span><div><strong>{item.title || item.relativePath}</strong><small>{item.performer}{item.duration ? ` · ${clockDuration(item.duration)}` : ""}</small></div><div className="merge-move"><button aria-label={`Move ${item.title || item.relativePath} up`} disabled={busy || index === 0} onClick={() => setOrdered(moveInOrder(ordered, index, -1))}>↑</button><button aria-label={`Move ${item.title || item.relativePath} down`} disabled={busy || index === ordered.length - 1} onClick={() => setOrdered(moveInOrder(ordered, index, 1))}>↓</button></div></li>)}</ol>
       <p className="merge-summary">Total <strong>{clockDuration(totalSeconds)}</strong>. Written next to the first video as <code>{stem}_merged{extension}</code>. The join is a stream copy: nothing is re-encoded and no audio or video is re-timed.</p>
       <label className="toggle-row"><span><b>Delete the originals after merging</b><small>Off by default. They are removed only once the merged file is on disk and in your library.</small></span><input type="checkbox" checked={removeSources} onChange={(event) => setRemoveSources(event.target.checked)}/></label>
     </div>
-    <div className="modal-actions"><button className="secondary" disabled={busy} onClick={close}>Cancel</button><button className="primary" disabled={busy} onClick={() => void submit(removeSources)}>{busy ? <LoaderCircle className="spin"/> : <Layers/>}Start merge</button></div>
+    <div className="modal-actions"><button className="secondary" disabled={busy} onClick={close}>Cancel</button><button className="primary" disabled={busy} onClick={() => void submit(removeSources, ordered.map((item) => item.id))}>{busy ? <LoaderCircle className="spin"/> : <Layers/>}Start merge</button></div>
   </div></div>;
 }
 

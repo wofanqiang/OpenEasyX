@@ -44,7 +44,7 @@ export type MergeDeps = {
   now?: () => number;
 };
 
-export type MergeRequest = { ids: string[]; removeSources?: boolean };
+export type MergeRequest = { ids: string[]; order?: string[]; removeSources?: boolean };
 
 export type MergeSummary = {
   mergedId: string;
@@ -63,11 +63,22 @@ function badRequest(message: string) {
 const labelOf = (media: Media): string => media.title || media.relativePath;
 const absolutePath = (mediaRoot: string, media: Media): string => path.join(mediaRoot, media.relativePath);
 
-/** Ingest order, oldest first: the merge reads in the order the files arrived and the first one
- *  decides both the destination folder and the media date the product inherits. */
-function ingestMs(media: Media): number {
-  const stamp = Date.parse(media.addedAt);
-  return Number.isFinite(stamp) ? stamp : 0;
+/**
+ * The date a library row is ordered by: its content date when the scan could derive one, else the
+ * file's own modified time, else the ingest time.
+ *
+ * `added_at` is the last resort on purpose. It is the only timestamp that is always present, but a
+ * rescan rewrites it to the moment of the scan, so a library that was copied in or re-indexed
+ * would order its files by when they were imported rather than by when they were recorded -- and
+ * a whole batch imported at once would fall back to the file path, which is an accident, not an
+ * order. The content date is what the library itself shows for a recording.
+ */
+function contentMs(media: Media): number {
+  for (const value of [media.mediaDate, media.modifiedAt, media.addedAt]) {
+    const stamp = Date.parse(value ?? "");
+    if (Number.isFinite(stamp) && stamp > 0) return stamp;
+  }
+  return 0;
 }
 
 /**
@@ -75,8 +86,13 @@ function ingestMs(media: Media): number {
  * the POST rather than as a failed job they have to go find on the Activity page. This covers
  * everything that can be answered without opening a file; the geometric/space checks need ffprobe
  * and stay in the worker.
+ *
+ * `order` is optional and explicit: it lists the videos to merge in the order they should be
+ * joined. Without it the order is the content-date order, which is what the page shows. With it,
+ * the caller decides -- and the order must name exactly the videos being merged, because a list
+ * that is short or long would silently merge something other than what the operator saw.
  */
-export function resolveMergeSources(deps: Pick<MergeDeps, "mediaRoot" | "library">, ids: string[]): Media[] {
+export function resolveMergeSources(deps: Pick<MergeDeps, "mediaRoot" | "library">, ids: string[], order?: string[]): Media[] {
   const unique = [...new Set(ids)];
   if (unique.length < 2) throw badRequest("Select at least two videos to merge");
   const videos: Media[] = [];
@@ -93,7 +109,17 @@ export function resolveMergeSources(deps: Pick<MergeDeps, "mediaRoot" | "library
     try { size = fs.statSync(absolutePath(deps.mediaRoot, media)).size; } catch { /* reported below */ }
     if (size <= 0) throw badRequest(`${labelOf(media)} is no longer on disk`);
   }
-  return videos.sort((left, right) => ingestMs(left) - ingestMs(right) || left.relativePath.localeCompare(right.relativePath));
+  if (order && order.length > 0) {
+    const requested = [...new Set(order)];
+    if (requested.length !== order.length) throw badRequest("The requested order lists the same video twice");
+    const known = new Set(videos.map((media) => media.id));
+    if (requested.length !== videos.length || requested.some((id) => !known.has(id))) {
+      throw badRequest("The requested order must list exactly the selected videos");
+    }
+    const byId = new Map(videos.map((media) => [media.id, media]));
+    return requested.map((id) => byId.get(id)!);
+  }
+  return [...videos].sort((left, right) => contentMs(left) - contentMs(right) || left.relativePath.localeCompare(right.relativePath));
 }
 
 /**
@@ -126,7 +152,7 @@ function cleanup(leftovers: string[], log?: MergeDeps["log"], reason?: string): 
  * the task, which is what the Activity page renders.
  */
 export function startMerge(deps: MergeDeps, request: MergeRequest): { taskId: string } {
-  const media = resolveMergeSources(deps, request.ids);
+  const media = resolveMergeSources(deps, request.ids, request.order);
   const removeSources = request.removeSources === true;
   const handle = deps.tasks.create({
     kind: "merge",
@@ -199,10 +225,13 @@ async function runMerge(deps: MergeDeps, handle: TaskHandle, media: Media[], rem
       throw new Error(`The merged file holds ${(merged?.duration ?? 0).toFixed(1)}s of the ${expectedSeconds.toFixed(1)}s its sources measured`);
     }
 
-    // 5. Stamp the product with the first source's media date BEFORE the scan, so the library
-    //    records the same content date a recording would. Its ingest time stays "now", which is
-    //    what the "recently added" order reads.
-    const date = new Date(ingestMs(media[0]) || (deps.now?.() ?? Date.now()));
+    // 5. Stamp the product with the content date of the EARLIEST source before the scan, so the
+    //    library records the same content date a recording would. Its ingest time stays "now",
+    //    which is what the "recently added" order reads. The earliest source is not necessarily
+    //    the first one: an explicit order can put a later recording in front, and the product still
+    //    belongs to the moment the broadcast started.
+    const earliest = media.reduce((best, item) => (contentMs(item) < contentMs(best) ? item : best), media[0]);
+    const date = new Date(contentMs(earliest) || (deps.now?.() ?? Date.now()));
     if (!Number.isNaN(date.valueOf())) { try { fs.utimesSync(target, date, date); } catch { /* mtime is cosmetic */ } }
 
     // 5b. A merged file has no download job, so the library cannot recover its title from the

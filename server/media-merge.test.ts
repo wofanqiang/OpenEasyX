@@ -150,6 +150,44 @@ describe("merge request validation", () => {
     // A single image among videos is not an error -- it is simply not a video.
     expect(() => resolveMergeSources({ mediaRoot: env.mediaDir, library: env.library }, [photo.id, addImage(env, "alice/two.jpg").id])).toThrow(/at least two videos/);
   });
+
+  it("orders by the content date, not by when the file was ingested", () => {
+    const env = seed();
+    // A library that was imported or rescanned: both rows were ingested at the same moment, but
+    // they were recorded a day apart. The content date is the one that tells them apart.
+    const imported = Date.UTC(2026, 8, 21, 12, 0, 0);
+    const older = addVideo(env, "alice/older.mp4", imported);
+    const newer = addVideo(env, "alice/newer.mp4", imported);
+    env.library.upsertMedia({ ...older, mediaDate: new Date(FIRST_AT).toISOString(), metadata: {}, scanId: "test-scan" });
+    env.library.upsertMedia({ ...newer, mediaDate: new Date(SECOND_AT).toISOString(), metadata: {}, scanId: "test-scan" });
+
+    const resolved = resolveMergeSources({ mediaRoot: env.mediaDir, library: env.library }, [newer.id, older.id]);
+    expect(resolved.map((media) => media.relativePath)).toEqual(["alice/older.mp4", "alice/newer.mp4"]);
+  });
+
+  it("joins in the order the caller asked for", () => {
+    const env = seed();
+    const one = addVideo(env, "alice/one.mp4", FIRST_AT);
+    const two = addVideo(env, "alice/two.mp4", SECOND_AT);
+    const deps = { mediaRoot: env.mediaDir, library: env.library };
+
+    const resolved = resolveMergeSources(deps, [one.id, two.id], [two.id, one.id]);
+    expect(resolved.map((media) => media.id)).toEqual([two.id, one.id]);
+  });
+
+  it("refuses an order that is not exactly the selected videos", () => {
+    const env = seed();
+    const one = addVideo(env, "alice/one.mp4", FIRST_AT);
+    const two = addVideo(env, "alice/two.mp4", SECOND_AT);
+    const three = addVideo(env, "alice/three.mp4", SECOND_AT);
+    const deps = { mediaRoot: env.mediaDir, library: env.library };
+
+    // A list that names a video nobody selected, and one that leaves a selected video out, would
+    // both merge something other than what the operator saw.
+    expect(() => resolveMergeSources(deps, [one.id, two.id], [one.id, three.id])).toThrow(/exactly the selected videos/);
+    expect(() => resolveMergeSources(deps, [one.id, two.id], [one.id])).toThrow(/exactly the selected videos/);
+    expect(() => resolveMergeSources(deps, [one.id, two.id], [one.id, one.id])).toThrow(/twice/);
+  });
 });
 
 describe("startMerge", () => {
@@ -191,6 +229,30 @@ describe("startMerge", () => {
     expect(reported.length).toBeGreaterThan(0);
     expect(Math.max(...reported)).toBeGreaterThan(0.5);
     expect(env.tasks.activeSourceIds()).toEqual([]);
+  });
+
+  it("joins the files in the order the caller asked for", async () => {
+    const env = seed();
+    const one = addVideo(env, "alice/one.mp4", FIRST_AT);
+    const two = addVideo(env, "alice/two.mp4", SECOND_AT);
+    let joined: string[] = [];
+    const { deps } = await mergeDeps(env, {
+      // Stands in for ffmpeg: it reads the list the merge wrote -- that list is what ffmpeg is
+      // told to join, in that order -- and leaves a file behind, which the post-condition checks.
+      probe: async () => ({ duration: 1, signature: "h264|aac" }),
+      concat: async (listPath, output) => {
+        joined = fs.readFileSync(listPath, "utf8").trim().split("\n").map((line) => path.basename(line.replace(/^file '/, "").replace(/'$/, "")));
+        fs.writeFileSync(output, "merged");
+      },
+    });
+
+    const task = await settle(env.tasks, startMerge(deps, { ids: [one.id, two.id], order: [two.id, one.id] }).taskId);
+    expect(task.status).toBe("done");
+    expect(joined).toEqual(["two.mp4", "one.mp4"]);
+    // The product still belongs to the moment the broadcast started, not to the first file joined.
+    const merged = path.join(env.mediaDir, "alice", "two_merged.mp4");
+    expect(fs.existsSync(merged)).toBe(true);
+    expect(fs.statSync(merged).mtimeMs).toBe(FIRST_AT);
   });
 
   it("refuses videos that do not share one stream layout and leaves no partial file", async () => {

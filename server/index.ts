@@ -837,9 +837,12 @@ app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queu
 // Merge several library videos into one file. The work runs as a background job (see
 // server/media-merge.ts) so the request returns immediately; progress shows up on the Activity page
 // beside the recordings. Everything that can be checked without ffprobe still answers as a 400 here.
-app.post<{ Body: { ids?: unknown; removeSources?: unknown } }>("/api/media/merge", async (request) => {
+app.post<{ Body: { ids?: unknown; order?: unknown; removeSources?: unknown } }>("/api/media/merge", async (request) => {
   const body = z.object({
     ids: z.array(z.string().regex(/^[a-f0-9]{24}$/)).min(2).max(100),
+    // Optional and explicit: the order the videos are joined in. It has to name exactly the
+    // selected videos, so a stale or partial list is refused instead of merging something else.
+    order: z.array(z.string().regex(/^[a-f0-9]{24}$/)).min(2).max(100).optional(),
     removeSources: z.boolean().optional(),
   }).parse(request.body);
   return startMerge({
@@ -852,7 +855,7 @@ app.post<{ Body: { ids?: unknown; removeSources?: unknown } }>("/api/media/merge
     removeSource: (media) => { const result = catalog.deleteMedia(media); db.markStoredItemDeleted(media.relativePath); return result; },
     minFreeDiskGb: Number(db.getSettings().minFreeDiskGb),
     log: (message, fields) => app.log.info({ scope: "media-merge", ...fields }, message),
-  }, { ids: body.ids, removeSources: body.removeSources });
+  }, { ids: body.ids, order: body.order, removeSources: body.removeSources });
 });
 
 // Residual TS recovery (Recovery page under COLLECT). A dry run still answers synchronously because
