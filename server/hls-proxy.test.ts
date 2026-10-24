@@ -67,12 +67,34 @@ describe("hls proxy routing", () => {
   });
 
   // CamSoda's edge answers 403 to a plain fetch and 200 to a Chrome TLS fingerprint for the very
-  // same URL. The proxy is built with whichever client can reach the provider (see
-  // tls-fingerprint.ts), which is what makes a fingerprint-gated capture possible at all.
-  it("reaches an upstream only the fingerprint client can", async () => {
-    const plain = new HlsProxy(async () => new Response("forbidden", { status: 403, headers: { "content-type": "text/plain" } }));
-    const fingerprinted = new HlsProxy(async () => new Response("#EXTM3U\n#EXTINF:2\n", { status: 200, headers: { "content-type": "application/vnd.apple.mpegurl" } }));
+  // same URL, and its plugin stamps `requiresTlsFingerprint` to say so. The fingerprint client
+  // costs several times what a plain fetch costs, so it is spent per stream: a provider that never
+  // asked for it records through the plain client even when both are wired in.
+  it("spends the fingerprint client only on streams that asked for it", async () => {
+    const playlist = () => new Response("#EXTM3U\n#EXTINF:2,\nhttps://cdn.test/media.ts\n", { status: 200, headers: { "content-type": "application/vnd.apple.mpegurl" } });
+    const calls: string[] = [];
+    const plain = async () => { calls.push("plain"); return playlist(); };
+    const fingerprinted = async () => { calls.push("fingerprinted"); return playlist(); };
+    const proxy = new HlsProxy(plain, fingerprinted);
 
+    const { reply, body } = fakeReply();
+    const gated = proxy.register({ url: "https://cdn.test/gated.m3u8", requiresTlsFingerprint: true });
+    await proxy.serve(gated.replace(LIVE_PROXY_PREFIX, ""), reply, {});
+    expect(body()).toContain("#EXTM3U");
+    // A rewritten playlist hands out child entries that inherit the stream's client choice, so the
+    // next hop keeps using the client that can actually reach the provider.
+    const nested = body().split("\n").find((line) => line.trim() && !line.startsWith("#"));
+    await proxy.serve(nested!.replace(LIVE_PROXY_PREFIX, ""), reply, {});
+    expect(body()).toContain("#EXTM3U");
+
+    await proxy.serve(proxy.register({ url: "https://cdn.test/open.m3u8" }).replace(LIVE_PROXY_PREFIX, ""), reply, {});
+    expect(body()).toContain("#EXTM3U");
+
+    expect(calls).toEqual(["fingerprinted", "fingerprinted", "plain"]);
+  });
+
+  it("answers 403 with what the provider said when the client cannot reach it", async () => {
+    const plain = new HlsProxy(async () => new Response("forbidden", { status: 403, headers: { "content-type": "text/plain" } }));
     const state: { status?: number } = {};
     const statusReply = {
       status: (code: number) => { state.status = code; return statusReply; },
@@ -80,9 +102,5 @@ describe("hls proxy routing", () => {
     };
     await plain.serve(plain.register({ url: "https://cdn.test/gated.m3u8" }).replace(LIVE_PROXY_PREFIX, ""), statusReply as unknown as FastifyReply, {});
     expect(state.status).toBe(403);
-
-    const { reply, body } = fakeReply();
-    await fingerprinted.serve(fingerprinted.register({ url: "https://cdn.test/gated.m3u8" }).replace(LIVE_PROXY_PREFIX, ""), reply, {});
-    expect(body()).toContain("#EXTM3U");
   });
 });

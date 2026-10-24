@@ -8,8 +8,12 @@ import { fileURLToPath } from "node:url";
  * Some live CDNs gate on the client's TLS fingerprint instead of headers or cookies: CamSoda's
  * edge answers 403 to ffmpeg's OpenSSL stack for the very URL that answers 200 through
  * curl_cffi's Chrome impersonation -- measured, playlist and segments alike, headers identical.
- * ffmpeg cannot impersonate, so the HLS proxy forwards those fetches to a small persistent
- * Python helper (server/tls_fetch.py) that can. One process serves everything: spawning Python
+ * ffmpeg cannot impersonate, so the HLS proxy forwards *fingerprint-gated* fetches here -- and
+ * only those: the proxy holds both clients and spends this one on streams whose plugin stamped
+ * `requiresTlsFingerprint`, because impersonating a stream that never needed it costs several
+ * times what the plain fetch costs, on every byte of the recording.
+ * A small persistent
+ * Python helper (server/tls_fetch.py) serves them. One process serves everything: spawning Python
  * per segment would cost more than the segment on a single-core host.
  *
  * When the helper cannot run at all -- no Python, no curl_cffi, a dev box -- every call falls

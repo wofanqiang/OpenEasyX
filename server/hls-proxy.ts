@@ -21,7 +21,7 @@ import type { LiveStream } from "../packages/plugin-sdk/index.js";
  * URLs handed to a player or a recorder are safe to treat as capabilities.
  */
 
-type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; expiresAt: number };
+type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; fingerprint?: boolean; expiresAt: number };
 
 const ENTRY_TTL_MS = 15 * 60_000;
 const PLAYLIST_MIME = "application/vnd.apple.mpegurl";
@@ -51,7 +51,14 @@ export class HlsProxy {
   private entries = new Map<string, ProxyEntry>();
   private reverse = new Map<string, string>();
 
-  constructor(private readonly request: typeof fetch = fetch) {}
+  /**
+   * `request` is what every proxied fetch leaves through. `fingerprinted` is the Chrome-impersonating
+   * client (see tls-fingerprint.ts) and is spent only on streams whose plugin declared them
+   * fingerprint-gated: it costs several times what a plain fetch costs, and routing a provider that
+   * answers plain fetches through Python's curl_cffi taxes every byte of the recording for nothing
+   * (measured: 13% of one core for a Chaturbate capture that needs no fingerprint at all).
+   */
+  constructor(private readonly request: typeof fetch = fetch, private readonly fingerprinted?: typeof fetch) {}
 
   /**
    * Wrap a resolved stream in a proxy URL. A stream that carries both a video and an audio
@@ -59,16 +66,17 @@ export class HlsProxy {
    */
   register(stream: LiveStream): string {
     const decodeKey = stream.playlistDecodeKey;
+    const fingerprint = stream.requiresTlsFingerprint === true;
     if (stream.audioUrl) {
-      const videoUrl = this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey);
-      const audioUrl = this.url(stream.audioUrl, stream.headers ?? {}, ".m3u8", decodeKey);
+      const videoUrl = this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint);
+      const audioUrl = this.url(stream.audioUrl, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint);
       return this.body([
         "#EXTM3U", "#EXT-X-VERSION:6",
         `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="${audioUrl}"`,
         "#EXT-X-STREAM-INF:BANDWIDTH=6500000,AUDIO=\"audio\"", videoUrl, "",
       ].join("\n"), ".m3u8");
     }
-    return this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey);
+    return this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint);
   }
 
   /** Register a literal playlist body, for the synthesized master above. */
@@ -82,9 +90,9 @@ export class HlsProxy {
    * Proxy one URL. Identical (url, headers) pairs reuse a token so a playlist the client
    * refetches every few seconds does not leak a new entry per refresh.
    */
-  url(target: string, headers: Record<string, string>, suffix = "", decodeKey?: string): string {
+  url(target: string, headers: Record<string, string>, suffix = "", decodeKey?: string, fingerprint = false): string {
     this.prune();
-    const key = JSON.stringify([target, Object.entries(headers).sort(), suffix, decodeKey ?? ""]);
+    const key = JSON.stringify([target, Object.entries(headers).sort(), suffix, decodeKey ?? "", fingerprint]);
     const existingToken = this.reverse.get(key);
     const existing = existingToken ? this.entries.get(existingToken) : undefined;
     if (existing && existing.expiresAt > Date.now()) {
@@ -92,7 +100,7 @@ export class HlsProxy {
       return `${LIVE_PROXY_PREFIX}${existingToken}${suffix}`;
     }
     const token = randomBytes(24).toString("base64url");
-    this.entries.set(token, { url: target, headers, decodeKey, expiresAt: Date.now() + ENTRY_TTL_MS });
+    this.entries.set(token, { url: target, headers, decodeKey, fingerprint, expiresAt: Date.now() + ENTRY_TTL_MS });
     this.reverse.set(key, token);
     return `${LIVE_PROXY_PREFIX}${token}${suffix}`;
   }
@@ -110,7 +118,7 @@ export class HlsProxy {
     for (const key of FORWARDED_QUERY) { const value = text(query[key]); if (value) sourceUrl.searchParams.set(key, value); }
 
     let response: Response;
-    try { response = await this.fetchUpstream(sourceUrl, entry.headers, range); }
+    try { response = await this.fetchUpstream(sourceUrl, entry.headers, range, entry.fingerprint ? this.fingerprinted : undefined); }
     catch (error) {
       return reply.status(502).send({ error: `Upstream live provider unreachable: ${error instanceof Error ? error.message : String(error)}` });
     }
@@ -134,7 +142,7 @@ export class HlsProxy {
       // a base to resolve relative addresses against, the rewrite below cannot work at all.
       const baseUrl = response.url || sourceUrl.toString();
       return reply.status(response.status).type(PLAYLIST_MIME)
-        .send(this.rewrite(playlist, baseUrl, entry.headers, entry.decodeKey));
+        .send(this.rewrite(playlist, baseUrl, entry.headers, entry.decodeKey, entry.fingerprint));
     }
     // Media segments are opaque binary. Stream them straight through with no buffering and no
     // disk writes so playback stays real-time instead of waiting for each segment to land on
@@ -157,13 +165,13 @@ export class HlsProxy {
    * a player will actually fetch. The decode key propagates to every nested playlist, because
    * a master's variants are protected by the same challenge as its segments.
    */
-  private rewrite(body: string, sourceUrl: string, headers: Record<string, string>, decodeKey?: string): string {
+  private rewrite(body: string, sourceUrl: string, headers: Record<string, string>, decodeKey?: string, fingerprint = false): string {
     const coerced = decodeKey ? coerceMouflonPlaylist(body, decodeKey) : body;
     const proxied = (raw: string) => {
       const absolute = new URL(raw, sourceUrl).toString();
       let suffix = "";
       try { const ext = new URL(absolute).pathname.match(/\.[a-z0-9]{1,8}$/i)?.[0]; if (ext) suffix = ext; } catch { /* Keep the token extensionless. */ }
-      return this.url(absolute, headers, suffix, decodeKey);
+      return this.url(absolute, headers, suffix, decodeKey, fingerprint);
     };
     return coerced.split(/\r?\n/).map((line) => {
       if (!line) return line;
@@ -172,11 +180,12 @@ export class HlsProxy {
     }).join("\n");
   }
 
-  private async fetchUpstream(url: URL, headers: Record<string, string>, range: string | undefined): Promise<Response> {
+  private async fetchUpstream(url: URL, headers: Record<string, string>, range: string | undefined, fingerprinted?: typeof fetch): Promise<Response> {
+    const request = fingerprinted ?? this.request;
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        return await this.request(url, { headers: { ...headers, ...(range ? { range } : {}) }, signal: AbortSignal.timeout(60_000) });
+        return await request(url, { headers: { ...headers, ...(range ? { range } : {}) }, signal: AbortSignal.timeout(60_000) });
       } catch (error) {
         lastError = error;
         if (attempt < 2) await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1000 * (attempt + 1)); timer.unref?.(); });

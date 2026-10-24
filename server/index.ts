@@ -73,7 +73,7 @@ const selfOrigin = process.env.EASYX_SELF_ORIGIN ?? `http://127.0.0.1:${port}`;
 // The live proxy fetches upstream with a Chrome TLS fingerprint where that is possible (see
 // tls-fingerprint.ts): some CDNs answer 403 to ffmpeg's OpenSSL stack no matter the headers, and
 // both the player and the recorder reach providers only through this proxy.
-const liveProxy = new HlsProxy(fingerprintedFetch);
+const liveProxy = new HlsProxy(fetch, fingerprintedFetch);
 const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
 const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); }, liveProxy);
 const queue = new DownloadQueue(
