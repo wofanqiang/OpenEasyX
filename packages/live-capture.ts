@@ -10,8 +10,17 @@ const FFMPEG_CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
  */
 const LIVE_READ_TIMEOUT_US = 15_000_000;
 
-/** File name of the synthesized master playlist a single-input capture reads. */
-export const LIVE_MASTER_PLAYLIST = "capture.master.m3u8";
+/**
+ * Marker written next to a capture that ffmpeg fed from a single input.
+ *
+ * The remux falls back to comparing the container's video and audio start times when nothing
+ * measured the offset, and that comparison is meaningless on a single-input capture: the two
+ * streams legitimately begin at different instants (each rendition's first segment covers a
+ * different slice of the same timeline), so the difference is a head length, not a skew. Applying
+ * it would shift an already-aligned track. No file means "not known to be single input", which is
+ * exactly when the historical comparison is still the right guess.
+ */
+export const SINGLE_INPUT_MARKER = "capture.single-input";
 
 /**
  * How a direct capture feeds ffmpeg.
@@ -24,7 +33,7 @@ export const LIVE_MASTER_PLAYLIST = "capture.master.m3u8";
 export type DirectCaptureInput = "split" | "master";
 
 /**
- * Whether to capture a stream through one synthesized master playlist instead of two inputs.
+ * Whether a stream should be captured through one master playlist instead of two inputs.
  *
  * Two independent inputs each start at their own live edge, and the two renditions' segments are
  * not the same length, so "three segments before the end" lands at two different instants and the
@@ -33,15 +42,19 @@ export type DirectCaptureInput = "split" | "master";
  * the source-side PROGRAM-DATE-TIME and shifts the audio back at remux time.
  *
  * A single master input removes the cause: one demuxer, one timeline, the audio group aligned by
- * the playlist itself -- exactly what a browser player does. The offset measurement then has
- * nothing to correct, and the remux no longer needs to re-encode the audio to apply a shift.
+ * the playlist itself -- exactly what a browser player does. Measured on a 30s capture:
+ * PTS(first audio) - PTS(first video) equalled PDT(first audio segment) - PDT(first video segment)
+ * to within one frame, so identical wall-clock moments keep identical timestamps. The offset
+ * measurement then has nothing to correct, and the remux no longer re-encodes the audio to apply
+ * a shift.
  *
- * Only two things can make that impossible, so only those two fall back to `split`:
+ * The master itself is not a file: ffmpeg refuses `-user_agent`/`-headers` on a local input and
+ * then finds no streams in it at all. It is the app's HLS proxy, which already synthesizes exactly
+ * this playlist for the browser preview -- the recorder points ffmpeg at the same URL.
+ *
+ * Only two things can make a single input pointless, so only those two stay on `split`:
  *  - no separate audio rendition (nothing to align),
- *  - no master playlist to write, which is what `audioUrl` missing means here.
- *
- * A proxied stream never reaches this decision: the HLS proxy already synthesizes a master, and
- * the capture is handed that single URL.
+ *  - no proxy to serve the master, which is the caller's business (`rewrite` returns nothing).
  */
 export function chooseDirectCaptureInput(stream: LiveStream, preference: string | undefined): DirectCaptureInput {
   if (preference !== "master" && preference !== "auto") return "split";
@@ -60,20 +73,6 @@ export function captureInputPreference(settingValue: unknown, envValue: string |
     return text === "split" || text === "master" || text === "auto" ? text : undefined;
   };
   return known(envValue) ?? known(settingValue) ?? "split";
-}
-
-/** The master playlist that turns two rendition URLs into one input. */
-export function liveMasterPlaylist(stream: LiveStream): string | undefined {
-  if (!stream.audioUrl) return undefined;
-  return [
-    "#EXTM3U",
-    "#EXT-X-VERSION:6",
-    // BANDWIDTH is a placeholder: there is one variant, so nothing selects between them.
-    `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="${stream.audioUrl}"`,
-    '#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO="audio"',
-    stream.url,
-    "",
-  ].join("\n");
 }
 
 /**
@@ -173,10 +172,11 @@ export function isLiveCandidate(candidate: MediaCandidate): boolean {
 }
 
 /**
- * @param rewrite  Optional hook that replaces the stream's address before ffmpeg sees it. A
- *   provider whose playlist is obfuscated (or needs private headers) cannot be recorded
- *   directly: ffmpeg parses the playlist as written and fetches the decoys. The server's HLS
- *   proxy rewrites it on the way through, so callers that have one pass a hook here. The
+ * @param rewrite  Optional hook that replaces the stream's address before ffmpeg sees it. Two
+ *   callers need it. A provider whose playlist is obfuscated (or needs private headers) cannot be
+ *   recorded directly: ffmpeg parses the playlist as written and fetches the decoys, so the server's
+ *   HLS proxy rewrites it on the way through. And a `master` capture is served the same way, because
+ *   the proxy already synthesizes the master playlist that unifies the two renditions. Either way the
  *   proxied address carries no headers of its own - the proxy replays the provider's.
  */
 export async function liveRecordingRequest(
@@ -184,7 +184,6 @@ export async function liveRecordingRequest(
   context: PluginContext,
   item: MediaCandidate,
   rewrite?: (stream: LiveStream) => string | undefined,
-  options: { captureInput?: string } = {},
 ): Promise<CommandDownloadRequest | undefined> {
   const meta = item.metadata as Record<string, unknown> | undefined;
   if (meta?.live !== true || !plugin.resolveLiveStream) return undefined;
@@ -205,24 +204,13 @@ export async function liveRecordingRequest(
     const referer = proxied ? undefined : liveReferer(pageUrl);
     const filename = item.filename ?? `${item.externalId}.mp4`;
     if (proxied) {
-      // The proxy's own master already names both renditions, so this is a single input too.
-      return ffmpegLiveCaptureCommand({ url: proxied }, { referer, output: "{outputDir}/capture.ts", filename });
+      // One input: the proxy's master (when it has one) names both renditions, so a single demuxer
+      // owns the timeline. The remux is told, because it must not read that as an offset.
+      return { ...ffmpegLiveCaptureCommand({ url: proxied }, { referer, output: "{outputDir}/capture.ts", filename }), captureInput: "master" };
     }
-    if (chooseDirectCaptureInput(stream, options.captureInput) === "master") {
-      const content = liveMasterPlaylist(stream);
-      if (content) {
-        return {
-          ...ffmpegLiveCaptureCommand(
-            // The headers still apply: ffmpeg now fetches BOTH renditions as segments of this one
-            // input, so it has to carry the provider's referer/cookies just as the two-input form did.
-            { url: `{outputDir}/${LIVE_MASTER_PLAYLIST}`, headers: stream.headers },
-            { referer, output: "{outputDir}/capture.ts", filename },
-          ),
-          supportFiles: [{ name: LIVE_MASTER_PLAYLIST, content }],
-        };
-      }
-    }
-    return ffmpegLiveCaptureCommand(stream, { referer, output: "{outputDir}/capture.ts", filename });
+    // A live capture always states how it feeds ffmpeg, so the downloader can write (or clear) the
+    // marker the remux reads. `split` is the two-input command with one demuxer per rendition.
+    return { ...ffmpegLiveCaptureCommand(stream, { referer, output: "{outputDir}/capture.ts", filename }), captureInput: "split" };
   } catch (error) {
     context.log("warn", "Live stream capture resolution failed; falling back to the plugin download path", error instanceof Error ? error.message : String(error));
     return undefined;

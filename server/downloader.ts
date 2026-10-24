@@ -12,7 +12,7 @@ import type { LogWriter } from "./log-store.js";
 import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
-import { LIVE_MASTER_PLAYLIST, captureInputPreference, liveRecordingRequest } from "../packages/live-capture.js";
+import { SINGLE_INPUT_MARKER, captureInputPreference, chooseDirectCaptureInput, liveRecordingRequest } from "../packages/live-capture.js";
 import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
 import type { LiveStream, MediaCandidate } from "../packages/plugin-sdk/index.js";
 import type { LogLevel } from "./log-store.js";
@@ -405,10 +405,15 @@ export class DownloadQueue {
    * the TLS fingerprint. ffmpeg cannot de-obfuscate a playlist itself, and it does not send a
    * provider's private headers, so for those streams the proxy is not an optimisation but the
    * only thing that makes recording possible. Providers that do not opt in are untouched.
+   *
+   * A `master` capture opts in for a second reason: the proxy already synthesizes the master
+   * playlist the browser preview plays, so pointing ffmpeg at it turns two inputs into one and
+   * removes the A/V offset at its source. That master cannot be handed over as a local file --
+   * ffmpeg rejects the input options on a local path and then finds no streams in it at all.
    */
-  private recordThroughProxy(stream: LiveStream): string | undefined {
+  private recordThroughProxy(stream: LiveStream, captureInput: string): string | undefined {
     if (!this.liveProxy || !this.selfOrigin) return undefined;
-    if (!requiresLiveProxy(stream)) return undefined;
+    if (!requiresLiveProxy(stream) && chooseDirectCaptureInput(stream, captureInput) !== "master") return undefined;
     return this.selfOrigin + this.liveProxy.register(stream);
   }
 
@@ -805,11 +810,10 @@ export class DownloadQueue {
       // records as ffmpeg MPEG-TS (then the remux below turns it into MP4) no matter
       // which plugin resolved it. Non-live items and plugins without a live resolver
       // keep using resolveDownload unchanged.
-      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream), {
-        // "split" keeps the historical two-input capture. The stored setting decides, and a
-        // deployment override wins so one box can be switched and switched back without a data change.
-        captureInput: captureInputPreference(this.db.getSettings().liveCaptureInput, process.env.EASYX_LIVE_CAPTURE_INPUT),
-      }))
+      // "split" keeps the historical two-input capture. The stored setting decides, and a
+      // deployment override wins so one box can be switched and switched back without a data change.
+      const captureInput = captureInputPreference(this.db.getSettings().liveCaptureInput, process.env.EASYX_LIVE_CAPTURE_INPUT);
+      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream, captureInput)))
         ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
       if (!request) throw new Error("This plugin cannot resolve downloads");
       // The resolve is done; from here on the clock is the capture's.
@@ -840,16 +844,21 @@ export class DownloadQueue {
       temporary = path.join(temporaryDirectory, filename);
       let checksum: string;
       if (request.kind === "command") {
-        // A single-input capture reads a master playlist that names both renditions; its URLs only
-        // exist once the plugin has resolved the stream, so it is written here. Rewritten on every
-        // attempt because a retry re-resolves the stream and the tokens inside change with it.
-        if (request.supportFiles?.length && temporaryDirectory) {
-          for (const file of request.supportFiles) fs.writeFileSync(path.join(temporaryDirectory, file.name), file.content);
+        // A single-input capture must be recognisable at remux time, including after a restart
+        // re-queued the item or a salvage picked the parts up later, so the fact lives next to the
+        // capture rather than in anything this process holds. Written on every attempt, and removed
+        // when the mode changed, so it always describes the bytes actually on disk.
+        if (request.captureInput && temporaryDirectory) {
+          const markerPath = path.join(temporaryDirectory, SINGLE_INPUT_MARKER);
+          if (request.captureInput === "master") fs.writeFileSync(markerPath, "master");
+          else fs.rmSync(markerPath, { force: true });
         }
         // For a live dual-HLS capture, measure the constant A/V offset while
         // ffmpeg records: watch the first segment opened per input on stderr
         // and map it to the playlist's PROGRAM-DATE-TIME. The result lands in
         // a sidecar JSON next to capture.ts, consumed by the remux below.
+        // A single input has no second edge to measure -- `avSyncPlan` asks for two inputs and
+        // returns nothing, which is the right answer rather than a skipped measurement.
         if ((item.metadata as Record<string, unknown> | undefined)?.live === true && temporaryDirectory) {
           const plan = avSyncPlan(request.args, temporaryDirectory);
           if (plan) avWatcher = await startAvSyncMeasurement(plan, (message) => this.writeLog?.("info", "download", message, { itemId: item.id }));
@@ -1722,11 +1731,12 @@ export class DownloadQueue {
   private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload, concatList?: string, inputBytes?: number): Promise<number> {
     const sidecarShift = readAvSyncSidecar(tsPath + ".avsync.json");
     let audioShift = sidecarShift ?? 0;
-    // A capture driven by a synthesized master is a single ffmpeg input, so the two streams never
-    // had separate live edges and never acquired an offset. The start_time fallback below must not
-    // run on one: comparing container start times there would shift a track that was already
-    // aligned, which is worse than doing nothing.
-    const singleInputCapture = fs.existsSync(path.join(path.dirname(tsPath), LIVE_MASTER_PLAYLIST));
+    // A single-input capture never had two live edges, so it never acquired an offset: the two
+    // renditions' first samples simply sit where their segments started, which on a 30s capture
+    // matched the segments' PROGRAM-DATE-TIME difference to within one frame. The start_time
+    // fallback below must not run on one -- there it would shift a track that was already aligned,
+    // which is worse than doing nothing.
+    const singleInputCapture = fs.existsSync(path.join(path.dirname(tsPath), SINGLE_INPUT_MARKER));
     // `audioCodec` decides whether the audio can be copied instead of re-encoded, so it is read
     // even when a sidecar already settled the offset.
     let audioCodec: string | undefined;

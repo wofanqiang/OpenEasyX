@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { EasyXPlugin, PluginContext } from "./plugin-sdk/index.js";
-import { LIVE_MASTER_PLAYLIST, captureInputPreference, chooseDirectCaptureInput, ffmpegLiveCaptureCommand, isLiveCandidate, liveMasterPlaylist, liveRecordingRequest, liveReferer } from "./live-capture.js";
+import { captureInputPreference, chooseDirectCaptureInput, ffmpegLiveCaptureCommand, isLiveCandidate, liveRecordingRequest, liveReferer } from "./live-capture.js";
 
 const context: PluginContext = {
   config: {}, fetch, runCommand: async () => ({ exitCode: 1, stdout: "", stderr: "" }), log: () => undefined,
@@ -68,33 +68,31 @@ describe("live capture request", () => {
     expect(request.args.filter((argument) => argument === "-thread_queue_size")).toHaveLength(2);
   });
 
-  it("feeds ffmpeg one master playlist when the capture is asked to use a single input", async () => {
+  it("records one input when the rewrite hook serves a master", async () => {
     // Two inputs each start at their own live edge and bake a constant offset into the capture.
-    // One master input hands both renditions to a single demuxer, which aligns them itself.
+    // The proxy's master hands both renditions to a single demuxer, which aligns them itself.
     const resolveLiveStream = vi.fn(async () => ({ url: "https://cdn.test/v.m3u8", audioUrl: "https://cdn.test/a.m3u8" }));
-    const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem, undefined, { captureInput: "master" });
+    const rewrite = vi.fn(() => "http://127.0.0.1:3210/api/live-cams/proxy/master.m3u8");
+    const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem, rewrite);
     expect(request?.kind).toBe("command");
     if (request?.kind !== "command") return;
     // One input, and no second map: there is nothing to mux across inputs any more.
     expect(request.args.filter((argument) => argument === "-i")).toHaveLength(1);
-    expect(request.args).toContain(`{outputDir}/${LIVE_MASTER_PLAYLIST}`);
+    expect(request.args).toContain("http://127.0.0.1:3210/api/live-cams/proxy/master.m3u8");
     expect(request.args).not.toContain("-map");
-    // The master carries both absolute URLs and is written next to the capture.
-    expect(request.supportFiles).toHaveLength(1);
-    const master = request.supportFiles?.[0];
-    expect(master?.name).toBe(LIVE_MASTER_PLAYLIST);
-    expect(master?.content).toContain("#EXT-X-MEDIA:TYPE=AUDIO");
-    expect(master?.content).toContain('URI="https://cdn.test/a.m3u8"');
-    expect(master?.content).toContain("https://cdn.test/v.m3u8");
+    // The remux has to know: without this it would read the head-length difference between the two
+    // renditions as an A/V offset and shift an already-aligned track.
+    expect(request.captureInput).toBe("master");
   });
 
-  it("keeps the two-input capture when the preference says split", async () => {
+  it("keeps the two-input capture when the hook declines", async () => {
     const resolveLiveStream = vi.fn(async () => ({ url: "https://cdn.test/v.m3u8", audioUrl: "https://cdn.test/a.m3u8" }));
-    const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem, undefined, { captureInput: "split" });
+    const request = await liveRecordingRequest(plugin(resolveLiveStream), context, liveItem, () => undefined);
     expect(request?.kind).toBe("command");
     if (request?.kind !== "command") return;
     expect(request.args.filter((argument) => argument === "-i")).toHaveLength(2);
-    expect(request.supportFiles).toBeUndefined();
+    // Stated, not implied: the downloader clears a marker left by an earlier single-input attempt.
+    expect(request.captureInput).toBe("split");
   });
 
   it("derives the referer from the recorded page origin", () => {
@@ -187,20 +185,8 @@ describe("direct capture input choice", () => {
   });
 
   it("stays on split for a stream with no separate audio rendition", () => {
-    // Nothing to align, so a master would only add a file and an indirection.
+    // Nothing to align, so a master would only add an indirection.
     expect(chooseDirectCaptureInput(muxed, "master")).toBe("split");
-  });
-
-  it("builds a master that names both renditions", () => {
-    expect(liveMasterPlaylist(dual)).toBe([
-      "#EXTM3U",
-      "#EXT-X-VERSION:6",
-      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="https://cdn.test/a.m3u8"',
-      '#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO="audio"',
-      "https://cdn.test/v.m3u8",
-      "",
-    ].join("\n"));
-    expect(liveMasterPlaylist(muxed)).toBeUndefined();
   });
 
   it("lets the deployment override beat the stored setting", () => {

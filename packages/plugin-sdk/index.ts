@@ -94,13 +94,11 @@ export type CommandDownloadRequest = {
   args: string[];
   filename: string;
   /**
-   * Files the command needs on disk before it starts, written into the output directory.
-   *
-   * A single-input live capture feeds ffmpeg one synthesized master playlist instead of two
-   * separate rendition URLs; ffmpeg can only read that from a file, and the URLs inside it are
-   * only known once the plugin has resolved the stream.
+   * How a live capture feeds ffmpeg: `split` opens one input per rendition, `master` opens a
+   * single playlist that names both. The downloader writes it next to the capture, because the
+   * TS remux must not read container start times as an A/V offset on a single input.
    */
-  supportFiles?: Array<{ name: string; content: string }>;
+  captureInput?: "split" | "master";
   /** Wrappers that finalize output themselves must exit successfully, even after a stop. */
   requireSuccessfulExit?: boolean;
 };
