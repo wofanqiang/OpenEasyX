@@ -25,6 +25,9 @@ export const settingsSchema = z.object({
   // Presets rather than a free number: the ceiling is what keeps a plugin's sweep budget below
   // the provider envelope, and the envelope below the page's own timeouts.
   liveCrawlBudgetPreset: z.enum(liveCrawlBudgetPresetIds).optional(),
+  // "split" keeps the two-input capture; "master" feeds ffmpeg one synthesized master playlist
+  // so the HLS demuxer aligns the renditions itself; "auto" uses master wherever it is possible.
+  liveCaptureInput: z.enum(["split", "master", "auto"]).optional(),
 });
 
 export function downloadOutputPath(settings: Record<string, unknown>, item: DownloadItem, performer: string, site: string, originalFilename: string): string {

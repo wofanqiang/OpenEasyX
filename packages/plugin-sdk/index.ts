@@ -93,6 +93,14 @@ export type CommandDownloadRequest = {
   command: string;
   args: string[];
   filename: string;
+  /**
+   * Files the command needs on disk before it starts, written into the output directory.
+   *
+   * A single-input live capture feeds ffmpeg one synthesized master playlist instead of two
+   * separate rendition URLs; ffmpeg can only read that from a file, and the URLs inside it are
+   * only known once the plugin has resolved the stream.
+   */
+  supportFiles?: Array<{ name: string; content: string }>;
   /** Wrappers that finalize output themselves must exit successfully, even after a stop. */
   requireSuccessfulExit?: boolean;
 };

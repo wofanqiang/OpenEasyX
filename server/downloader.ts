@@ -12,7 +12,7 @@ import type { LogWriter } from "./log-store.js";
 import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
-import { liveRecordingRequest } from "../packages/live-capture.js";
+import { LIVE_MASTER_PLAYLIST, captureInputPreference, liveRecordingRequest } from "../packages/live-capture.js";
 import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
 import type { LiveStream, MediaCandidate } from "../packages/plugin-sdk/index.js";
 import type { LogLevel } from "./log-store.js";
@@ -805,7 +805,11 @@ export class DownloadQueue {
       // records as ffmpeg MPEG-TS (then the remux below turns it into MP4) no matter
       // which plugin resolved it. Non-live items and plugins without a live resolver
       // keep using resolveDownload unchanged.
-      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream)))
+      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream), {
+        // "split" keeps the historical two-input capture. The stored setting decides, and a
+        // deployment override wins so one box can be switched and switched back without a data change.
+        captureInput: captureInputPreference(this.db.getSettings().liveCaptureInput, process.env.EASYX_LIVE_CAPTURE_INPUT),
+      }))
         ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
       if (!request) throw new Error("This plugin cannot resolve downloads");
       // The resolve is done; from here on the clock is the capture's.
@@ -836,6 +840,12 @@ export class DownloadQueue {
       temporary = path.join(temporaryDirectory, filename);
       let checksum: string;
       if (request.kind === "command") {
+        // A single-input capture reads a master playlist that names both renditions; its URLs only
+        // exist once the plugin has resolved the stream, so it is written here. Rewritten on every
+        // attempt because a retry re-resolves the stream and the tokens inside change with it.
+        if (request.supportFiles?.length && temporaryDirectory) {
+          for (const file of request.supportFiles) fs.writeFileSync(path.join(temporaryDirectory, file.name), file.content);
+        }
         // For a live dual-HLS capture, measure the constant A/V offset while
         // ffmpeg records: watch the first segment opened per input on stderr
         // and map it to the playlist's PROGRAM-DATE-TIME. The result lands in
@@ -1712,6 +1722,11 @@ export class DownloadQueue {
   private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload, concatList?: string, inputBytes?: number): Promise<number> {
     const sidecarShift = readAvSyncSidecar(tsPath + ".avsync.json");
     let audioShift = sidecarShift ?? 0;
+    // A capture driven by a synthesized master is a single ffmpeg input, so the two streams never
+    // had separate live edges and never acquired an offset. The start_time fallback below must not
+    // run on one: comparing container start times there would shift a track that was already
+    // aligned, which is worse than doing nothing.
+    const singleInputCapture = fs.existsSync(path.join(path.dirname(tsPath), LIVE_MASTER_PLAYLIST));
     // `audioCodec` decides whether the audio can be copied instead of re-encoded, so it is read
     // even when a sidecar already settled the offset.
     let audioCodec: string | undefined;
@@ -1731,7 +1746,7 @@ export class DownloadQueue {
         // The start_time comparison is only a fallback for a capture that was never measured: a
         // sidecar saying "no offset" is a measurement, and second-guessing it here would shift a
         // track that was already aligned.
-        if (sidecarShift === undefined && videoStart !== undefined && audioStart !== undefined) {
+        if (!singleInputCapture && sidecarShift === undefined && videoStart !== undefined && audioStart !== undefined) {
           // Only correct a clear, sane skew: tiny deltas are measurement noise,
           // and huge deltas would indicate something other than a sync issue.
           const delta = videoStart - audioStart;

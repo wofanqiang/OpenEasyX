@@ -10,6 +10,72 @@ const FFMPEG_CHROME_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
  */
 const LIVE_READ_TIMEOUT_US = 15_000_000;
 
+/** File name of the synthesized master playlist a single-input capture reads. */
+export const LIVE_MASTER_PLAYLIST = "capture.master.m3u8";
+
+/**
+ * How a direct capture feeds ffmpeg.
+ *
+ * `split` opens one input per rendition (the historical behaviour, and the only option for a
+ * provider whose video and audio cannot share a playlist). `master` opens ONE input: a master
+ * playlist that names both renditions, so the HLS demuxer owns a single timeline and aligns them
+ * itself. See `chooseDirectCaptureInput` for why that matters.
+ */
+export type DirectCaptureInput = "split" | "master";
+
+/**
+ * Whether to capture a stream through one synthesized master playlist instead of two inputs.
+ *
+ * Two independent inputs each start at their own live edge, and the two renditions' segments are
+ * not the same length, so "three segments before the end" lands at two different instants and the
+ * capture carries a constant offset -- typically audio 1-3s ahead. Nothing in the container shows
+ * it (the TS muxer rebases both streams to the same start_time), which is why the recorder measures
+ * the source-side PROGRAM-DATE-TIME and shifts the audio back at remux time.
+ *
+ * A single master input removes the cause: one demuxer, one timeline, the audio group aligned by
+ * the playlist itself -- exactly what a browser player does. The offset measurement then has
+ * nothing to correct, and the remux no longer needs to re-encode the audio to apply a shift.
+ *
+ * Only two things can make that impossible, so only those two fall back to `split`:
+ *  - no separate audio rendition (nothing to align),
+ *  - no master playlist to write, which is what `audioUrl` missing means here.
+ *
+ * A proxied stream never reaches this decision: the HLS proxy already synthesizes a master, and
+ * the capture is handed that single URL.
+ */
+export function chooseDirectCaptureInput(stream: LiveStream, preference: string | undefined): DirectCaptureInput {
+  if (preference !== "master" && preference !== "auto") return "split";
+  return stream.audioUrl ? "master" : "split";
+}
+
+/**
+ * The capture-input preference in force: a deployment override wins over the stored setting.
+ *
+ * The override exists so a rollout can switch one box without touching its database, and switch it
+ * back just as quickly -- the same reason the segmented-capture kill switch exists.
+ */
+export function captureInputPreference(settingValue: unknown, envValue: string | undefined): string {
+  const known = (value: unknown): string | undefined => {
+    const text = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return text === "split" || text === "master" || text === "auto" ? text : undefined;
+  };
+  return known(envValue) ?? known(settingValue) ?? "split";
+}
+
+/** The master playlist that turns two rendition URLs into one input. */
+export function liveMasterPlaylist(stream: LiveStream): string | undefined {
+  if (!stream.audioUrl) return undefined;
+  return [
+    "#EXTM3U",
+    "#EXT-X-VERSION:6",
+    // BANDWIDTH is a placeholder: there is one variant, so nothing selects between them.
+    `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="${stream.audioUrl}"`,
+    '#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO="audio"',
+    stream.url,
+    "",
+  ].join("\n");
+}
+
 /**
  * Build an ffmpeg command that captures a live HLS stream straight to MPEG-TS.
  * Capturing to TS (instead of letting yt-dlp record the whole session) keeps
@@ -118,6 +184,7 @@ export async function liveRecordingRequest(
   context: PluginContext,
   item: MediaCandidate,
   rewrite?: (stream: LiveStream) => string | undefined,
+  options: { captureInput?: string } = {},
 ): Promise<CommandDownloadRequest | undefined> {
   const meta = item.metadata as Record<string, unknown> | undefined;
   if (meta?.live !== true || !plugin.resolveLiveStream) return undefined;
@@ -136,7 +203,26 @@ export async function liveRecordingRequest(
     // A proxied stream needs no identity of its own: the proxy attaches the provider's headers
     // and referer upstream, so sending them here too would only confuse the hop.
     const referer = proxied ? undefined : liveReferer(pageUrl);
-    return ffmpegLiveCaptureCommand(proxied ? { url: proxied } : stream, { referer, output: "{outputDir}/capture.ts", filename: item.filename ?? `${item.externalId}.mp4` });
+    const filename = item.filename ?? `${item.externalId}.mp4`;
+    if (proxied) {
+      // The proxy's own master already names both renditions, so this is a single input too.
+      return ffmpegLiveCaptureCommand({ url: proxied }, { referer, output: "{outputDir}/capture.ts", filename });
+    }
+    if (chooseDirectCaptureInput(stream, options.captureInput) === "master") {
+      const content = liveMasterPlaylist(stream);
+      if (content) {
+        return {
+          ...ffmpegLiveCaptureCommand(
+            // The headers still apply: ffmpeg now fetches BOTH renditions as segments of this one
+            // input, so it has to carry the provider's referer/cookies just as the two-input form did.
+            { url: `{outputDir}/${LIVE_MASTER_PLAYLIST}`, headers: stream.headers },
+            { referer, output: "{outputDir}/capture.ts", filename },
+          ),
+          supportFiles: [{ name: LIVE_MASTER_PLAYLIST, content }],
+        };
+      }
+    }
+    return ffmpegLiveCaptureCommand(stream, { referer, output: "{outputDir}/capture.ts", filename });
   } catch (error) {
     context.log("warn", "Live stream capture resolution failed; falling back to the plugin download path", error instanceof Error ? error.message : String(error));
     return undefined;

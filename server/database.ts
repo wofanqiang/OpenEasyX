@@ -234,6 +234,9 @@ export class Database {
     this.setDefault("defaultScrapeIntervalMinutes", 360);
     this.setDefault("defaultLiveIntervalSeconds", 10);
     this.setDefault("autoRecordCheckSeconds", 60);
+    // Two independent inputs each start at their own live edge, which bakes a constant A/V offset
+    // into the capture; "split" is the behaviour every existing install has, so it stays the default.
+    this.setDefault("liveCaptureInput", "split");
     this.setDefault("autoRecordCooldownSeconds", 120);
     this.setDefault("autoRecordMinBytes", 5 * 1024 * 1024);
     this.setDefault("admin_password_hash", "");
