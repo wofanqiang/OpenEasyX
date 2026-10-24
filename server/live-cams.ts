@@ -917,7 +917,7 @@ export class LiveCamService {
     return this.hlsProxy.register(stream);
   }
 
-  async proxy(tokenPath: string, reply: FastifyReply, query: Record<string, unknown> = {}, range?: string) {
-    return this.hlsProxy.serve(tokenPath, reply, query, range);
+  async proxy(tokenPath: string, reply: FastifyReply, query: Record<string, unknown> = {}, range?: string, log?: (message: string) => void) {
+    return this.hlsProxy.serve(tokenPath, reply, query, range, log);
   }
 }

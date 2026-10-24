@@ -456,8 +456,12 @@ app.post<{ Body: unknown }>("/api/live-cams/record", async (request) => {
   const body = liveCamBodySchema.parse(request.body);
   return liveCams.record(body.providerId, body.cam);
 });
-app.get<{ Params: { tokenPath: string }; Querystring: Record<string, unknown> }>("/api/live-cams/proxy/:tokenPath", async (request, reply) => {
-  return liveCams.proxy(request.params.tokenPath, reply, request.query, typeof request.headers.range === "string" ? request.headers.range : undefined);
+app.get<{ Params: { tokenPath: string }; Querystring: Record<string, unknown> }>("/api/live-cams/proxy/:tokenPath", { logLevel: "silent" }, async (request, reply) => {
+  // Request logging is silenced for this route: one capture hammers it a few times a second, which
+  // would flood the whole log buffer with "incoming request" lines. Failures are still reported --
+  // the proxy is handed a logger so stale links and unreachable providers stay visible.
+  return liveCams.proxy(request.params.tokenPath, reply, request.query, typeof request.headers.range === "string" ? request.headers.range : undefined,
+    (message) => writeLog("warn", "live-cams", message));
 });
 
 app.get<{ Querystring: { q?: string } }>("/api/discover", async (request) => {

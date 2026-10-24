@@ -24,6 +24,15 @@ import type { LiveStream } from "../packages/plugin-sdk/index.js";
 type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; fingerprint?: boolean; expiresAt: number };
 
 const ENTRY_TTL_MS = 15 * 60_000;
+/**
+ * How often expired entries are actually swept. `url()` runs on every line of every rewritten
+ * playlist, and a full scan per line made the proxy's cost grow with the recording's length; a
+ * sweep 30 seconds apart keeps the map at its steady state for free. The cost of waiting is that
+ * a link can outlive its TTL by at most one interval -- still far below anything a stale client
+ * could use.
+ */
+export const PRUNE_EVERY_MS = 30_000;
+export { ENTRY_TTL_MS };
 const PLAYLIST_MIME = "application/vnd.apple.mpegurl";
 /**
  * Route prefix the proxy lives behind. Recorded here rather than only in the router because
@@ -50,6 +59,7 @@ function text(value: unknown): string | undefined { return typeof value === "str
 export class HlsProxy {
   private entries = new Map<string, ProxyEntry>();
   private reverse = new Map<string, string>();
+  private lastPrune = -PRUNE_EVERY_MS;
 
   /**
    * `request` is what every proxied fetch leaves through. `fingerprinted` is the Chrome-impersonating
@@ -105,11 +115,19 @@ export class HlsProxy {
     return `${LIVE_PROXY_PREFIX}${token}${suffix}`;
   }
 
-  async serve(tokenPath: string, reply: FastifyReply, query: Record<string, unknown> = {}, range?: string) {
+  /**
+   * `log` receives the proxy's failures. The route is registered with Fastify's per-request
+   * logging silenced -- one capture would otherwise flood the whole log buffer with
+   * "incoming request" lines and bury every real message -- so without this, a stale link or an
+   * unreachable provider would fail silently exactly when someone is watching the logs for why.
+   */
+  async serve(tokenPath: string, reply: FastifyReply, query: Record<string, unknown> = {}, range?: string, log?: (message: string) => void) {
     const token = tokenPath.split(".", 1)[0];
     const entry = this.entries.get(token);
     if (!entry || entry.expiresAt <= Date.now()) {
-      this.entries.delete(token); return reply.status(404).send({ error: "Live stream link expired" });
+      this.entries.delete(token);
+      log?.("live proxy: stream link expired");
+      return reply.status(404).send({ error: "Live stream link expired" });
     }
     entry.expiresAt = Date.now() + ENTRY_TTL_MS;
     if (entry.body !== undefined) return reply.type(PLAYLIST_MIME).header("cache-control", "no-store").send(entry.body);
@@ -120,9 +138,13 @@ export class HlsProxy {
     let response: Response;
     try { response = await this.fetchUpstream(sourceUrl, entry.headers, range, entry.fingerprint ? this.fingerprinted : undefined); }
     catch (error) {
+      log?.("live proxy: upstream unreachable: " + (error instanceof Error ? error.message : String(error)));
       return reply.status(502).send({ error: `Upstream live provider unreachable: ${error instanceof Error ? error.message : String(error)}` });
     }
-    if (!response.ok) return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
+    if (!response.ok) {
+      log?.("live proxy: provider returned HTTP " + response.status + " for " + sourceUrl.host + sourceUrl.pathname);
+      return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
+    }
 
     const contentType = response.headers.get("content-type") ?? "application/octet-stream";
     const contentRange = response.headers.get("content-range");
@@ -196,6 +218,8 @@ export class HlsProxy {
 
   private prune() {
     const now = Date.now();
+    if (now - this.lastPrune < PRUNE_EVERY_MS) return;
+    this.lastPrune = now;
     for (const [token, entry] of this.entries) if (entry.expiresAt <= now) this.entries.delete(token);
     for (const [key, token] of this.reverse) if (!this.entries.has(token)) this.reverse.delete(key);
   }

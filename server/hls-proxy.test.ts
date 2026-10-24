@@ -1,6 +1,6 @@
 import type { FastifyReply } from "fastify";
-import { describe, expect, it } from "vitest";
-import { HlsProxy, isLiveProxyPath, LIVE_PROXY_PREFIX } from "./hls-proxy.js";
+import { describe, expect, it, vi } from "vitest";
+import { ENTRY_TTL_MS, HlsProxy, isLiveProxyPath, LIVE_PROXY_PREFIX, PRUNE_EVERY_MS } from "./hls-proxy.js";
 
 /**
  * The one invariant a unit test can pin down here: whatever URL the proxy hands out, the router
@@ -27,6 +27,11 @@ function fakeReply(): { reply: FastifyReply; body: () => string } {
 
 describe("hls proxy routing", () => {
   const proxy = new HlsProxy();
+
+  const plainPlaylist = () => new Response("#EXTM3U\n#EXTINF:2,\nhttps://cdn.test/media.ts\n", {
+    status: 200,
+    headers: { "content-type": "application/vnd.apple.mpegurl" },
+  });
 
   it("mints URLs on the route the session gate exempts", () => {
     expect(isLiveProxyPath(proxy.register({ url: "https://cdn.test/a.m3u8" }))).toBe(true);
@@ -102,5 +107,53 @@ describe("hls proxy routing", () => {
     };
     await plain.serve(plain.register({ url: "https://cdn.test/gated.m3u8" }).replace(LIVE_PROXY_PREFIX, ""), statusReply as unknown as FastifyReply, {});
     expect(state.status).toBe(403);
+  });
+
+  it("sweeps at most once per interval, and enforces expiry whether or not a sweep ran", async () => {
+    // The sweep is throttled because url() runs on every line of every rewritten playlist; the
+    // thing that must not be throttled is the TTL itself. A lazy sweep only delays reclaiming the
+    // map slot -- the token stops answering the moment it expires, swept or not.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const proxy = new HlsProxy(async () => plainPlaylist());
+      const internal = proxy as unknown as { lastPrune: number };
+      const sent: unknown[] = [];
+      const reply = {
+        status: () => reply, type: () => reply, header: () => reply,
+        send: (value: unknown) => { sent.push(value); return reply; },
+      } as unknown as FastifyReply;
+      const entry = proxy.register({ url: "https://cdn.test/a.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+
+      proxy.url("https://cdn.test/warm.m3u8", {});
+      const afterFirst = internal.lastPrune;
+      for (let index = 0; index < 50; index++) proxy.url("https://cdn.test/chatter.m3u8?" + index, {});
+      expect(internal.lastPrune).toBe(afterFirst);
+
+      vi.setSystemTime(ENTRY_TTL_MS + PRUNE_EVERY_MS + 1000);
+      proxy.url("https://cdn.test/late.m3u8", {});
+      expect(internal.lastPrune).toBe(ENTRY_TTL_MS + PRUNE_EVERY_MS + 1000);
+
+      await proxy.serve(entry, reply, {});
+      expect(JSON.stringify(sent[sent.length - 1])).toContain("expired");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports failures to the caller even with route logging silenced", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const proxy = new HlsProxy(async () => plainPlaylist());
+      const messages: string[] = [];
+      const { reply } = fakeReply();
+      const entry = proxy.register({ url: "https://cdn.test/a.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+      vi.setSystemTime(ENTRY_TTL_MS + 60_000);
+      await proxy.serve(entry, reply, {}, undefined, (message) => messages.push(message));
+      expect(messages).toEqual([expect.stringContaining("expired")]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
