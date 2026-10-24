@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, requiresLiveProxy, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, remuxCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, requiresLiveProxy, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -711,6 +711,55 @@ describe("slotPlan", () => {
 
   it("offers nothing once both pools are full", () => {
     expect(slotPlan({ recordings: 32, downloads: 8 }, { recordings: 32, downloads: 8 })).toEqual([]);
+  });
+});
+
+describe("remuxCaptureArgs", () => {
+  const base = { tsPath: "/media/staging/capture.ts", output: "/media/staging/encoded.mp4" };
+
+  it("copies the audio when there is no offset to remove", () => {
+    // The capture is a byte copy of the provider's AAC, so the only thing standing between it and
+    // a valid MP4 is the ADTS->ASC conversion. Re-encoding here rewrote every audio byte for
+    // nothing and was the slowest part of the remux on a multi-GB file.
+    const args = remuxCaptureArgs({ ...base, audioShift: 0, audioCodec: "aac" });
+    expect(args).toContain("copy");
+    expect(args.slice(args.indexOf("-c:a"), args.indexOf("-c:a") + 2)).toEqual(["-c:a", "copy"]);
+    expect(args.slice(args.indexOf("-bsf:a"), args.indexOf("-bsf:a") + 2)).toEqual(["-bsf:a", "aac_adtstoasc"]);
+    expect(args).not.toContain("-af");
+    expect(args).not.toContain("-async");
+    // Video is never re-encoded, and the file still gets a front-loaded index.
+    expect(args.slice(args.indexOf("-c:v"), args.indexOf("-c:v") + 2)).toEqual(["-c:v", "copy"]);
+    expect(args).toContain("+faststart");
+  });
+
+  it("re-encodes the audio to remove a measured offset", () => {
+    // A constant shift cannot be fixed by -async (that only stretches for drift), so the PTS have
+    // to move while the audio is decoded.
+    const args = remuxCaptureArgs({ ...base, audioShift: -1.75, audioCodec: "aac" });
+    expect(args.slice(args.indexOf("-c:a"), args.indexOf("-c:a") + 2)).toEqual(["-c:a", "aac"]);
+    expect(args).toContain("asetpts=PTS-1.750/TB");
+    expect(args).toContain("-async");
+    expect(args).not.toContain("aac_adtstoasc");
+  });
+
+  it("re-encodes audio that is not AAC, even with no offset", () => {
+    // mp2/ac3 in an MP4 is not something every player accepts, and that failure would only show up
+    // at playback, long after the capture is gone.
+    const args = remuxCaptureArgs({ ...base, audioShift: 0, audioCodec: "mp2" });
+    expect(args.slice(args.indexOf("-c:a"), args.indexOf("-c:a") + 2)).toEqual(["-c:a", "aac"]);
+    expect(args).not.toContain("aac_adtstoasc");
+  });
+
+  it("does not copy the audio on an unproven codec", () => {
+    const args = remuxCaptureArgs({ ...base, audioShift: 0 });
+    expect(args.slice(args.indexOf("-c:a"), args.indexOf("-c:a") + 2)).toEqual(["-c:a", "aac"]);
+  });
+
+  it("reads a segmented capture through the concat demuxer", () => {
+    // A plain -i on one part would remux only the first slice of a segmented capture.
+    const args = remuxCaptureArgs({ concatList: "/media/staging/capture.concat.txt", output: base.output, audioShift: 0, audioCodec: "aac" });
+    expect(args.slice(args.indexOf("-f"), args.indexOf("-f") + 5)).toEqual(["-f", "concat", "-safe", "0", "-i"]);
+    expect(args).not.toContain(base.tsPath);
   });
 });
 

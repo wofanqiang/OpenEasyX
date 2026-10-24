@@ -318,6 +318,59 @@ export function concatCaptureArgs(listPath: string, output: string): string[] {
   return ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", output];
 }
 
+/**
+ * ffmpeg arguments that turn a finished capture into the delivered MP4.
+ *
+ * Video is never re-encoded: the capture is a byte copy of the provider's stream, so decoding and
+ * re-encoding it could only lose quality.
+ *
+ * Audio is decided by *why* it would otherwise be touched:
+ *
+ *  - A measured offset must be removed, and that is only possible while re-encoding (a constant
+ *    shift cannot be fixed by `-async`, which only stretches for drift). `asetpts` moves the PTS by
+ *    exactly the measured amount and `-async 1` cleans up whatever drifted inside the timeline.
+ *  - No offset, and the audio is already AAC: copy it. A dual-HLS capture used to be the only case
+ *    that reached this step, so `-c:a aac` was unconditional and every recording paid a full audio
+ *    re-encode for nothing -- on a multi-GB capture that is the slowest part of the remux, and it
+ *    is why the post-processing gate kept filling up. The MP4 muxer only needs the ADTS headers in
+ *    a TS capture converted to ASC, which `aac_adtstoasc` does without touching a frame.
+ *  - No offset but the audio is not AAC (a provider still serving mp2/ac3): re-encode. Those
+ *    codecs are not safely copyable into an MP4 every player accepts, and a wrong container here
+ *    fails at playback time, long after the capture is gone.
+ *
+ * An unknown codec counts as "not AAC": the cheap path is only taken on a positive identification.
+ */
+export function remuxCaptureArgs(options: {
+  /** The captured TS. Mutually exclusive with `concatList`. */
+  tsPath?: string;
+  /** A concat-demuxer list of capture parts, for a segmented capture. */
+  concatList?: string;
+  output: string;
+  /** Measured constant A/V offset in seconds; 0 means the streams start together. */
+  audioShift: number;
+  /** First audio stream's codec name, as ffprobe reports it. */
+  audioCodec?: string;
+}): string[] {
+  const input = options.concatList
+    ? ["-f", "concat", "-safe", "0", "-i", options.concatList]
+    : ["-i", options.tsPath ?? ""];
+  // Emit the sign explicitly rather than "PTS+-1.750": the expression parser accepts both, but a
+  // double sign is the kind of thing that reads as a bug six months later.
+  const shiftExpression = `asetpts=PTS${options.audioShift < 0 ? "-" : "+"}${Math.abs(options.audioShift).toFixed(3)}/TB`;
+  const audio = options.audioShift !== 0
+    ? ["-c:a", "aac", "-af", shiftExpression, "-async", "1"]
+    : options.audioCodec === "aac"
+      ? ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
+      : ["-c:a", "aac"];
+  return [
+    "-y", "-fflags", "+genpts+igndts",
+    ...input,
+    "-map", "0", "-c:v", "copy",
+    ...audio,
+    "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", options.output,
+  ];
+}
+
 
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
@@ -1657,26 +1710,35 @@ export class DownloadQueue {
    *  `concatList` (A10 segmented-capture rescue) swaps the single-file input for the concat
    *  demuxer, so every part is remuxed in one pass without an intermediate folded capture.ts. */
   private async remuxCaptureToMp4(tsPath: string, mp4Staging: string, control: ActiveDownload, concatList?: string, inputBytes?: number): Promise<number> {
-    let audioShift = readAvSyncSidecar(tsPath + ".avsync.json") ?? 0;
+    const sidecarShift = readAvSyncSidecar(tsPath + ".avsync.json");
+    let audioShift = sidecarShift ?? 0;
+    // `audioCodec` decides whether the audio can be copied instead of re-encoded, so it is read
+    // even when a sidecar already settled the offset.
+    let audioCodec: string | undefined;
     if (audioShift === 0) {
       try {
-        const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", tsPath]);
-        const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; start_time?: string }> };
+        const probe = await this.capture("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type,codec_name,start_time", "-of", "json", tsPath]);
+        const parsed = JSON.parse(probe.stdout.toString("utf8")) as { streams?: Array<{ codec_type?: string; codec_name?: string; start_time?: string }> };
         let videoStart: number | undefined;
         let audioStart: number | undefined;
         for (const stream of parsed.streams ?? []) {
           if (stream.codec_type === "video" && videoStart === undefined) videoStart = Number(stream.start_time ?? 0) || 0;
-          if (stream.codec_type === "audio" && audioStart === undefined) audioStart = Number(stream.start_time ?? 0) || 0;
+          if (stream.codec_type === "audio" && audioStart === undefined) {
+            audioStart = Number(stream.start_time ?? 0) || 0;
+            audioCodec = stream.codec_name;
+          }
         }
-        // Only correct a clear, sane skew: tiny deltas are measurement noise,
-        // and huge deltas would indicate something other than a sync issue.
-        if (videoStart !== undefined && audioStart !== undefined) {
+        // The start_time comparison is only a fallback for a capture that was never measured: a
+        // sidecar saying "no offset" is a measurement, and second-guessing it here would shift a
+        // track that was already aligned.
+        if (sidecarShift === undefined && videoStart !== undefined && audioStart !== undefined) {
+          // Only correct a clear, sane skew: tiny deltas are measurement noise,
+          // and huge deltas would indicate something other than a sync issue.
           const delta = videoStart - audioStart;
           if (Math.abs(delta) > 0.15 && Math.abs(delta) <= 30) audioShift = delta;
         }
       } catch { /* Probe failed: keep the audio unshifted (previous behaviour). */ }
     }
-    const audioFilter = audioShift !== 0 ? `asetpts=PTS+${audioShift.toFixed(3)}/TB` : undefined;
     // `+faststart` rewrites the whole file after the muxer has written it, so this step takes
     // minutes on a multi-GB capture and must not read as a stalled download.
     let captureBytes = 0;
@@ -1685,17 +1747,9 @@ export class DownloadQueue {
     // The gate also covers the recovery path below: a rescue remux must not fight live
     // captures either, and the deadline only starts once a slot is actually granted.
     await this.postProcessGate.run("Remux", () =>
-      this.withPostProcessDeadline(control, captureBytes, "Remux", () => this.runPostProcessCommand("ffmpeg", [
-      "-y", "-fflags", "+genpts+igndts",
-      // The concat demuxer streams every capture part as one continuous input; a plain
-      // `-i tsPath` here would remux only the first slice of a segmented capture.
-      ...(concatList ? ["-f", "concat", "-safe", "0", "-i", concatList] : ["-i", tsPath]),
-      "-map", "0", "-c:v", "copy", "-c:a", "aac",
-      ...(audioFilter ? ["-af", audioFilter] : []),
-      // Still corrects any drift inside the audio timeline itself.
-      "-async", "1",
-      "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4Staging,
-      ], path.dirname(mp4Staging), control)));
+      this.withPostProcessDeadline(control, captureBytes, "Remux", () => this.runPostProcessCommand("ffmpeg",
+        remuxCaptureArgs({ tsPath, concatList, output: mp4Staging, audioShift, audioCodec }),
+        path.dirname(mp4Staging), control)));
     if (control.action === "cancel" || control.action === "delete") throw new Error("Remux cancelled");
     if (!fs.existsSync(mp4Staging) || !fs.statSync(mp4Staging).size) throw new Error("Remux to MP4 produced no output");
     return audioShift;
