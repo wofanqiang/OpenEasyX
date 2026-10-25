@@ -52,8 +52,15 @@ services:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3210/api/health').then(r=>{if(!r.ok)process.exit(1)})"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      # The probe is a loopback fetch, so it is slow only when the box is busy -- and the small
+      # single-core hosts run three live captures at once, where the event loop is saturated for
+      # whole seconds. A 5s timeout made the container report unhealthy during exactly the load it
+      # is supposed to be recording through; 20s answers the same question without crying wolf.
+      timeout: 20s
+      # Five strikes instead of three, and a minute of grace after a (re)start, so a boot under
+      # load or a heavy remux does not read as a broken container.
+      retries: 5
+      start_period: 60s
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
