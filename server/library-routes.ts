@@ -224,6 +224,11 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
     // starts -- the same bytes, delivered, but as something the browser wants to play.
     if ((request.query as { download?: string } | undefined)?.download === "1") {
       reply.header("content-disposition", attachmentDisposition(media.relativePath));
+      // Close the connection once the file is out. The player benefits from a kept-alive socket
+      // for its next range request, but a download manager that reads until the connection ends
+      // rather than trusting the content length would otherwise sit waiting for an EOF that only
+      // arrives when the keep-alive timer expires -- a link that looks like it never answers.
+      reply.header("connection", "close");
     }
     reply.header("accept-ranges", "bytes").header("content-type", playback.mimeType).header("cache-control", "private, max-age=3600");
     if (!range) return reply.header("content-length", stat.size).send(fs.createReadStream(file));

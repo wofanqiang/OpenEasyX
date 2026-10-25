@@ -106,12 +106,17 @@ describe("downloading a media file", () => {
     const stream = await app.inject({ method: "GET", url: `/api/media/${item.id}/stream` });
     expect(stream.statusCode).toBe(200);
     expect(stream.headers["content-disposition"]).toBeUndefined();
+    // ...and it keeps the connection open, because a player asks for range after range.
+    expect(stream.headers["connection"]).not.toBe("close");
 
     // A link exported for a download manager asks for a file, and gets one with a name.
     const download = await app.inject({ method: "GET", url: `/api/media/${item.id}/stream?download=1` });
     expect(download.statusCode).toBe(200);
     expect(download.headers["content-disposition"]).toContain("attachment;");
     expect(download.headers["content-disposition"]).toContain('filename="clip one.mp4"');
+    // A client that reads until the connection ends must not be left waiting for one: the file
+    // arrives, the socket closes, the download manager files it.
+    expect(download.headers["connection"]).toBe("close");
     // The token in the query string is not part of what the signature covers, so adding the
     // download flag cannot invalidate it.
     const signed = (await app.inject({ method: "GET", url: `/api/media/${item.id}` })).json().streamUrl as string;
