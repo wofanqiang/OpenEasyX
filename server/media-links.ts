@@ -11,16 +11,26 @@ import type { FastifyRequest } from "fastify";
 // 30 days, the session lifetime: long enough to hand a list to a download manager and come back
 // to it, short enough that a leaked file ages out.
 const MEDIA_LINK_TTL_DAYS = 30;
-const STREAM_PATH = /^\/api\/media\/([a-f0-9]{24})\/stream$/;
+/**
+ * The stream path, with an optional trailing file name.
+ *
+ * The name is cosmetic -- download managers read the real one from `Content-Disposition` -- but a
+ * URL that ends in `.mp4` is treated as a file by clients that refuse to queue anything without a
+ * recognisable extension, and it gives their task list a readable name instead of the bare last
+ * segment of the path ("stream"). It is not part of the signature: the id and the expiry are, so a
+ * caller cannot turn one link into another by editing the name.
+ */
+const STREAM_PATH = /^\/api\/media\/([a-f0-9]{24})\/stream(?:\/[^/?#]*)?$/;
 
 function sign(id: string, exp: number, secret: string): string {
   return createHmac("sha256", secret).update(`${id}.${exp}`).digest("base64url");
 }
 
 /** A stream URL that answers without a session. Relative, so it works behind any origin. */
-export function mediaLinkUrl(id: string, secret: string): string {
+export function mediaLinkUrl(id: string, secret: string, name?: string): string {
   const exp = Math.floor(Date.now() / 1000) + MEDIA_LINK_TTL_DAYS * 86_400;
-  return `/api/media/${id}/stream?exp=${exp}&token=${sign(id, exp, secret)}`;
+  const suffix = name ? "/" + encodeURIComponent(name.slice(0, 180)) : "";
+  return `/api/media/${id}/stream${suffix}?exp=${exp}&token=${sign(id, exp, secret)}`;
 }
 
 /**

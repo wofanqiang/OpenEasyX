@@ -197,7 +197,7 @@ app.addHook("onRequest", createSessionGate({
 if (browserLoginEnabled()) {
   await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
 }
-const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds(), (id) => mediaLinkUrl(id, auth.sessionSecret));
+const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir, () => tasks.activeSourceIds(), (id, name) => mediaLinkUrl(id, auth.sessionSecret, name));
 const sourceSync = new SourceSync(db, mediaDir, ensureScraperPlugin, (id) => plugins.context(id), (ids) => queue.applyStoredMediaDates(ids));
 registerPerformerMergeRoutes(app, db, libraryDb, dataDir, (id) => performerOperations.has(id) || performerRefreshStatus.running || discoveryStatus.running || db.listSources(id).some((source) => sourceSync.active.has(source.id)));
 

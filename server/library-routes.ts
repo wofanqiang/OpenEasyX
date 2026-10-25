@@ -28,10 +28,16 @@ function libraryQuery(value: Record<string, string | undefined>): LibraryQuery {
  * library hands out is directly fetchable without a session (that is what makes an exported link
  * work in a download manager); tests and callers that do not care get the plain path.
  */
-type MediaLink = (id: string) => string;
+/** The file name a download manager should see, when the payload carries a path at all. */
+function mediaName(media: unknown): string | undefined {
+  const relativePath = (media as { relativePath?: unknown }).relativePath;
+  return typeof relativePath === "string" && relativePath.trim() ? path.basename(relativePath) : undefined;
+}
 
-function plainMediaLink(id: string): string {
-  return `/api/media/${id}/stream`;
+type MediaLink = (id: string, name?: string) => string;
+
+function plainMediaLink(id: string, name?: string): string {
+  return `/api/media/${id}/stream${name ? "/" + encodeURIComponent(name) : ""}`;
 }
 
 export function parseMediaRange(value: string, size: number): { start: number; end: number } | undefined {
@@ -69,7 +75,10 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
       ...media,
       thumbnailUrl: `/api/media/${media.id}/thumbnail?v=${version}`,
       previewUrl: "kind" in media && media.kind === "video" ? `/api/media/${media.id}/preview.gif?v=${version}` : "",
-      streamUrl: mediaLink(media.id),
+      // The name is cosmetic (see media-links.ts): it makes the exported URL look like a file to
+      // download managers that refuse extension-less targets. Not every media-shaped payload
+      // carries a path (the dashboard's do not), so it is added only when one is there.
+      streamUrl: mediaLink(media.id, mediaName(media)),
     };
   };
   const requiredMedia = (id: string) => {
@@ -238,6 +247,9 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
     return reply.status(206).header("content-range", `bytes ${start}-${end}/${stat.size}`).header("content-length", end - start + 1).send(fs.createReadStream(file, { start, end }));
   };
   app.get<{ Params: { id: string } }>("/api/media/:id/stream", async (request, reply) => sendMedia(request, reply, request.params.id));
+  // The same stream under a name that looks like a file. The name is ignored when serving; it only
+  // exists so a download manager sees ".mp4" and can name its task properly.
+  app.get<{ Params: { id: string; name: string } }>("/api/media/:id/stream/:name", async (request, reply) => sendMedia(request, reply, request.params.id));
 
   return { settings: () => ({ subtitles: libraryDb.subtitleSettings(), subtitleLanguages: SUBTITLE_LANGUAGES }), scan: () => catalog.scan() };
 }

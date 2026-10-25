@@ -44,3 +44,35 @@ describe("media link tokens", () => {
     expect(authorizedMediaLink({ url: "/api/library" }, secret)).toBeUndefined();
   });
 });
+
+/**
+ * The trailing file name exists for download managers, not for the server: a URL that ends in
+ * ".mp4" is queued by clients that refuse an extension-less target, and the task list shows a real
+ * name instead of "stream". It is cosmetic, so it must not affect what the token authorises.
+ */
+describe("media link file names", () => {
+  it("puts the name in the path, encoded", () => {
+    const url = mediaLinkUrl(id, secret, "clip one.mp4");
+    expect(url.startsWith(`/api/media/${id}/stream/clip%20one.mp4?exp=`)).toBe(true);
+    expect(authorizedMediaLink({ url }, secret)).toBe(id);
+  });
+
+  it("keeps the same token whether or not a name is present", () => {
+    const plain = new URL(mediaLinkUrl(id, secret), "http://localhost");
+    const named = new URL(mediaLinkUrl(id, secret, "clip.mp4"), "http://localhost");
+    expect(named.searchParams.get("token")).toBe(plain.searchParams.get("token"));
+    expect(named.searchParams.get("exp")).toBe(plain.searchParams.get("exp"));
+  });
+
+  it("cannot be turned into another path by editing the name", () => {
+    const url = mediaLinkUrl(id, secret, "clip.mp4");
+    // A slash cannot appear in the name segment, so "stream/<name>" can never become a deeper path.
+    expect(authorizedMediaLink({ url: url.replace("/stream/clip.mp4", "/stream/a/b") }, secret)).toBeUndefined();
+    expect(authorizedMediaLink({ url: url.replace("/stream/clip.mp4", "/stream/../../thumbnail") }, secret)).toBeUndefined();
+  });
+
+  it("still refuses the name form with a token minted for another id", () => {
+    const url = mediaLinkUrl(id, secret, "clip.mp4").replace(`/media/${id}/`, `/media/${other}/`);
+    expect(authorizedMediaLink({ url }, secret)).toBeUndefined();
+  });
+});

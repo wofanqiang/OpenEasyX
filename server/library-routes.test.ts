@@ -79,10 +79,11 @@ describe("media link payload", () => {
     const downloadDb = { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3];
     const app = Fastify();
     // The production wiring passes the signer; this asserts the two halves agree.
-    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => [], (id) => mediaLinkUrl(id, secret));
+    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => [], (id, name) => mediaLinkUrl(id, secret, name));
 
     const streamUrl: string = (await app.inject({ method: "GET", url: `/api/media/${item.id}` })).json().streamUrl;
-    expect(streamUrl.startsWith(`/api/media/${item.id}/stream?exp=`)).toBe(true);
+    // The name rides in the path so a download manager sees a file, not an extension-less endpoint.
+    expect(streamUrl.startsWith(`/api/media/${item.id}/stream/clip.mp4?exp=`)).toBe(true);
     expect(authorizedMediaLink({ url: streamUrl }, secret)).toBe(item.id);
     await app.close();
     db.close();
@@ -100,7 +101,7 @@ describe("downloading a media file", () => {
     const catalog = { playbackFile: async () => ({ file: path.join(media, relative), mimeType: "video/mp4" }) } as unknown as Catalog;
     const downloadDb = { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3];
     const app = Fastify();
-    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => [], (id) => mediaLinkUrl(id, "download-secret"));
+    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => [], (id, name) => mediaLinkUrl(id, "download-secret", name));
 
     // The player asks for a stream: it must stay inline, or the video opens in the tab.
     const stream = await app.inject({ method: "GET", url: `/api/media/${item.id}/stream` });
@@ -117,6 +118,11 @@ describe("downloading a media file", () => {
     // A client that reads until the connection ends must not be left waiting for one: the file
     // arrives, the socket closes, the download manager files it.
     expect(download.headers["connection"]).toBe("close");
+    // The named form serves the same bytes and the same headers; only the path looks like a file.
+    const named = await app.inject({ method: "GET", url: `/api/media/${item.id}/stream/clip%20one.mp4?download=1` });
+    expect(named.statusCode).toBe(200);
+    expect(named.headers["content-disposition"]).toContain('filename="clip one.mp4"');
+
     // The token in the query string is not part of what the signature covers, so adding the
     // download flag cannot invalidate it.
     const signed = (await app.inject({ method: "GET", url: `/api/media/${item.id}` })).json().streamUrl as string;
