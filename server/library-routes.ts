@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { Catalog } from "./catalog.js";
 import type { Database } from "./database.js";
@@ -45,6 +46,19 @@ export function parseMediaRange(value: string, size: number): { start: number; e
   const requestedEnd = match[2] ? Number(match[2]) : size - 1;
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(requestedEnd) || start < 0 || start >= size || requestedEnd < start) return undefined;
   return { start, end: Math.min(requestedEnd, size - 1) };
+}
+
+/**
+ * A Content-Disposition that saves the file under the name the library knows it by, not the name
+ * of whatever the player happens to be reading from (a remuxed copy in the playback cache). The
+ * name comes off the filesystem, so anything that could break the header -- quotes, newlines --
+ * is removed, and the original is carried along in the RFC 5987 form for names that are not
+ * plain ASCII.
+ */
+function attachmentDisposition(relativePath: string): string {
+  const name = path.basename(relativePath).replace(/[\r\n"\\]/g, "_").trim() || "media";
+  const ascii = name.replace(/[^\x20-\x7e]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
 export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, libraryDb: LibraryDatabase, catalog: Catalog, downloadDb: Database, dataDir: string, mergingIds: () => string[] = () => [], mediaLink: MediaLink = plainMediaLink) {
@@ -205,6 +219,12 @@ export function registerLibraryRoutes(app: FastifyInstance<any, any, any, any>, 
     try { stat = fs.statSync(file); } catch { throw Object.assign(new Error("Media file is not available"), { statusCode: 404 }); }
     if (!stat.isFile() || stat.size <= 0) { libraryDb.markMediaUnplayable(media.id); throw Object.assign(new Error("Media file is not playable"), { statusCode: 404 }); }
     const range = request.headers.range;
+    // An exported link is meant for a download manager, not for a player. Without this the
+    // browser opens the video inline and a multi-gigabyte file looks like a download that never
+    // starts -- the same bytes, delivered, but as something the browser wants to play.
+    if ((request.query as { download?: string } | undefined)?.download === "1") {
+      reply.header("content-disposition", attachmentDisposition(media.relativePath));
+    }
     reply.header("accept-ranges", "bytes").header("content-type", playback.mimeType).header("cache-control", "private, max-age=3600");
     if (!range) return reply.header("content-length", stat.size).send(fs.createReadStream(file));
     const parsed = parseMediaRange(range, stat.size);

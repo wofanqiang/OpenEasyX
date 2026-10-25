@@ -499,8 +499,31 @@ function clockDuration(seconds: number): string {
 }
 
 /** One absolute stream URL per line, so the export drops straight into `wget -i` or a manager. */
+/**
+ * The origin a download manager can actually use. A bare IP address cannot carry a trusted
+ * certificate -- the authorities issue names, not addresses -- so an https link to one is refused
+ * by everything that verifies certificates: wget, aria2c and the browser alike. A named host
+ * keeps its scheme.
+ */
+export function exportOrigin(origin: string): string {
+  try {
+    const url = new URL(origin);
+    const host = url.hostname.replace(/^\[|\]$/g, "");
+    const bareAddress = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":");
+    return bareAddress ? `http://${url.host}` : origin;
+  } catch {
+    return origin;
+  }
+}
+
+/**
+ * One absolute download URL per line, so the file drops straight into `wget -i`, aria2c or a
+ * download manager's import box. `download=1` is what tells the server to answer with a file
+ * rather than a stream the browser would try to play.
+ */
 export function linkExportText(items: Array<Pick<Media, "streamUrl">>, origin: string): string {
-  return `${items.map((item) => `${origin}${item.streamUrl}`).join("\n")}\n`;
+  const base = exportOrigin(origin);
+  return `${items.map((item) => `${base}${item.streamUrl}${item.streamUrl.includes("?") ? "&" : "?"}download=1`).join("\n")}\n`;
 }
 
 /** The file is named after the export day, not the first video: exports mix performers freely. */
@@ -510,7 +533,7 @@ export function linkExportName(now: Date): string {
 
 /** One-click export of the selected videos' stream URLs as a text file. */
 export function ExportLinksButton({ count, disabled, onExport }: { count: number; disabled: boolean; onExport: () => void }) {
-  return <button className="export-selection" disabled={disabled} title={disabled ? "Select at least one video" : `Export ${count} video link${count === 1 ? "" : "s"} to a text file`} onClick={onExport}><Download/>Links{count ? ` (${count})` : ""}</button>;
+  return <button className="export-selection" disabled={disabled} title={disabled ? "Select at least one video" : `Export ${count} video link${count === 1 ? "" : "s"} as download-URLs for wget, aria2c or a download manager`} onClick={onExport}><Download/>Links{count ? ` (${count})` : ""}</button>;
 }
 
 /**

@@ -89,6 +89,39 @@ describe("media link payload", () => {
   });
 });
 
+describe("downloading a media file", () => {
+  it("answers a download request with a file, and leaves the player stream alone", async () => {
+    const { data, media, db } = libraryFixture();
+    const relative = path.join("Example Performer", "example.com", "clip one.mp4");
+    fs.writeFileSync(path.join(media, relative), "video");
+    await new Catalog(db, media, data, false).scan();
+    const item = db.listMedia().items[0];
+
+    const catalog = { playbackFile: async () => ({ file: path.join(media, relative), mimeType: "video/mp4" }) } as unknown as Catalog;
+    const downloadDb = { markStoredItemDeleted: () => false } as unknown as Parameters<typeof registerLibraryRoutes>[3];
+    const app = Fastify();
+    registerLibraryRoutes(app, db, catalog, downloadDb, data, () => [], (id) => mediaLinkUrl(id, "download-secret"));
+
+    // The player asks for a stream: it must stay inline, or the video opens in the tab.
+    const stream = await app.inject({ method: "GET", url: `/api/media/${item.id}/stream` });
+    expect(stream.statusCode).toBe(200);
+    expect(stream.headers["content-disposition"]).toBeUndefined();
+
+    // A link exported for a download manager asks for a file, and gets one with a name.
+    const download = await app.inject({ method: "GET", url: `/api/media/${item.id}/stream?download=1` });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-disposition"]).toContain("attachment;");
+    expect(download.headers["content-disposition"]).toContain('filename="clip one.mp4"');
+    // The token in the query string is not part of what the signature covers, so adding the
+    // download flag cannot invalidate it.
+    const signed = (await app.inject({ method: "GET", url: `/api/media/${item.id}` })).json().streamUrl as string;
+    expect(authorizedMediaLink({ url: `${signed}&download=1` }, "download-secret")).toBe(item.id);
+
+    await app.close();
+    db.close();
+  });
+});
+
 describe("media deletion while a merge is running", () => {
   it("refuses to delete a video a running merge is still streaming from", async () => {
     const { data, media, db } = libraryFixture();
