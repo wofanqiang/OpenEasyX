@@ -157,3 +157,108 @@ describe("hls proxy routing", () => {
     }
   });
 });
+
+/**
+ * A refusal from the provider is a verdict, not a hiccup, and the recorder retries far faster than
+ * a CDN changes its mind: a broadcast that ended produced 22 upstream requests in 2.4 seconds on a
+ * live box. These pin down that the refusal is remembered per URL, so those retries are answered
+ * locally -- and that nothing transient is remembered, so a real recovery is not delayed.
+ */
+describe("remembering a refusal", () => {
+  function statusReply(): { reply: FastifyReply; status: () => number | undefined; body: () => string } {
+    let code: number | undefined;
+    let sent = "";
+    const reply = {
+      status: (value: number) => { code = value; return reply; },
+      type: () => reply,
+      header: () => reply,
+      send: (value: unknown) => { sent = typeof value === "string" ? value : JSON.stringify(value); return reply; },
+    };
+    return { reply: reply as unknown as FastifyReply, status: () => code, body: () => sent };
+  }
+
+  it("answers a repeated 403 from memory instead of asking again", async () => {
+    let calls = 0;
+    const proxy = new HlsProxy(async () => { calls += 1; return new Response("forbidden", { status: 403 }); });
+    const path = proxy.register({ url: "https://cdn.test/gated.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+
+    const first = statusReply();
+    await proxy.serve(path, first.reply, {});
+    expect(first.status()).toBe(403);
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const again = statusReply();
+      await proxy.serve(path, again.reply, {});
+      expect(again.status()).toBe(403);
+      expect(again.body()).toContain("403");
+    }
+    expect(calls).toBe(1);
+  });
+
+  it("asks again once the memory has expired", async () => {
+    let calls = 0;
+    const proxy = new HlsProxy(async () => { calls += 1; return new Response("forbidden", { status: 410 }); }, undefined, 30);
+    const path = proxy.register({ url: "https://cdn.test/gone.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+
+    await proxy.serve(path, statusReply().reply, {});
+    expect(calls).toBe(1);
+    await proxy.serve(path, statusReply().reply, {});
+    expect(calls).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 45));
+    await proxy.serve(path, statusReply().reply, {});
+    expect(calls).toBe(2);
+  });
+
+  it("does not remember a transient failure, so a recovery is not delayed", async () => {
+    let calls = 0;
+    const proxy = new HlsProxy(async () => {
+      calls += 1;
+      return calls === 1 ? new Response("boom", { status: 503 }) : new Response("#EXTM3U\n", { status: 200, headers: { "content-type": "application/vnd.apple.mpegurl" } });
+    });
+    const path = proxy.register({ url: "https://cdn.test/flaky.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+
+    await proxy.serve(path, statusReply().reply, {});
+    const recovered = statusReply();
+    await proxy.serve(path, recovered.reply, {});
+    expect(recovered.body()).toContain("#EXTM3U");
+    expect(calls).toBe(2);
+  });
+
+  it("clears the memory once a request succeeds, so a later refusal is a fresh decision", async () => {
+    const plan = [403, 200, 403];
+    let index = 0;
+    const proxy = new HlsProxy(async () => {
+      const status = plan[Math.min(index++, plan.length - 1)];
+      return new Response(status === 200 ? "#EXTM3U\n" : "no", { status, headers: { "content-type": "application/vnd.apple.mpegurl" } });
+    }, undefined, 30);
+    const path = proxy.register({ url: "https://cdn.test/flap.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+
+    const first = statusReply();
+    await proxy.serve(path, first.reply, {});
+    expect(first.status()).toBe(403);
+    expect(index).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 45));
+    const second = statusReply();
+    await proxy.serve(path, second.reply, {});
+    expect(second.body()).toContain("#EXTM3U");
+    expect(index).toBe(2);
+
+    // The success above cleared the memory; the next refusal must be asked for again rather than
+    // answered from a verdict that no longer applies.
+    const third = statusReply();
+    await proxy.serve(path, third.reply, {});
+    expect(third.status()).toBe(403);
+    expect(index).toBe(3);
+  });
+
+  it("can be switched off, which restores one upstream request per attempt", async () => {
+    let calls = 0;
+    const proxy = new HlsProxy(async () => { calls += 1; return new Response("forbidden", { status: 403 }); }, undefined, 0);
+    const path = proxy.register({ url: "https://cdn.test/gated.m3u8" }).replace(LIVE_PROXY_PREFIX, "");
+
+    for (let attempt = 0; attempt < 3; attempt += 1) await proxy.serve(path, statusReply().reply, {});
+    expect(calls).toBe(3);
+  });
+});

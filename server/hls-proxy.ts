@@ -21,9 +21,21 @@ import type { LiveStream } from "../packages/plugin-sdk/index.js";
  * URLs handed to a player or a recorder are safe to treat as capabilities.
  */
 
-type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; fingerprint?: boolean; expiresAt: number };
+type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; fingerprint?: boolean; expiresAt: number; reject?: { status: number; until: number } };
 
 const ENTRY_TTL_MS = 15 * 60_000;
+/**
+ * How long a definitive rejection (403/410/429) is remembered for one URL.
+ *
+ * The recorder retries a playlist far faster than a CDN can change its mind: a broadcast that
+ * ended produced 22 upstream requests in 2.4 seconds on a live box, and a CDN that is rate-limiting
+ * gets that pressure multiplied back at it exactly when it asked for less. Answering those retries
+ * from memory keeps the refusal cheap for both sides. The verdict is per URL, so a re-resolved
+ * stream -- which gets a new URL, and therefore a new entry -- is never blocked by it.
+ */
+const DEFAULT_REJECT_BACKOFF_MS = 5_000;
+/** Statuses that mean "no" rather than "not now": a 5xx or a dropped connection is worth retrying. */
+const REJECT_STATUSES = new Set([403, 410, 429]);
 /**
  * How often expired entries are actually swept. `url()` runs on every line of every rewritten
  * playlist, and a full scan per line made the proxy's cost grow with the recording's length; a
@@ -68,7 +80,12 @@ export class HlsProxy {
    * answers plain fetches through Python's curl_cffi taxes every byte of the recording for nothing
    * (measured: 13% of one core for a Chaturbate capture that needs no fingerprint at all).
    */
-  constructor(private readonly request: typeof fetch = fetch, private readonly fingerprinted?: typeof fetch) {}
+  constructor(
+    private readonly request: typeof fetch = fetch,
+    private readonly fingerprinted?: typeof fetch,
+    /** How long a 403/410/429 is answered from memory; 0 disables the memory. */
+    private readonly rejectBackoffMs = DEFAULT_REJECT_BACKOFF_MS,
+  ) {}
 
   /**
    * Wrap a resolved stream in a proxy URL. A stream that carries both a video and an audio
@@ -135,6 +152,12 @@ export class HlsProxy {
     const sourceUrl = new URL(entry.url!);
     for (const key of FORWARDED_QUERY) { const value = text(query[key]); if (value) sourceUrl.searchParams.set(key, value); }
 
+    // Answer a remembered refusal without touching the network. Deliberately silent: the refusal
+    // was logged once when it happened, and repeating it per retry is the log spam this replaces.
+    if (entry.reject && entry.reject.until > Date.now()) {
+      return reply.status(entry.reject.status).send({ error: `Live provider returned HTTP ${entry.reject.status}` });
+    }
+
     let response: Response;
     try { response = await this.fetchUpstream(sourceUrl, entry.headers, range, entry.fingerprint ? this.fingerprinted : undefined); }
     catch (error) {
@@ -142,9 +165,15 @@ export class HlsProxy {
       return reply.status(502).send({ error: `Upstream live provider unreachable: ${error instanceof Error ? error.message : String(error)}` });
     }
     if (!response.ok) {
+      // A refusal is a verdict, not a hiccup: remember it for a few seconds so the recorder's
+      // retries are answered locally instead of being multiplied at the provider.
+      if (REJECT_STATUSES.has(response.status) && this.rejectBackoffMs > 0) {
+        entry.reject = { status: response.status, until: Date.now() + this.rejectBackoffMs };
+      }
       log?.("live proxy: provider returned HTTP " + response.status + " for " + sourceUrl.host + sourceUrl.pathname);
       return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
     }
+    entry.reject = undefined;
 
     const contentType = response.headers.get("content-type") ?? "application/octet-stream";
     const contentRange = response.headers.get("content-range");
