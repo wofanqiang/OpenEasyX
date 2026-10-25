@@ -50,3 +50,54 @@ describe("download concurrency ceiling", () => {
     expect(concurrentDownloads(100)).toBe(24);
   });
 });
+
+/**
+ * The capture pool has its own load gate: starting a capture on a saturated box makes the
+ * saturation worse, and the broadcast is still there a second later. It must refuse to start --
+ * not stop what is running -- and it must start again the moment the load drops.
+ */
+describe("capture start gate", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  async function liveQueue(root: string) {
+    const { DownloadQueue } = await import("./downloader.js");
+    const db = new Database(root);
+    // Three different rooms: the queue allows only one capture per source, so three items on one
+    // source would collapse into a duplicate pair before the gate could ever be observed.
+    db.updateSettings({ maxConcurrentRecordings: 2 });
+    for (const room of ["anna", "bea", "cora"]) {
+      const person = db.createPerformer({ name: "Performer " + room });
+      const source = db.addSource(person.id, "test", { externalId: room, label: room, profileUrl: "https://test.test/" + room, domain: "test.test" });
+      db.updateSource(source.id, { autoDownload: true });
+      // ingestItems reads autoDownload off the Source it is handed, so pass the updated row: a live
+      // candidate only queues when its own source opted in.
+      db.ingestItems(db.getSource(source.id)!, [{ externalId: "live-" + room, mediaType: "video" as const, metadata: { live: true } }]);
+    }
+    const plugins = {
+      get: () => ({ resolveDownload: (context: PluginContext) => new Promise((_resolve, reject) => context.signal!.addEventListener("abort", () => reject(new Error("Stopped")), { once: true })) }),
+      context: (_id: string, signal: AbortSignal) => ({ signal }),
+    } as unknown as PluginManager;
+    const queue = new DownloadQueue(db, plugins, path.join(root, "media"));
+    return { db, queue };
+  }
+
+  it("starts no capture while the box is overloaded, and starts them once it is not", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-capture-gate-"));
+    vi.spyOn(os, "cpus").mockReturnValue(new Array(1).fill({}) as os.CpuInfo[]);
+    const load = vi.spyOn(os, "loadavg").mockReturnValue([3, 3, 3]);
+    const { db, queue } = await liveQueue(root);
+    try {
+      queue.start();
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+      expect(db.listItems().filter((item) => item.status === "downloading")).toHaveLength(0);
+      expect(db.listItems().filter((item) => item.status === "queued")).toHaveLength(3);
+
+      load.mockReturnValue([0.2, 0.2, 0.2]);
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+      expect(db.listItems().filter((item) => item.status === "downloading")).toHaveLength(2);
+    } finally {
+      queue.stop(); await new Promise((resolve) => setImmediate(resolve));
+      db.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});

@@ -19,6 +19,7 @@ import type { LogLevel } from "./log-store.js";
 import { isOfflineConfirmedError } from "./offline-error.js";
 import { reapOrphans, reapModeFromEnv } from "./process-reap.js";
 import { PostProcessGate } from "./postprocess-gate.js";
+import { CaptureStartGate } from "./capture-gate.js";
 import type { HlsProxy } from "./hls-proxy.js";
 import { canMatchVideoExcerpt, fingerprintVideo, verifyVideoContainment, videoFileStamp, type VideoFingerprint } from "./video-matching.js";
 import type { TaskRegistry } from "./tasks.js";
@@ -39,6 +40,12 @@ export type RecoveryReport = {
 // setting keeps meaning what it always meant; recordings get their own, larger one because a
 // broadcast is time sensitive and cannot be retried later.
 const DEFAULT_MAX_DOWNLOADS = 2;
+/**
+ * How long a start counts as "replacing a preempted capture". Preemption stops a lower-priority
+ * capture so a higher-priority one can take the slot; if the load gate refused that start the box
+ * would end up with one capture fewer than it had, so the swap is exempt from the gate.
+ */
+const PREEMPT_RELEASE_MS = 30_000;
 const MAX_DOWNLOADS = 8;
 // Default lowered from 8: on the small (1-core / 1.6GB) boxes this app commonly runs on,
 // eight simultaneous ffmpeg captures starve the very recordings they serve (measured: the
@@ -378,6 +385,10 @@ export class DownloadQueue {
   private timer?: NodeJS.Timeout;
   private lowPrioritySupport?: boolean;
   private readonly postProcessGate: PostProcessGate;
+  /** Declines a capture *start* while the box is overloaded; never blocks and never stops one. */
+  private readonly captureGate: CaptureStartGate;
+  /** When a capture was last stopped to make room for a higher-priority one. */
+  private preemptedAt = 0;
   constructor(
     private db: Database,
     private plugins: PluginManager,
@@ -397,6 +408,10 @@ export class DownloadQueue {
     // 1-core box, loadavg 13, capture throughput ~0). Concurrency and thresholds are tunable
     // via EASYX_POSTPROCESS_CONCURRENCY / _LOAD_PAUSE / _LOAD_RESUME.
     this.postProcessGate = PostProcessGate.fromEnv((level, message, meta) => this.writeLog?.(level, "download", message, meta));
+    // Starting a capture is the one place where waiting is cheaper than working: the broadcast is
+    // still there in a second, and a capture started on a saturated box makes the saturation worse.
+    // Thresholds: EASYX_CAPTURE_LOAD_PAUSE / _RESUME / _MAX_WAIT_SECONDS.
+    this.captureGate = CaptureStartGate.fromEnv((level, message, meta) => this.writeLog?.(level, "download", message, meta));
   }
 
   /**
@@ -655,10 +670,17 @@ export class DownloadQueue {
     // A higher-priority live recording waiting for a slot preempts a lower one, but only when
     // the recordings pool is actually full: with a free slot both recordings can run side by side.
     if (this.activeCounts().recordings >= limits.recordings) this.preemptForPriority();
+    // One verdict per tick, never per item: a plan can name both pools, and two answers inside one
+    // tick would contradict each other. A preemption that just gave up a slot is exempt -- refusing
+    // the replacement would leave the box one capture short of what it had a moment ago.
+    const captureAllowed = this.captureGate.allowsStart();
+    const replacingPreempted = this.preemptedAt > 0 && Date.now() - this.preemptedAt < PREEMPT_RELEASE_MS;
     // Each pool drains only its own queue, so a recording can never be blocked behind a
     // backfill and a backfill can never be blocked behind a broadcast. A pool whose queue
     // is empty yields nothing and the plan simply moves on to the other one.
     for (const kind of slotPlan(this.activeCounts(), limits)) {
+      // Declining here only skips this attempt; the next tick re-asks a second later.
+      if (kind === "recording" && !captureAllowed && !replacingPreempted) continue;
       let item = this.db.nextQueued(kind === "recording");
       // A queued capture can outlive the room it was queued for: the status said live when it was
       // queued, but the broadcast may end while the item waits for a slot. Dropping it here costs
@@ -709,7 +731,7 @@ export class DownloadQueue {
         .sort(([, left], [, right]) => (left.priority ?? 0) - (right.priority ?? 0) || (right.startedAt ?? 0) - (left.startedAt ?? 0))[0];
       if (!victim) return;
       const [itemId, control] = victim;
-      control.preempted = true; control.action = "stop";
+      control.preempted = true; control.action = "stop"; this.preemptedAt = Date.now();
       this.signal(control, "SIGCONT"); this.signal(control, "SIGINT"); control.abort?.abort();
       const item = this.db.setItemStatus(itemId, "stopping");
       this.writeLog?.("info", "download", "Recording stopped for a higher-priority performer", { itemId, title: item?.title, priority: control.priority ?? 0, waitingPriority: priority });
