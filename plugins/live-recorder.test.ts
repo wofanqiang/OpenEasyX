@@ -66,3 +66,85 @@ describe("segmented live recorder", () => {
     controller.abort(new Error("Stopped")); await expect(pending).rejects.toThrow("Stopped");
   });
 });
+
+/**
+ * A room that changes quality mid-broadcast is common (the encoder drops a ladder step when the
+ * uplink gets tight). The recorder used to treat that as "this video is finished", which split one
+ * broadcast into two files and lost the minutes the watcher needed to notice the room again.
+ *
+ * Verified before wiring this in: a 720p part followed by a 480p part concatenated with
+ * `-c copy` decodes cleanly and the frames switch resolution at the join, so one continuous file
+ * is safe. A codec change (hvc1, av01) is the one thing `-c copy` cannot splice, and that still
+ * finishes the video.
+ */
+async function variantFixture(secondCodecs: string) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-recorder-quality-"));
+  cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sample = path.join(root, "sample.ts");
+  execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10", "-t", "0.5", "-c:v", "libx264", "-f", "mpegts", sample]);
+  const ffmpeg = execFileSync("which", ["ffmpeg"], { encoding: "utf8" }).trim();
+  const bin = path.join(root, "bin"); fs.mkdirSync(bin);
+  // Same fake encoder as the fixture above, without the stop/cancel tail: every capture attempt
+  // copies the sample and exits 0, so the recorder decides on its own when to stop.
+  fs.writeFileSync(path.join(bin, "ffmpeg"), `#!${process.execPath}\nconst fs=require('node:fs'),{spawnSync}=require('node:child_process');const args=process.argv.slice(2);if(args.includes('concat')){const result=spawnSync(${JSON.stringify(ffmpeg)},args,{stdio:'inherit'});process.exit(result.status??1)}fs.appendFileSync(${JSON.stringify(path.join(root, "inputs.txt"))}, args[args.indexOf('-i')+1]+'\\n');fs.copyFileSync(${JSON.stringify(sample)},args.at(-1))`);
+  fs.chmodSync(path.join(bin, "ffmpeg"), 0o755);
+  const output = path.join(root, "output.mp4");
+  const media = (ended: boolean) => "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1\nsegment.ts\n" + (ended ? "#EXT-X-ENDLIST\n" : "");
+  const server = http.createServer((request, response) => {
+    const partOne = fs.existsSync(path.join(root, "live-parts", "part-001.ts"));
+    const partTwo = fs.existsSync(path.join(root, "live-parts", "part-002.ts"));
+    if (request.url === "/master.m3u8") {
+      // A master playlist never carries ENDLIST; it just stops offering the high variant.
+      response.end([
+        "#EXTM3U",
+        '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"',
+        "/high.m3u8",
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=854x480,CODECS="' + secondCodecs + '"',
+        "/low.m3u8",
+        "",
+      ].join("\n"));
+      return;
+    }
+    if (request.url === "/high.m3u8") { response.end(media(partOne)); return; }
+    response.end(media(partTwo));
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening"); cleanup.push(() => server.close());
+  const port = (server.address() as { port: number }).port;
+  const child = spawn(process.execPath, ["-e", LIVE_RECORDER_SCRIPT,
+    `http://127.0.0.1:${port}/high.m3u8`,
+    `http://127.0.0.1:${port}/master.m3u8`,
+    "{}", output, "300", "20", "Test"],
+    { detached: true, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdio: ["ignore", "pipe", "pipe"] });
+  cleanup.push(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch {} });
+  const finished = once(child, "close"); let logs = ""; child.stderr.on("data", (chunk) => { logs += chunk; });
+  return { root, output, finished, logs: () => logs };
+}
+describe("quality changes and endings", () => {
+  it("continues one video when only the quality changed", { timeout: 15_000 }, async () => {
+    const f = await variantFixture("avc1.4d401e,mp4a.40.2");
+    expect((await f.finished)[0], f.logs()).toBe(0);
+    const inputs = fs.readFileSync(path.join(f.root, "inputs.txt"), "utf8").trim().split("\n");
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toContain("/high.m3u8");
+    expect(inputs[1]).toContain("/low.m3u8");
+    expect(f.logs()).toContain("quality changed to 854x480");
+    expect(f.logs()).toContain("joined 2 parts");
+  });
+  it("finishes the video when the codec changed, because -c copy cannot splice it", { timeout: 15_000 }, async () => {
+    const f = await variantFixture("hvc1.1.6.L93.B0,mp4a.40.2");
+    expect((await f.finished)[0], f.logs()).toBe(0);
+    const inputs = fs.readFileSync(path.join(f.root, "inputs.txt"), "utf8").trim().split("\n");
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toContain("/high.m3u8");
+    expect(f.logs()).toContain("different codecs");
+  });
+  it("gives the slot back at once when the broadcast is gone", { timeout: 10_000 }, async () => {
+    const f = await fixture("finite");
+    const started = Date.now();
+    expect((await f.finished)[0], f.logs()).toBe(0);
+    // The window in this fixture is 300 ms, so the timing alone proves little; the log line is what
+    // distinguishes "asked why and got a verdict" from "waited the window out".
+    expect(f.logs()).toContain("the broadcast has ended");
+    expect(Date.now() - started).toBeLessThan(9_000);
+  });
+});

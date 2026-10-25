@@ -29,6 +29,20 @@ async function get(url) {
   const response = await fetch(url, { headers: { ...headers, "user-agent": userAgent }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
   return response.ok ? response.text() : undefined;
 }
+// Why nothing is servable matters more than the fact itself: a broadcast that has ended should
+// free the capture slot at once, while a provider we merely cannot reach is exactly what the wait
+// window exists to wait out. Only an unambiguous "gone" counts -- 404/410, or a playlist whose own
+// ENDLIST says the stream closed. A 403 does not, because rate limiting answers the same way.
+async function masterGone() {
+  try {
+    const response = await fetch(currentMasterUrl, { headers: { ...headers, "user-agent": userAgent }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
+    if (response.status === 404 || response.status === 410) return true;
+    if (!response.ok) return false;
+    const text = await response.text();
+    if (!text.trimStart().startsWith("#EXTM3U")) return false;
+    return text.includes("#EXT-X-ENDLIST");
+  } catch { return false; }
+}
 async function variants(refresh = false) {
   if (refresh && refreshUrl && refreshField) {
     const body = await get(refreshUrl);
@@ -49,27 +63,47 @@ async function variants(refresh = false) {
     if (!line || line.startsWith("#") || !/\.m3u8(?:$|\?)/i.test(line)) continue;
     const url = new URL(line, currentMasterUrl);
     if (pkey && !url.searchParams.has("pkey")) url.searchParams.set("pkey", pkey);
-    list.push({ url: url.toString(), bandwidth: Number((info.match(/(?:^|[:,])BANDWIDTH=(\d+)/i) || [])[1] || 0), resolution: (info.match(/RESOLUTION=(\d+x\d+)/i) || [])[1] || "" });
+    list.push({ url: url.toString(), bandwidth: Number((info.match(/(?:^|[:,])BANDWIDTH=(\d+)/i) || [])[1] || 0), resolution: (info.match(/RESOLUTION=(\d+x\d+)/i) || [])[1] || "", codecs: (info.match(/CODECS="([^"]+)"/i) || [])[1] || "" });
     info = "";
   }
   return list.sort((a, b) => b.bandwidth - a.bandwidth);
 }
-async function liveVariant(resolution) {
+// "avc1.4d401f,mp4a.40.2" -> "avc1,mp4a". The profile and level inside a family can differ (that is
+// still H.264, still spliceable); a family change -- hvc1, av01 -- is what a -c copy splice cannot
+// carry, so that is the only thing that still finishes a video.
+function codecFamilies(value) {
+  return (value || "").split(",").map((part) => part.trim().toLowerCase().split(".")[0]).filter(Boolean).sort().join(",");
+}
+function sameCodecs(left, right) {
+  if (!left || !right) return true; // the master did not advertise them: do not split on a guess
+  return codecFamilies(left) === codecFamilies(right);
+}
+async function liveVariant(resolution, codecs) {
   const list = await variants(true);
-  const ordered = resolution ? list.filter((item) => item.resolution === resolution) : list;
-  for (const item of ordered) {
-    try { const text = await get(item.url); if (text && isLive(text)) return item; } catch {}
-  }
-  if (!resolution || ordered.length) return undefined;
+  // Collect what is actually broadcasting before deciding: "no variant is live" and "a different
+  // variant is live" need opposite answers from the caller.
+  const live = [];
   for (const item of list) {
-    try { const text = await get(item.url); if (text && isLive(text)) return { url: "", resolution: "changed" }; } catch {}
+    try { const text = await get(item.url); if (text && isLive(text)) live.push(item); } catch {}
   }
-  return undefined;
+  if (!resolution) return live[0];
+  const preferred = live.find((item) => item.resolution === resolution);
+  if (preferred) return preferred;
+  if (!live.length) return undefined;
+  // The quality this recording started at is gone, but another one is still broadcasting.
+  // Switching is better than finishing the file: verified that a 720p part followed by a 480p part
+  // concatenated with -c copy decodes cleanly and the frames switch resolution at the join, and one
+  // continuous video beats two files plus the minutes lost while the watcher notices the room again.
+  const compatible = live.find((item) => sameCodecs(item.codecs, codecs));
+  return compatible ?? { url: "", resolution: "changed" };
 }
 (async () => {
   const parts = [];
-  let url = mediaUrl, resolution;
-  try { resolution = (await variants()).find((item) => item.url === mediaUrl)?.resolution; } catch {}
+  let url = mediaUrl, resolution, codecs;
+  try {
+    const initial = (await variants()).find((item) => item.url === mediaUrl);
+    resolution = initial?.resolution; codecs = initial?.codecs;
+  } catch {}
   while (!stopping) {
     const part = path.join(partsDir, "part-" + String(parts.length + 1).padStart(3, "0") + ".ts");
     const headerLines = Object.entries(headers).map(([name, value]) => name + ": " + value).join("\r\n") + "\r\n";
@@ -81,7 +115,8 @@ async function liveVariant(resolution) {
     if (resolution === undefined) {
       try {
         const first = new URL(mediaUrl).pathname;
-        resolution = (await variants()).find((item) => new URL(item.url).pathname === first)?.resolution || "";
+        const match = (await variants()).find((item) => new URL(item.url).pathname === first);
+        resolution = match?.resolution || ""; codecs = match?.codecs || codecs;
       } catch { resolution = ""; }
     }
     say("stream stopped (ffmpeg exit " + code + "); waiting up to " + (gapMs >= 60000 ? Math.round(gapMs / 60000) + " min" : Math.round(gapMs / 1000) + " s") + " for the room to return");
@@ -91,9 +126,15 @@ async function liveVariant(resolution) {
       await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
       if (stopping) break;
       let found;
-      try { found = await liveVariant(resolution); } catch {}
-      if (found && found.resolution === "changed") { say("room is back in a different quality; finishing this video"); break; }
-      if (found) { url = found.url; say("room is public again; continuing the recording"); break; }
+      try { found = await liveVariant(resolution, codecs); } catch {}
+      if (found && found.resolution === "changed") { say("room is back with different codecs; finishing this video"); break; }
+      if (found && found.url) {
+        if (found.resolution && found.resolution !== resolution) { resolution = found.resolution; say("quality changed to " + resolution + "; continuing the same video"); }
+        url = found.url; say("room is public again; continuing the recording"); break;
+      }
+      // Nothing servable right now. Stop at once if the broadcast is unambiguously over, so the
+      // capture slot goes back to the queue instead of being parked for the rest of the window.
+      if (await masterGone()) { say("the broadcast has ended; finishing this video"); break; }
     }
     if (!url) break;
   }
