@@ -24,7 +24,6 @@ import { authorizedMediaLink, mediaLinkUrl } from "./media-links.js";
 import { fingerprintedFetch } from "./tls-fingerprint.js";
 import { trustProxyOption } from "./trusted-network.js";
 import { SystemStatsService } from "./system-stats.js";
-import { restoreLiveCamPerformers } from "./live-cam-restore.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
 import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
@@ -106,10 +105,12 @@ const systemStats = new SystemStatsService({ mediaDir });
 // a room still creates its performer on demand via record(), but deleting a performer must not
 // resurrect it from a leftover favorite on the next restart. Keeping the two entities independent is
 // what makes "delete performer" stick.
-restoreLiveCamPerformers(db, plugins, liveCams, (error, providerId, username) => {
-  appLogger.warn({ err: error, providerId, username, scope: "live-cams",
-    ...(error instanceof PerformerConflictError ? { conflict: error.conflict } : {}) }, "Saved favorite performer could not be restored; review the performer profiles");
-});
+//
+// A restore pass lived here and undid exactly that: it walked every favorite and created the missing
+// performer, so a deleted performer came back on the next boot. It was originally introduced to keep
+// a conflict in saved data from crashing startup; that is now handled where the conflict is raised
+// (the /api/live-cams/favorites and record routes answer 409 with the conflict payload), which does
+// not require touching performers the operator deleted.
 queue.start();
 systemStats.start();
 
