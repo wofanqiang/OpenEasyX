@@ -1061,5 +1061,11 @@ await app.listen({ port, host: "0.0.0.0" });
 startEmbeddedSubtitleWorker();
 setTimeout(() => refreshLiveCamFavorites(), 500).unref();
 setInterval(() => refreshLiveCamFavorites(), 5 * 60_000).unref();
-setTimeout(() => void catalog.scan().catch((error) => app.log.error(error, "Initial library scan failed")), 250).unref();
-setInterval(() => void catalog.scan().catch((error) => app.log.error(error, "Scheduled library scan failed")), scanIntervalMinutes * 60_000).unref();
+// A scan indexes files without opening them, so every new row starts with no runtime and the
+// library card shows none. The backfill fills them in afterwards, serialized behind the same
+// ffmpeg queue as previews so a large backlog cannot compete with a live capture.
+const scanLibrary = (failure: string) => void catalog.scan()
+  .then(() => catalog.backfillDurations())
+  .catch((error) => app.log.error(error, failure));
+setTimeout(() => scanLibrary("Initial library scan failed"), 250).unref();
+setInterval(() => scanLibrary("Scheduled library scan failed"), scanIntervalMinutes * 60_000).unref();

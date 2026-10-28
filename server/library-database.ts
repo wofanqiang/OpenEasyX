@@ -264,6 +264,18 @@ export class LibraryDatabase {
     };
   }
 
+  /**
+   * Videos nothing has ever inspected, so their runtime is still the 0 the scan wrote.
+   *
+   * Indexing deliberately does not open files, and `updateProbe` is the only other writer: a
+   * recording nobody has played or previewed reports no runtime at all, which is invisible on the
+   * library card and quietly missing from the "total available runtime" statistic.
+   */
+  mediaWithoutRuntime(limit = 50): Media[] {
+    return this.sqlite.prepare(`SELECT * FROM media WHERE missing=0 AND kind='video' AND duration<=0
+      ORDER BY added_at DESC LIMIT ?`).all(limit).map((row) => this.mapMedia(row as Record<string, unknown>));
+  }
+
   updateProbe(id: string, values: { duration?: number; width?: number; height?: number }) {
     this.sqlite.prepare(`UPDATE media SET duration=CASE WHEN ?>0 THEN ? ELSE duration END,
       width=CASE WHEN ?>0 THEN ? ELSE width END,height=CASE WHEN ?>0 THEN ? ELSE height END WHERE id=?`)

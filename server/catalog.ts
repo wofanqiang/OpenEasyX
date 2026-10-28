@@ -83,6 +83,8 @@ function runFfmpeg(args: string[], timeoutMs: number) {
 
 export class Catalog {
   private scanPromise: Promise<{ indexed: number; durationMs: number }> | null = null;
+  /** In-flight runtime backfill, so two scans cannot run it twice. */
+  private durationBackfill: Promise<void> | null = null;
   private thumbnails = new Map<string, Promise<string>>();
   private previews = new Map<string, Promise<string>>();
   private playbackFiles = new Map<string, Promise<string>>();
@@ -255,6 +257,34 @@ export class Catalog {
   forgetMedia(media: Media) {
     this.db.markMediaMissing(media.id);
     this.removeGeneratedArtifacts(media.id, media.kind);
+  }
+
+  /**
+   * Record the runtime of videos the library indexed without ever opening.
+   *
+   * Indexing writes `duration: 0` on purpose -- a scan that spawned ffprobe per file would spend
+   * seconds on a cold library while the box is also recording -- and the only other writer,
+   * `probe()`, runs when a preview is rendered or a player seeks. A recording nobody opened was
+   * therefore reported with no runtime at all: nothing on its card, and silently missing from the
+   * "total available runtime" figure. Measured on a live box: 12 of 33 files, 68 GB, every one of
+   * them a multi-hour recording.
+   *
+   * Serialized behind the preview queue so a large backlog cannot fight a live capture for the
+   * CPU, and bounded by `probe()`'s own 30s timeout. Best effort: a file that cannot be read now
+   * keeps its zero and is retried from the next scan.
+   */
+  backfillDurations(batch = 50): Promise<void> {
+    if (this.durationBackfill) return this.durationBackfill;
+    const operation = (async () => {
+      let filled = 0;
+      for (const media of this.db.mediaWithoutRuntime(batch)) {
+        try { await this.enqueueFfmpeg(() => this.probe(media)); filled += 1; }
+        catch { /* unreadable right now: the next scan tries again */ }
+      }
+      if (filled) this.warn(`Recorded the runtime of ${filled} library video(s) that had none`);
+    })().finally(() => { this.durationBackfill = null; });
+    this.durationBackfill = operation;
+    return operation;
   }
 
   private enqueueFfmpeg<T>(task: () => Promise<T>) {
