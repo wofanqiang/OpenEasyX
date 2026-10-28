@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
 import { PluginManager } from "./plugin-manager.js";
-import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, remuxCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, postProcessDeadlineMs, receivedBytes, requiresLiveProxy, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
+import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, outOfStallGrace, postProcessDeadlineMs, receivedBytes, remuxCaptureArgs, requiresLiveProxy, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 import { safeSegment } from "./utils.js";
@@ -453,6 +453,22 @@ describe("DownloadQueue", () => {
     expect(fs.existsSync(file)).toBe(false);
     expect(libraryDb.listMedia().total).toBe(0);
     libraryDb.close();
+  });
+});
+
+/**
+ * The stall timer used to kill a live capture's whole process group at the first stall, which took
+ * away the recorder's own recovery: the wrapper restarts ffmpeg, resolves the stream again and
+ * continues the recording in the same item. A live capture therefore keeps a grace window; anything
+ * else is killed as soon as it stalls.
+ */
+describe("stall grace window", () => {
+  it("kills a non-live download immediately and a live capture only after the grace window", () => {
+    const timeout = 60_000, noticed = 1_000_000;
+    expect(outOfStallGrace(false, noticed, noticed, timeout)).toBe(true);
+    expect(outOfStallGrace(true, noticed, noticed + timeout, timeout)).toBe(false);
+    expect(outOfStallGrace(true, noticed, noticed + timeout * 2 - 1, timeout)).toBe(false);
+    expect(outOfStallGrace(true, noticed, noticed + timeout * 2, timeout)).toBe(true);
   });
 });
 

@@ -142,6 +142,21 @@ export function downloadPriority(liveItem: boolean): CommandPriority | undefined
  * exactly how long recordings used to "fail" right after the capture had already finished.
  * Those steps run under `postProcessDeadlineMs` instead.
  */
+/**
+ * Whether a stalled capture has run out of its grace window, or may still recover on its own.
+ *
+ * A live capture runs inside a recorder wrapper that watches its own output and restarts ffmpeg when
+ * it stops writing; the wrapper then re-resolves the stream and continues the recording *in the same
+ * item*. Killing the process group at the first stall takes that path away -- measured on a live box,
+ * 26 recordings in three days ended as short files, each one a CDN hiccup the wrapper could have
+ * ridden out. So a live capture keeps a grace window on top of the stall bound, while everything
+ * else (a VOD download, or a wrapper that stopped responding to its own watchdog) is killed at once.
+ */
+export function outOfStallGrace(live: boolean, stalledSince: number, now: number, timeoutMs: number): boolean {
+  if (!live) return true;
+  return now - stalledSince >= timeoutMs * 2;
+}
+
 export function stalledDownload(control: Pick<ActiveDownload, "encoding" | "action" | "paused">, lastActivity: number, now: number, timeoutMs: number): boolean {
   if (control.encoding) return false;
   if (control.action || control.paused) return false;
@@ -784,6 +799,8 @@ export class DownloadQueue {
     // lastByteGrowthAt only advances when the byte count actually rises.
     let lastByteGrowthAt = Date.now();
     let lastSampledBytes = 0;
+    /** When the stall was first noticed, so the grace window is measured from there, not per tick. */
+    let stalledSince = 0;
     // On top of the stall gate, a sustained near-zero growth rate is the earliest symptom of
     // "losing the race against the live edge" (403s typically follow within minutes), so warn
     // about it while there is still time to react.
@@ -795,7 +812,7 @@ export class DownloadQueue {
     let rateAnchorBytes = 0;
     let lastLowRateWarnAt = 0;
     const noteBytes = (stamp: number, bytes: number) => {
-      if (bytes > lastSampledBytes) lastByteGrowthAt = stamp;
+      if (bytes > lastSampledBytes) { lastByteGrowthAt = stamp; stalledSince = 0; control.stalled = false; }
       lastSampledBytes = bytes;
       if (!isLiveRecording || control.encoding || control.action || control.paused) { rateAnchorAt = stamp; rateAnchorBytes = bytes; return; }
       // No bytes yet says nothing about falling behind (a slow resolve has not started
@@ -841,7 +858,11 @@ export class DownloadQueue {
       lastByteGrowthAt = Date.now();
       if (stallTimeoutMs <= 0 || stallTimer) return;
       stallTimer = setInterval(() => {
-        if (!stalledDownload(control, lastByteGrowthAt, Date.now(), stallTimeoutMs)) return;
+        if (!stalledDownload(control, lastByteGrowthAt, Date.now(), stallTimeoutMs)) { stalledSince = 0; return; }
+        if (!stalledSince) stalledSince = Date.now();
+        // The wrapper restarts its own ffmpeg on a stall; only a capture that stays silent past the
+        // grace window is killed here.
+        if (!outOfStallGrace(isLiveRecording, stalledSince, Date.now(), stallTimeoutMs)) return;
         control.stalled = true; control.abort?.abort(); this.signal(control, "SIGKILL");
       }, 5000);
       stallTimer.unref();
@@ -928,8 +949,10 @@ export class DownloadQueue {
           return argument;
         }), temporaryDirectory, item.expectedBytes, reportProgress, control, avWatcher?.onStderr, request.requireSuccessfulExit,
           // A backfill download yields to the broadcasts sharing this machine; a live capture is
-          // the thing they yield to, so it keeps the default priority.
-          { priority: downloadPriority(isLiveItem) });
+          // the thing they yield to, so it keeps the default priority. A live capture also carries
+          // the stall bound into the recorder, so the wrapper restarts a wedged ffmpeg on the same
+          // schedule this queue would otherwise kill the whole group on.
+          { priority: downloadPriority(isLiveItem), env: isLiveItem ? { ...process.env, EASYX_LIVE_STALL_MS: String(stallTimeoutMs) } : undefined });
         // Live captures land as MPEG-TS (capture.ts); remux to MP4 in place and
         // delete the TS so every downstream step only ever sees a .mp4 file.
         // Gated on the TS file actually existing so non-TS captures are untouched.
@@ -1574,7 +1597,7 @@ export class DownloadQueue {
     return (await this.lowPrioritySupported()) ? COMMAND_PRIORITY_WRAPPER[level] : undefined;
   }
 
-  private async runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, requireSuccessfulExit = false, options?: { priority?: CommandPriority }): Promise<void> {
+  private async runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, onStderr?: (text: string) => void, requireSuccessfulExit = false, options?: { priority?: CommandPriority; env?: NodeJS.ProcessEnv }): Promise<void> {
     const wrapper = await this.priorityWrapper(options?.priority);
     return new Promise((resolve, reject) => {
       // Memory guard for live recordings on small VPS: cap yt-dlp fragment concurrency
@@ -1591,7 +1614,7 @@ export class DownloadQueue {
         spawnCommand = "nice";
         spawnArgs = [...wrapper, command, ...effectiveArgs];
       }
-      const child = spawn(spawnCommand, spawnArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+      const child = spawn(spawnCommand, spawnArgs, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", env: options?.env });
       control.child = child;
       control.closed = new Promise<void>((resolve) => child.once("close", resolve));
       if (control.paused) this.signal(control, "SIGSTOP");

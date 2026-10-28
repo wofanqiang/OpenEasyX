@@ -8,6 +8,7 @@ const headers = JSON.parse(headersJson);
 let currentMasterUrl = masterUrl;
 const gapMs = Number(gapArg) || 0;
 const pollMs = Number(pollArg) || 20000;
+const stallMs = Number(process.env.EASYX_LIVE_STALL_MS) || 60000;
 const partsDir = path.join(path.dirname(output), "live-parts");
 fs.rmSync(partsDir, { recursive: true, force: true });
 fs.mkdirSync(partsDir, { recursive: true });
@@ -17,10 +18,28 @@ const say = (text) => process.stderr.write("[live-recorder] " + text + "\n");
 process.on("SIGINT", () => { stopping = true; if (process.platform === "win32") child?.kill("SIGINT"); controller.abort(); wake(); });
 process.on("SIGTERM", () => { stopping = true; cancelled = true; child?.kill("SIGKILL"); controller.abort(); wake(); });
 const sleep = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); wake = () => { clearTimeout(timer); resolve(); }; });
-const run = (args) => new Promise((resolve) => {
+const run = (args, watchPath) => new Promise((resolve) => {
   child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "inherit"] });
-  child.once("error", () => { child = undefined; resolve(-1); });
-  child.once("close", (code) => { child = undefined; resolve(code); });
+  // The queue's own stall timer kills this whole process group, which turns a CDN hiccup into a
+  // failed item: the re-resolve below never gets to run. Watching the output here instead keeps the
+  // recovery local -- ffmpeg is restarted, the stream is resolved again, and the recording continues
+  // in the same item as the next part. Only ffmpeg is signalled, never this wrapper.
+  let guard;
+  if (stallMs > 0 && watchPath) {
+    let lastSize = -1, lastGrowth = Date.now();
+    guard = setInterval(() => {
+      const now = size(watchPath);
+      if (now !== lastSize) { lastSize = now; lastGrowth = Date.now(); return; }
+      if (Date.now() - lastGrowth < stallMs) return;
+      lastGrowth = Date.now(); // one restart per stall window, even if the kill is ignored
+      say("no output for " + Math.round(stallMs / 1000) + "s; restarting this capture attempt");
+      try { child?.kill("SIGKILL"); } catch {}
+    }, 2000);
+    guard.unref?.();
+  }
+  const finish = (code) => { if (guard) clearInterval(guard); child = undefined; resolve(code); };
+  child.once("error", () => finish(-1));
+  child.once("close", (code) => finish(code));
 });
 const size = (file) => { try { return fs.statSync(file).size; } catch { return 0; } };
 const isLive = (text) => text.trimStart().startsWith("#EXTM3U") && !text.includes("#EXT-X-MOUFLON-ADVERT")
@@ -108,7 +127,7 @@ async function liveVariant(resolution, codecs) {
     const part = path.join(partsDir, "part-" + String(parts.length + 1).padStart(3, "0") + ".ts");
     const headerLines = Object.entries(headers).map(([name, value]) => name + ": " + value).join("\r\n") + "\r\n";
     const code = await run(["-hide_banner", "-loglevel", "warning", "-rw_timeout", "15000000", "-user_agent", userAgent, "-headers", headerLines, "-i", url,
-      "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "-y", part]);
+      "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "-y", part], part);
     const recorded = size(part) > 0;
     if (recorded) parts.push(part); else fs.rmSync(part, { force: true });
     if (stopping || !recorded || gapMs <= 0) break;
