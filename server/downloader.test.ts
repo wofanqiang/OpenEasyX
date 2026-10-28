@@ -392,6 +392,50 @@ describe("DownloadQueue", () => {
     expect(fs.existsSync(path.join(mediaDir, ".downloads", doomed.id))).toBe(false);
   });
 
+  it("removes the staging of a failed item, so deleting it really frees the bytes", async () => {
+    const dataDir = temp("easyx-failed-delete-data"); const mediaDir = temp("easyx-failed-delete-media"); const pluginDir = temp("easyx-failed-delete-plugins");
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    const person = db.upsertPerformer({ externalId: "person", name: "Failed Performer" }, "test.failed-delete");
+    const source = db.addSource(person.id, "test.failed-delete", { externalId: "source", label: "Live", profileUrl: "https://example.test/live", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "broken", mediaType: "video", filename: "broken.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0];
+    db.setItemStatus(item.id, "failed", { error: "Download timed out" });
+    // A failed live capture keeps its segments for a retry; nothing ever collects them once the
+    // operator deletes the item, and the next boot parks them in the recovery area instead.
+    const staging = path.join(mediaDir, ".downloads", item.id);
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(path.join(staging, "Anna-2026-10-25.mp4"), Buffer.alloc(2048, 7));
+
+    const queue = new DownloadQueue(db, manager, mediaDir);
+    expect(queue.delete(item.id)).toMatchObject({ deleted: true, id: item.id });
+    expect(db.getItem(item.id)).toBeUndefined();
+    expect(fs.existsSync(staging)).toBe(false);
+  });
+
+  it("leaves another item's staging alone", async () => {
+    const dataDir = temp("easyx-other-staging-data"); const mediaDir = temp("easyx-other-staging-media"); const pluginDir = temp("easyx-other-staging-plugins");
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    const person = db.upsertPerformer({ externalId: "person", name: "Two Items" }, "test.other-staging");
+    const source = db.addSource(person.id, "test.other-staging", { externalId: "source", label: "Live", profileUrl: "https://example.test/live", domain: "example.test" });
+    db.ingestItems(source, [
+      { externalId: "doomed", mediaType: "video", filename: "doomed.mp4", metadata: { live: true } },
+      { externalId: "resumes", mediaType: "video", filename: "resumes.mp4", metadata: { live: true } },
+    ]);
+    const items = db.listItems(); const doomed = items.find((entry) => entry.externalId === "doomed")!;
+    const keeps = items.find((entry) => entry.externalId === "resumes")!;
+    db.setItemStatus(doomed.id, "failed", { error: "nope" });
+    db.setItemStatus(keeps.id, "queued");
+    for (const id of [doomed.id, keeps.id]) {
+      fs.mkdirSync(path.join(mediaDir, ".downloads", id), { recursive: true });
+      fs.writeFileSync(path.join(mediaDir, ".downloads", id, "part.ts"), Buffer.alloc(64));
+    }
+    const queue = new DownloadQueue(db, manager, mediaDir);
+    queue.delete(doomed.id);
+    expect(fs.existsSync(path.join(mediaDir, ".downloads", doomed.id))).toBe(false);
+    // A queued item's staging is the resume point for its retry: deleting a neighbour must not take it.
+    expect(fs.existsSync(path.join(mediaDir, ".downloads", keeps.id, "part.ts"))).toBe(true);
+  });
+
   it("deletes both a completed item and its recorded media file", async () => {
     const dataDir = temp("easyx-completed-delete-data"); const mediaDir = temp("easyx-completed-delete-media"); const pluginDir = temp("easyx-completed-delete-plugins");
     const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();

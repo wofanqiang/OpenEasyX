@@ -515,7 +515,38 @@ export class DownloadQueue {
     }
     this.noteOrphanedRecovery(itemId);
     this.db.deleteItem(itemId);
+    this.discardStaging(itemId);
     return { deleted: true, id: itemId, ...(mediaDeletion && typeof mediaDeletion === "object" ? mediaDeletion : {}) };
+  }
+
+  /**
+   * Remove the staging directory of an item that was just deleted.
+   *
+   * A failed or cancelled capture keeps its staging alive on purpose: the recorded segments are the
+   * resume point for a retry (A9/A10). Once the operator deletes the item there is nothing left to
+   * resume, and leaving the directory behind only postpones the problem -- the next boot finds an
+   * unowned directory that still holds media and parks it in the recovery area, where it grows
+   * unseen (measured: 7.8 GB of a finished three-hour recording that no screen ever shows).
+   *
+   * Active items are left alone: the download loop owns their staging until its process exits, and
+   * it removes the directory itself in the same `finally` that deletes the row.
+   */
+  private discardStaging(itemId: string) {
+    if (this.active.has(itemId)) return;
+    const staging = path.join(this.downloadsRoot, safeSegment(itemId, "download"));
+    let bytes = 0;
+    try {
+      for (const entry of fs.readdirSync(staging, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        try { bytes += fs.statSync(path.join(staging, entry.name)).size; } catch { /* vanished mid-scan */ }
+      }
+    } catch { return; } // no staging directory: nothing to do
+    try {
+      fs.rmSync(staging, { recursive: true, force: true });
+      if (bytes > 0) this.writeLog?.("info", "download", "Removed the staged capture of a deleted item", { itemId, bytes });
+    } catch (error) {
+      this.writeLog?.("warn", "download", "Could not remove the staging directory of a deleted item", { itemId, error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   /**
