@@ -125,7 +125,13 @@ export function ytDlpDownload(item: MediaCandidate, config: Record<string, unkno
     ? `bestvideo${height}+bestaudio/best${height}`
     : "bestvideo*[vcodec!=none]+bestaudio[acodec!=none]/best[acodec!=none]/best";
   const args = [
-    "--progress", "--newline", "--progress-delta", "0.5", "--progress-template", "download:easyx-progress:%(progress._percent_str)s", "--no-playlist", "--retries", "5", "--fragment-retries", "5",
+    "--progress", "--newline", "--progress-delta", "0.5", "--progress-template", "download:easyx-progress:%(progress._percent_str)s", "--no-playlist",
+    // The live edge refuses in bursts. Over 40 hours the same rooms took 50-70 rejections each,
+    // bunched into seconds, and a capture that rode one out ran for hours while the one that did
+    // not stopped after ten minutes -- five retries were spent in under a minute, which is shorter
+    // than a burst. A larger, spaced budget sits one out without becoming unbounded: the live stall
+    // watchdog still ends a capture that stops producing bytes.
+    "--retries", "15", "--fragment-retries", "15", "--retry-sleep", "http:2:8", "--retry-sleep", "fragment:2:8",
     // A9: resume a .part file left by a failed attempt (the downloader keeps the staging
     // directory across retries). yt-dlp does this by default, but pin it so an upstream
     // default change or a stray --no-continue can never silently break resumption.
