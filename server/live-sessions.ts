@@ -342,6 +342,48 @@ async function spliceGroup(group: SessionGroup, deps: SpliceContext): Promise<Sp
 }
 
 /**
+ * Remove the temporary files a splice leaves behind when it is interrupted.
+ *
+ * A splice writes `<segment>.session.mp4` beside the segments, measures it, and only then renames
+ * it over the first segment; the `finally` removes it afterwards. If the process dies between
+ * those steps -- a container restart during a deploy, for instance -- the `finally` never runs and
+ * the half-merged file stays behind. The library then indexes it as a recording with no runtime,
+ * and the disk keeps the bytes.
+ *
+ * Any file matching the pattern is a leftover by construction: a successful splice renamed it away
+ * long before the library ever saw it. Runs at startup, where no splice can be in flight, and still
+ * skips anything touched in the last few minutes so a pass that began moments ago is never cut
+ * short.
+ */
+export function cleanupSessionArtifacts(mediaRoot: string, options: { minAgeMs?: number } = {}): { removed: string[]; bytes: number } {
+  const minAgeMs = options.minAgeMs ?? 5 * 60_000;
+  const removed: string[] = [];
+  let bytes = 0;
+  const walk = (directory: string) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        // The staging tree is the downloader's business; the library tree is where a splice writes.
+        if (!entry.name.startsWith(".")) walk(full);
+        continue;
+      }
+      if (!/\.session(\.concat\.txt|\.mp4)$/.test(entry.name)) continue;
+      try {
+        const stat = fs.statSync(full);
+        if (Date.now() - stat.mtimeMs < minAgeMs) continue;
+        fs.rmSync(full, { force: true });
+        removed.push(path.relative(mediaRoot, full));
+        bytes += stat.size;
+      } catch { /* another pass got there first */ }
+    }
+  };
+  walk(mediaRoot);
+  return { removed, bytes };
+}
+
+/**
  * Fold every finished broadcast that is over back into one recording. Runs periodically, never
  * throws, and leaves a group untouched whenever it cannot prove the splice is sound.
  */

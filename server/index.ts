@@ -31,7 +31,7 @@ import { registerLibraryRoutes, parseMediaRange } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
 import { startAutoRecorder } from "./auto-recorder.js";
 import { retentionPlan } from "./retention.js";
-import { spliceLiveSessions } from "./live-sessions.js";
+import { spliceLiveSessions, cleanupSessionArtifacts } from "./live-sessions.js";
 import { startMerge } from "./media-merge.js";
 import { TaskRegistry } from "./tasks.js";
 import { runDiagnostics } from "./diagnostics.js";
@@ -1067,5 +1067,12 @@ setInterval(() => refreshLiveCamFavorites(), 5 * 60_000).unref();
 const scanLibrary = (failure: string) => void catalog.scan()
   .then(() => catalog.backfillDurations())
   .catch((error) => app.log.error(error, failure));
+// A splice interrupted by a restart leaves its half-merged file behind; the library would index it
+// as a recording with no runtime. Clear those before the first scan sees them.
+const sessionArtifacts = cleanupSessionArtifacts(mediaDir);
+if (sessionArtifacts.removed.length) {
+  app.log.info({ scope: "live-sessions", removed: sessionArtifacts.removed, bytes: sessionArtifacts.bytes },
+    "Removed interrupted session-merge leftovers");
+}
 setTimeout(() => scanLibrary("Initial library scan failed"), 250).unref();
 setInterval(() => scanLibrary("Scheduled library scan failed"), scanIntervalMinutes * 60_000).unref();

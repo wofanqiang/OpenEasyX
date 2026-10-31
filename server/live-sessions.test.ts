@@ -7,8 +7,11 @@ import { Database } from "./database.js";
 import { DownloadQueue } from "./downloader.js";
 import { PluginManager } from "./plugin-manager.js";
 import {
+
   LIVE_SESSION_DEFAULTS, liveRoomOf, planSessions, probeSignature, sessionCandidates, spliceLiveSessions,
   type LiveSessionOptions, type MediaSignature, type SessionCandidate,
+  cleanupSessionArtifacts,
+
 } from "./live-sessions.js";
 
 const dirs: string[] = [];
@@ -400,5 +403,57 @@ describe("spliceLiveSessions", () => {
 
     expect(report).toMatchObject({ groups: 0, spliced: 0 });
     expect(fs.readdirSync(path.join(library.mediaDir, "alice")).sort()).toEqual(["one.mp4", "two.mp4"]);
+  });
+});
+
+describe("cleanupSessionArtifacts", () => {
+  const roots: string[] = [];
+  afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+
+  it("removes what an interrupted splice left behind and keeps everything else", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-session-artifacts-"));
+    roots.push(root);
+    const room = path.join(root, "Performer", "chaturbate.com");
+    fs.mkdirSync(room, { recursive: true });
+    const keep = path.join(room, "show.mp4");
+    const merged = path.join(room, "show.mp4.session.mp4");
+    const list = path.join(room, "show.mp4.session.concat.txt");
+    const fresh = path.join(room, "other.mp4.session.mp4");
+    fs.writeFileSync(keep, "recording");
+    fs.writeFileSync(merged, "half-merged");
+    fs.writeFileSync(list, "file 'x'");
+    fs.writeFileSync(fresh, "just started");
+    const old = new Date(Date.now() - 60 * 60_000);
+    fs.utimesSync(merged, old, old);
+    fs.utimesSync(list, old, old);
+
+    const report = cleanupSessionArtifacts(root);
+
+    expect(report.removed.sort()).toEqual([
+      path.join("Performer", "chaturbate.com", "show.mp4.session.concat.txt"),
+      path.join("Performer", "chaturbate.com", "show.mp4.session.mp4"),
+    ]);
+    expect(report.bytes).toBeGreaterThan(0);
+    expect(fs.existsSync(merged)).toBe(false);
+    expect(fs.existsSync(list)).toBe(false);
+    expect(fs.existsSync(keep)).toBe(true);
+    // A splice that started moments ago is never cut short.
+    expect(fs.existsSync(fresh)).toBe(true);
+  });
+
+  it("leaves the staging tree alone", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-session-staging-"));
+    roots.push(root);
+    const staging = path.join(root, ".downloads", "item_1");
+    fs.mkdirSync(staging, { recursive: true });
+    const artifact = path.join(staging, "part.mp4.session.mp4");
+    fs.writeFileSync(artifact, "staging");
+    const old = new Date(Date.now() - 60 * 60_000);
+    fs.utimesSync(artifact, old, old);
+
+    const report = cleanupSessionArtifacts(root);
+
+    expect(report.removed).toEqual([]);
+    expect(fs.existsSync(artifact)).toBe(true);
   });
 });
