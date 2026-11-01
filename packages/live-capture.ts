@@ -172,6 +172,29 @@ export function isLiveCandidate(candidate: MediaCandidate): boolean {
 }
 
 /**
+ * The room a candidate names, as the plugin's own lookup expects it.
+ *
+ * `username` is the room name, and a plugin keys its room lookup on it, so a display title must
+ * not stand in for one: a title like "Anais Bloom ( Anna)" fails a room-name check outright and
+ * the plugin then refuses to resolve the broadcast at all. `liveRoom` is the room key a capture
+ * records alongside its metadata, which makes it the right stand-in when no identity key exists;
+ * the title stays only as the last resort it has always been, for plugins that never validate.
+ *
+ * Exported because a re-resolve has to ask for the same room the first resolve asked for.
+ */
+export function liveCamFor(item: MediaCandidate, pageUrl: string): LiveCam {
+  const meta = item.metadata as Record<string, unknown> | undefined;
+  const roomName = item.identityKey ?? (typeof meta?.liveRoom === "string" ? meta.liveRoom.trim() : undefined);
+  return { id: item.externalId, username: roomName || item.title || "live", title: item.title, pageUrl };
+}
+
+/** The page a live candidate would be resolved from, if it names one. */
+export function livePageUrl(item: MediaCandidate): string | undefined {
+  const meta = item.metadata as Record<string, unknown> | undefined;
+  return item.pageUrl ?? (typeof meta?.extractorUrl === "string" ? meta.extractorUrl : undefined);
+}
+
+/**
  * @param rewrite  Optional hook that replaces the stream's address before ffmpeg sees it. Two
  *   callers need it. A provider whose playlist is obfuscated (or needs private headers) cannot be
  *   recorded directly: ffmpeg parses the playlist as written and fetches the decoys, so the server's
@@ -189,13 +212,7 @@ export async function liveRecordingRequest(
   if (meta?.live !== true || !plugin.resolveLiveStream) return undefined;
   const pageUrl = item.pageUrl ?? (typeof meta.extractorUrl === "string" ? meta.extractorUrl : undefined);
   if (!pageUrl) return undefined;
-  // `username` is the room name, and a plugin keys its room lookup on it, so a display title must
-  // not stand in for one: a title like "Anais Bloom ( Anna)" fails a room-name check outright and
-  // the plugin then refuses to resolve the broadcast at all. `liveRoom` is the room key a capture
-  // records alongside its metadata, which makes it the right stand-in when no identity key exists;
-  // the title stays only as the last resort it has always been, for plugins that never validate.
-  const roomName = item.identityKey ?? (typeof meta?.liveRoom === "string" ? meta.liveRoom.trim() : undefined);
-  const cam: LiveCam = { id: item.externalId, username: roomName || item.title || "live", title: item.title, pageUrl };
+  const cam: LiveCam = liveCamFor(item, pageUrl);
   try {
     const stream = await plugin.resolveLiveStream(context, cam);
     const proxied = rewrite?.(stream);

@@ -262,3 +262,109 @@ describe("remembering a refusal", () => {
     expect(calls).toBe(3);
   });
 });
+
+/**
+ * A live stream is reached by an address that carries the provider's session, and that session
+ * expires while the broadcast is still running. The CDN then answers 403 and the capture dies on a
+ * stream that never stopped -- measured over forty hours: every room took fifty to seventy
+ * refusals, and the recordings that survived were the ones whose address was replaced in time.
+ *
+ * So the proxy asks for the room again when the provider refuses, and the recorder keeps polling
+ * the same URL: only the address behind it changes.
+ */
+describe("hls proxy re-resolves a refused stream", () => {
+  const playlist = () => new Response("#EXTM3U\n#EXTINF:2,\nhttps://cdn.test/media.ts\n", {
+    status: 200, headers: { "content-type": "application/vnd.apple.mpegurl" },
+  });
+
+  /** The proxy answers with a status and a body; this keeps both. */
+  function reply() {
+    let sent = ""; let code = 0;
+    const stub = {
+      status: (value: number) => { code = value; return stub; },
+      type: () => stub,
+      header: () => stub,
+      send: (value: unknown) => { sent = typeof value === "string" ? value : JSON.stringify(value); return stub; },
+    };
+    return { reply: stub as unknown as FastifyReply, status: () => code, body: () => sent };
+  }
+
+  it("replaces the refused address with a fresh one", async () => {
+    const seen: string[] = [];
+    const request = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes("old")) return new Response("no", { status: 403 });
+      return playlist();
+    }) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    let refreshed = false;
+    const refresh = vi.fn(async () => { refreshed = true; return { url: "https://cdn.test/new.m3u8", headers: { "referer": "https://chaturbate.com/" } }; });
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+
+    const first = reply();
+    await proxy.serve(token, first.reply);
+    expect(first.status()).toBe(403);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    // The refresh lands on the entry, so the next request follows the new address.
+    await vi.waitFor(() => expect(refreshed).toBe(true));
+    const second = reply();
+    await proxy.serve(token, second.reply);
+    expect(second.status()).toBe(200);
+    expect(second.body()).toContain("#EXTM3U");
+    expect(seen).toContain("https://cdn.test/new.m3u8");
+  });
+
+  it("does not ask the provider again while the re-resolve is running", async () => {
+    let upstreamCalls = 0;
+    const request = vi.fn(async () => { upstreamCalls += 1; return new Response("no", { status: 403 }); }) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    let release: (value: { url: string } | undefined) => void = () => {};
+    const pending = new Promise<{ url: string } | undefined>((resolve) => { release = resolve; });
+    const refresh = vi.fn(async () => pending);
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+
+    const first = reply();
+    await proxy.serve(token, first.reply);
+    expect(upstreamCalls).toBe(1);
+    // The address is known to be refused and a new one is on its way: ask from memory instead.
+    const second = reply();
+    await proxy.serve(token, second.reply);
+    expect(upstreamCalls).toBe(1);
+    expect(second.status()).toBe(403);
+    release(undefined);
+    await pending;
+  });
+
+  it("replaces both renditions of a stream in one re-resolve", async () => {
+    const seen: string[] = [];
+    const request = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes("old")) return new Response("no", { status: 403 });
+      return playlist();
+    }) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    let refreshed = false;
+    const refresh = vi.fn(async () => { refreshed = true; return { url: "https://cdn.test/new-video.m3u8", audioUrl: "https://cdn.test/new-audio.m3u8" }; });
+    const master = proxy.register({ url: "https://cdn.test/old-video.m3u8", audioUrl: "https://cdn.test/old-audio.m3u8" }, refresh);
+    const masterReply = reply();
+    await proxy.serve(master.slice(LIVE_PROXY_PREFIX.length), masterReply.reply);
+    const urls = [...masterReply.body().matchAll(new RegExp(LIVE_PROXY_PREFIX.replace(/[/.]/g, (character) => "\\" + character) + "[A-Za-z0-9_-]+\\.m3u8", "g"))].map((match) => match[0]);
+    expect(urls.length).toBe(2);
+
+    for (const url of urls) {
+      const entry = reply();
+      await proxy.serve(url.slice(LIVE_PROXY_PREFIX.length), entry.reply);
+    }
+    await vi.waitFor(() => expect(refreshed).toBe(true));
+    // Both renditions now point at the fresh addresses.
+    for (const url of urls) {
+      const entry = reply();
+      await proxy.serve(url.slice(LIVE_PROXY_PREFIX.length), entry.reply);
+    }
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(seen).toContain("https://cdn.test/new-video.m3u8");
+    expect(seen).toContain("https://cdn.test/new-audio.m3u8");
+  });
+});

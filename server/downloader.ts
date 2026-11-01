@@ -12,7 +12,7 @@ import type { LogWriter } from "./log-store.js";
 import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
-import { SINGLE_INPUT_MARKER, captureInputPreference, chooseDirectCaptureInput, liveRecordingRequest } from "../packages/live-capture.js";
+import { SINGLE_INPUT_MARKER, captureInputPreference, chooseDirectCaptureInput, liveCamFor, livePageUrl, liveRecordingRequest } from "../packages/live-capture.js";
 import { avSyncPlan, readAvSyncSidecar, startAvSyncMeasurement, type AvSyncWatcher } from "../packages/av-sync-measure.js";
 import type { LiveStream, MediaCandidate } from "../packages/plugin-sdk/index.js";
 import type { LogLevel } from "./log-store.js";
@@ -441,10 +441,10 @@ export class DownloadQueue {
    * removes the A/V offset at its source. That master cannot be handed over as a local file --
    * ffmpeg rejects the input options on a local path and then finds no streams in it at all.
    */
-  private recordThroughProxy(stream: LiveStream, captureInput: string): string | undefined {
+  private recordThroughProxy(stream: LiveStream, captureInput: string, refresh?: () => Promise<LiveStream | undefined>): string | undefined {
     if (!this.liveProxy || !this.selfOrigin) return undefined;
     if (!requiresLiveProxy(stream) && chooseDirectCaptureInput(stream, captureInput) !== "master") return undefined;
-    return this.selfOrigin + this.liveProxy.register(stream);
+    return this.selfOrigin + this.liveProxy.register(stream, refresh);
   }
 
   start() {
@@ -887,7 +887,19 @@ export class DownloadQueue {
       // "split" keeps the historical two-input capture. The stored setting decides, and a
       // deployment override wins so one box can be switched and switched back without a data change.
       const captureInput = captureInputPreference(this.db.getSettings().liveCaptureInput, process.env.EASYX_LIVE_CAPTURE_INPUT);
-      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream, captureInput)))
+      // The address a live stream is reached by carries the provider's session, and that session
+      // expires while the broadcast is still running: the CDN then answers 403 and the capture
+      // dies on a stream that never stopped. Handing the proxy a way to ask for the room again
+      // gives the recorder a fresh address to follow, so it keeps recording instead of ending.
+      const resolveLiveStream = plugin.resolveLiveStream?.bind(plugin);
+      const refreshPageUrl = livePageUrl(candidate);
+      const refreshStream = resolveLiveStream && refreshPageUrl
+        ? async () => {
+            try { return await resolveLiveStream(context, liveCamFor(candidate, refreshPageUrl)); }
+            catch { return undefined; }
+          }
+        : undefined;
+      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream, captureInput, refreshStream)))
         ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
       if (!request) throw new Error("This plugin cannot resolve downloads");
       // The resolve is done; from here on the clock is the capture's.

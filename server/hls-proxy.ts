@@ -21,7 +21,27 @@ import type { LiveStream } from "../packages/plugin-sdk/index.js";
  * URLs handed to a player or a recorder are safe to treat as capabilities.
  */
 
-type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; fingerprint?: boolean; expiresAt: number; reject?: { status: number; until: number } };
+type ProxyEntry = { url?: string; body?: string; headers: Record<string, string>; decodeKey?: string; fingerprint?: boolean; expiresAt: number; reject?: { status: number; until: number }; refresher?: StreamRefresher; slot?: "video" | "audio" };
+
+/**
+ * How a dead stream gets a new address.
+ *
+ * A resolved stream carries the provider's session in its URL, and that session does not live
+ * forever: when it expires the CDN answers 403 and the recorder has nothing to follow, so the
+ * capture dies on a stream that is still broadcasting. Re-resolving the room produces a fresh
+ * address, and the capture simply continues -- the playlist it polls never changed, only the
+ * address behind it.
+ *
+ * One refresher serves both renditions of a stream (a video and an audio playlist), because
+ * re-resolving twice would spawn the provider's extractor twice for the same room.
+ */
+type StreamRefresher = {
+  resolve: () => Promise<LiveStream | undefined>;
+  pending?: Promise<LiveStream | undefined>;
+  /** When the last refresh was started, so a burst of refusals cannot turn into a spawn storm. */
+  lastAt?: number;
+  entries: Set<ProxyEntry>;
+};
 
 const ENTRY_TTL_MS = 15 * 60_000;
 /**
@@ -36,6 +56,16 @@ const ENTRY_TTL_MS = 15 * 60_000;
 const DEFAULT_REJECT_BACKOFF_MS = 5_000;
 /** Statuses that mean "no" rather than "not now": a 5xx or a dropped connection is worth retrying. */
 const REJECT_STATUSES = new Set([403, 410, 429]);
+/**
+ * How long one re-resolve may take before another is attempted, and how long the proxy keeps
+ * answering from memory while it runs.
+ *
+ * The refresher is the provider's extractor (yt-dlp for Chaturbate), which takes seconds and
+ * costs a process. A refusal storm must not turn into a spawn storm, and the CDN that just said
+ * no must not be asked again while the new address is on its way.
+ */
+const REFRESH_COOLDOWN_MS = 30_000;
+const REFRESH_MEMORY_MS = 30_000;
 /**
  * How often expired entries are actually swept. `url()` runs on every line of every rewritten
  * playlist, and a full scan per line made the proxy's cost grow with the recording's length; a
@@ -91,19 +121,21 @@ export class HlsProxy {
    * Wrap a resolved stream in a proxy URL. A stream that carries both a video and an audio
    * rendition becomes a tiny master playlist so a player (or ffmpeg) can mux them itself.
    */
-  register(stream: LiveStream): string {
+  register(stream: LiveStream, refresh?: () => Promise<LiveStream | undefined>): string {
     const decodeKey = stream.playlistDecodeKey;
     const fingerprint = stream.requiresTlsFingerprint === true;
+    // One refresher for the whole stream: a video and an audio rendition are refreshed together.
+    const refresher: StreamRefresher | undefined = refresh ? { resolve: refresh, entries: new Set<ProxyEntry>() } : undefined;
     if (stream.audioUrl) {
-      const videoUrl = this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint);
-      const audioUrl = this.url(stream.audioUrl, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint);
+      const videoUrl = this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint, refresher, "video");
+      const audioUrl = this.url(stream.audioUrl, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint, refresher, "audio");
       return this.body([
         "#EXTM3U", "#EXT-X-VERSION:6",
         `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="${audioUrl}"`,
         "#EXT-X-STREAM-INF:BANDWIDTH=6500000,AUDIO=\"audio\"", videoUrl, "",
       ].join("\n"), ".m3u8");
     }
-    return this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint);
+    return this.url(stream.url, stream.headers ?? {}, ".m3u8", decodeKey, fingerprint, refresher, "video");
   }
 
   /** Register a literal playlist body, for the synthesized master above. */
@@ -117,19 +149,69 @@ export class HlsProxy {
    * Proxy one URL. Identical (url, headers) pairs reuse a token so a playlist the client
    * refetches every few seconds does not leak a new entry per refresh.
    */
-  url(target: string, headers: Record<string, string>, suffix = "", decodeKey?: string, fingerprint = false): string {
+  url(target: string, headers: Record<string, string>, suffix = "", decodeKey?: string, fingerprint = false, refresher?: StreamRefresher, slot: "video" | "audio" = "video"): string {
     this.prune();
     const key = JSON.stringify([target, Object.entries(headers).sort(), suffix, decodeKey ?? "", fingerprint]);
     const existingToken = this.reverse.get(key);
     const existing = existingToken ? this.entries.get(existingToken) : undefined;
     if (existing && existing.expiresAt > Date.now()) {
       existing.expiresAt = Date.now() + ENTRY_TTL_MS;
+      // The newest registration owns the address: a stream resolved again hands over its refresher.
+      if (refresher) {
+        existing.refresher?.entries.delete(existing);
+        existing.refresher = refresher;
+        existing.slot = slot;
+        refresher.entries.add(existing);
+      }
       return `${LIVE_PROXY_PREFIX}${existingToken}${suffix}`;
     }
     const token = randomBytes(24).toString("base64url");
-    this.entries.set(token, { url: target, headers, decodeKey, fingerprint, expiresAt: Date.now() + ENTRY_TTL_MS });
+    const entry: ProxyEntry = { url: target, headers, decodeKey, fingerprint, expiresAt: Date.now() + ENTRY_TTL_MS, refresher, slot };
+    this.entries.set(token, entry);
+    refresher?.entries.add(entry);
     this.reverse.set(key, token);
     return `${LIVE_PROXY_PREFIX}${token}${suffix}`;
+  }
+
+  /**
+   * Start a re-resolve for a stream whose address was refused.
+   *
+   * Single-flight and rate-limited: one extractor run serves every rendition of the stream, and a
+   * refusal storm cannot turn into a spawn storm. While it runs, the entries answer from memory --
+   * the address we hold is known to be refused, and asking again would only multiply the pressure
+   * on a CDN that just said no. The refresh lands on the entries it belongs to, so the recorder
+   * keeps polling the same URL and simply gets the new address behind it.
+   */
+  private beginRefresh(entry: ProxyEntry, log?: (message: string) => void) {
+    const refresher = entry.refresher;
+    if (!refresher) return;
+    if (refresher.pending) return;
+    if (refresher.lastAt !== undefined && Date.now() - refresher.lastAt < REFRESH_COOLDOWN_MS) return;
+    refresher.lastAt = Date.now();
+    for (const target of refresher.entries) {
+      target.reject = { status: target.reject?.status ?? 403, until: Date.now() + REFRESH_MEMORY_MS };
+    }
+    const pending = refresher.resolve()
+      .catch((error) => {
+        log?.("live proxy: re-resolving the stream failed: " + (error instanceof Error ? error.message : String(error)));
+        return undefined;
+      })
+      .then((fresh) => {
+        if (!fresh) return undefined;
+        let moved = 0;
+        for (const target of refresher.entries) {
+          const next = target.slot === "audio" ? fresh.audioUrl : fresh.url;
+          if (!next) continue;
+          target.url = next;
+          target.headers = fresh.headers ?? target.headers;
+          target.reject = undefined;
+          moved += 1;
+        }
+        if (moved) log?.("live proxy: re-resolved the stream after a refusal");
+        return fresh;
+      })
+      .finally(() => { refresher.pending = undefined; });
+    refresher.pending = pending;
   }
 
   /**
@@ -170,6 +252,11 @@ export class HlsProxy {
       if (REJECT_STATUSES.has(response.status) && this.rejectBackoffMs > 0) {
         entry.reject = { status: response.status, until: Date.now() + this.rejectBackoffMs };
       }
+      // A refusal can also mean the address expired rather than the broadcast ending: the session
+      // in the URL has a lifetime. Re-resolving hands the recorder a fresh address, so the capture
+      // continues on a stream that never stopped. Only a provider that can be asked again gets
+      // this; a stream without a refresher simply keeps refusing.
+      if (REJECT_STATUSES.has(response.status)) this.beginRefresh(entry, log);
       log?.("live proxy: provider returned HTTP " + response.status + " for " + sourceUrl.host + sourceUrl.pathname);
       return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
     }

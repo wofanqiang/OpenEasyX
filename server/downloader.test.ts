@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -6,6 +6,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { Database } from "./database.js";
+import { HlsProxy } from "./hls-proxy.js";
 import { PluginManager } from "./plugin-manager.js";
 import { COMMAND_PRIORITY_WRAPPER, DownloadQueue, captureSegmentFiles, concatCaptureArgs, concurrentLimit, downloadPriority, failureRetryPlan, httpStatusFromError, nextSegmentStart, outOfStallGrace, postProcessDeadlineMs, receivedBytes, remuxCaptureArgs, requiresLiveProxy, resolveLiveStallSeconds, retryDisposition, slotPlan, stalledDownload } from "./downloader.js";
 import { Catalog } from "./catalog.js";
@@ -81,6 +82,35 @@ describe("DownloadQueue", () => {
       queue.stopRecording(itemId);
       await waitFor(() => db.getItem(itemId)?.status === "completed");
       expect(fs.statSync(path.join(mediaDir, db.getItem(itemId)!.storagePath!)).size).toBeGreaterThan(5);
+    } finally { queue.stop(); db.close(); }
+  });
+
+  it("hands the live proxy a way to ask for the room again", async () => {
+    // The address a live stream is reached by carries the provider's session, which expires while
+    // the broadcast runs on. The proxy asks for the room again when the provider refuses, so the
+    // recorder keeps recording a stream that never stopped.
+    const dataDir = temp("easyx-reproxy-data"); const mediaDir = temp("easyx-reproxy-media"); const pluginDir = temp("easyx-reproxy-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default {
+      manifest: { id: "test.reproxy", name: "Reproxy", version: "1", description: "Test", author: "Test", capabilities: ["live-cam", "download-resolver"], sourceUrlPatterns: ["https://live.test/*"] },
+      listLiveCams: async () => ({ cams: [{ id: "alice", username: "alice", pageUrl: "https://live.test/alice" }], total: 1, page: 1, pageSize: 24, pages: 1 }),
+      resolveLiveStream: async () => ({ url: "https://cdn.test/live.m3u8", playlistRewrite: true }),
+      resolveDownload: async () => ({ kind: "command", command: process.execPath, args: ["-e", "process.exit(0)"], filename: "recording.mp4" })
+    };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load(); manager.install("test.reproxy");
+    const service = new LiveCamService(db, manager);
+    const cam = { id: "alice", username: "alice", pageUrl: "https://live.test/alice" };
+    const { itemId } = await service.record("test.reproxy", cam);
+    const proxy = new HlsProxy(async () => new Response("#EXTM3U\n", { status: 200, headers: { "content-type": "application/vnd.apple.mpegurl" } }));
+    const register = vi.spyOn(proxy, "register");
+    const queue = new DownloadQueue(db, manager, mediaDir, undefined, undefined, undefined, proxy, "http://127.0.0.1:9");
+    queue.start();
+    try {
+      await waitFor(() => register.mock.calls.length > 0);
+      const [, refresh] = register.mock.calls[0];
+      expect(typeof refresh).toBe("function");
+      const fresh = await (refresh as () => Promise<{ url: string } | undefined>)();
+      expect(fresh?.url).toBe("https://cdn.test/live.m3u8");
     } finally { queue.stop(); db.close(); }
   });
 
