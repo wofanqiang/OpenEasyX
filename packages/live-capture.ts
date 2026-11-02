@@ -182,10 +182,10 @@ export function isLiveCandidate(candidate: MediaCandidate): boolean {
  *
  * Exported because a re-resolve has to ask for the same room the first resolve asked for.
  */
-export function liveCamFor(item: MediaCandidate, pageUrl: string): LiveCam {
+export function liveCamFor(item: MediaCandidate, pageUrl: string, maxHeight?: number): LiveCam {
   const meta = item.metadata as Record<string, unknown> | undefined;
   const roomName = item.identityKey ?? (typeof meta?.liveRoom === "string" ? meta.liveRoom.trim() : undefined);
-  return { id: item.externalId, username: roomName || item.title || "live", title: item.title, pageUrl };
+  return { id: item.externalId, username: roomName || item.title || "live", title: item.title, pageUrl, maxHeight };
 }
 
 /** The page a live candidate would be resolved from, if it names one. */

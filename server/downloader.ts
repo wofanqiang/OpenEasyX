@@ -893,9 +893,13 @@ export class DownloadQueue {
       // gives the recorder a fresh address to follow, so it keeps recording instead of ending.
       const resolveLiveStream = plugin.resolveLiveStream?.bind(plugin);
       const refreshPageUrl = livePageUrl(candidate);
+      // A recording follows one rendition for its whole length; the ceiling keeps that rendition
+      // stable across the captures of one broadcast, which is what lets them be folded into a
+      // single file later. 0 means best available.
+      const recordingMaxHeight = Math.max(0, Number(this.db.getSettings().recordingMaxHeight ?? 0));
       const refreshStream = resolveLiveStream && refreshPageUrl
         ? async () => {
-            try { return await resolveLiveStream(context, liveCamFor(candidate, refreshPageUrl)); }
+            try { return await resolveLiveStream(context, liveCamFor(candidate, refreshPageUrl, recordingMaxHeight)); }
             catch { return undefined; }
           }
         : undefined;

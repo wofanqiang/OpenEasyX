@@ -237,6 +237,9 @@ export class Database {
     // Two independent inputs each start at their own live edge, which bakes a constant A/V offset
     // into the capture; "split" is the behaviour every existing install has, so it stays the default.
     this.setDefault("liveCaptureInput", "split");
+    // 1080 keeps a full-HD broadcast intact while stopping a 1440p one from splitting the
+    // recording into files that no longer share a layout.
+    this.setDefault("recordingMaxHeight", 1080);
     this.setDefault("autoRecordCooldownSeconds", 120);
     this.setDefault("autoRecordMinBytes", 5 * 1024 * 1024);
     this.setDefault("admin_password_hash", "");

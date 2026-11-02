@@ -28,6 +28,10 @@ export const settingsSchema = z.object({
   // "split" keeps the two-input capture; "master" feeds ffmpeg one synthesized master playlist
   // so the HLS demuxer aligns the renditions itself; "auto" uses master wherever it is possible.
   liveCaptureInput: z.enum(["split", "master", "auto"]).optional(),
+  // A recording follows one rendition for its whole length. Pinning the ceiling keeps every
+  // capture of a broadcast on the same layout, which is what lets the session splice fold them
+  // into one file when a room changes quality mid-broadcast. 0 = best available.
+  recordingMaxHeight: z.number().int().min(0).max(4320).optional(),
 });
 
 export function downloadOutputPath(settings: Record<string, unknown>, item: DownloadItem, performer: string, site: string, originalFilename: string): string {

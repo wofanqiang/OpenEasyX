@@ -159,6 +159,13 @@ export type LiveCam = {
   username: string;
   title?: string;
   pageUrl: string;
+  /**
+   * The tallest rendition a recording may use, from the settings page (0 or absent = best
+   * available). A capture follows one rendition for its whole length, so pinning it keeps every
+   * segment of a broadcast on the same layout -- which is what lets the session splice fold a
+   * stream whose quality moved mid-broadcast into one file.
+   */
+  maxHeight?: number;
   thumbnailUrl?: string;
   profileImageUrl?: string;
   viewers?: number;

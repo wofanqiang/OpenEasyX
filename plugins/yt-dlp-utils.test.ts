@@ -88,3 +88,50 @@ describe("live recording output", () => {
     }
   });
 });
+
+describe("recording height ceiling", () => {
+  // The shape a chaturbate room hands back: a video-only ladder and separate audio tracks.
+  const ladder = {
+    formats: [
+      { url: "https://cdn.test/1440.m3u8", vcodec: "avc1.640032", acodec: "none", height: 1440 },
+      { url: "https://cdn.test/1080.m3u8", vcodec: "avc1.640028", acodec: "none", height: 1080 },
+      { url: "https://cdn.test/720.m3u8", vcodec: "avc1.4d4020", acodec: "none", height: 720 },
+      { url: "https://cdn.test/360.m3u8", vcodec: "avc1.42c01e", acodec: "none", height: 360 },
+      { url: "https://cdn.test/audio-96.m3u8", vcodec: "none", acodec: "aac", abr: 96 },
+      { url: "https://cdn.test/audio-128.m3u8", vcodec: "none", acodec: "aac", abr: 128 },
+    ],
+    http_headers: { Referer: "https://chaturbate.com/" },
+  };
+
+  it("follows the best rendition at or below the ceiling, with the room's best audio", () => {
+    // A capture sticks to one rendition for its whole length, so the ceiling decides the layout of
+    // every segment -- which is what keeps them foldable when a room changes quality mid-show.
+    expect(liveStreamFromInfo(ladder, "alice", 1080)).toEqual({
+      url: "https://cdn.test/1080.m3u8", audioUrl: "https://cdn.test/audio-128.m3u8",
+      headers: { Referer: "https://chaturbate.com/" }, contentType: "application/vnd.apple.mpegurl",
+    });
+    expect(liveStreamFromInfo(ladder, "alice", 720).url).toBe("https://cdn.test/720.m3u8");
+  });
+
+  it("still records a room that offers nothing at or below the ceiling", () => {
+    // Better a slightly larger file than no recording at all.
+    expect(liveStreamFromInfo(ladder, "alice", 240).url).toBe("https://cdn.test/360.m3u8");
+  });
+
+  it("keeps yt-dlp's own choice when the ceiling is off", () => {
+    const merged = {
+      requested_formats: [
+        { url: "https://cdn.test/video.m3u8", vcodec: "avc1", acodec: "none", height: 1440 },
+        { url: "https://cdn.test/audio.m3u8", vcodec: "none", acodec: "aac" },
+      ],
+      formats: ladder.formats,
+      http_headers: { Referer: "https://chaturbate.com/" },
+    };
+    expect(liveStreamFromInfo(merged, "alice", 0)).toEqual({
+      url: "https://cdn.test/video.m3u8", audioUrl: "https://cdn.test/audio.m3u8",
+      headers: { Referer: "https://chaturbate.com/" }, contentType: "application/vnd.apple.mpegurl",
+    });
+    // ... and the same stream capped lands on the rung the ceiling names.
+    expect(liveStreamFromInfo(merged, "alice", 1080).url).toBe("https://cdn.test/1080.m3u8");
+  });
+});

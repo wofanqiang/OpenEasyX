@@ -281,7 +281,7 @@ export default definePlugin({
     settings: [
       { key: "cookiesFile", label: "Account session", type: "session", cookieDomains: ["chaturbate.com"], help: "Optional. Public rooms normally do not require an account session." },
       { key: "forceIpv4", label: "Use IPv4 for stream extraction", type: "boolean", default: true, help: "Avoids unreachable IPv6 routes when yt-dlp resolves or opens a recording. Disable only if your network requires IPv6." },
-      { key: "recordingMaxHeight", label: "Maximum recording height", type: "number", default: 0, help: "0 = best available; use 720, 480, or 1080 to capture a native stream at or below that height, with audio. A matching stream must be available. Choose Original stream in Settings → Live recording preset to avoid re-encoding." },
+      { key: "recordingMaxHeight", label: "Maximum download height", type: "number", default: 0, help: "Applies to saved-video downloads, not to live recordings: those follow Settings → Recording height. 0 = best available; use 720, 480, or 1080 to take a native stream at or below that height, with audio. A matching stream must be available. Choose Original stream in Settings → Live recording preset to avoid re-encoding." },
     ],
   },
   async testConnection(context) {
@@ -388,7 +388,12 @@ export default definePlugin({
   },
   async listFollowedLiveCams(context) { return followedSnapshot(context); },
   async setLiveCamFavorite(context, cam, favorite) { return setRemoteFavorite(context, cam, favorite); },
-  async resolveLiveStream(context, cam) { return ytDlpLiveStream(context, cam, { referer: "https://chaturbate.com/", forceIpv4: context.config.forceIpv4 !== false }); },
+  async resolveLiveStream(context, cam) {
+    // The settings page owns the recording ceiling; the plugin's own option stays the fallback for
+    // callers that resolve a stream without one (the live player, for instance).
+    const maxHeight = cam.maxHeight ?? Number(context.config.recordingMaxHeight ?? 0);
+    return ytDlpLiveStream(context, cam, { referer: "https://chaturbate.com/", forceIpv4: context.config.forceIpv4 !== false, maxHeight });
+  },
   async resolveDownload(context, item) {
     const maxHeight = Number(context.config.recordingMaxHeight ?? 0);
     if (!Number.isInteger(maxHeight) || maxHeight < 0) throw new Error("Maximum recording height must be 0 (best available) or a positive integer such as 720.");

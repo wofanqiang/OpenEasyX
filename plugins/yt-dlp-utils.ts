@@ -40,7 +40,53 @@ export async function runYtDlpJson(context: PluginContext, args: string[], timeo
   catch { throw new Error("yt-dlp returned invalid JSON metadata"); }
 }
 
-export function liveStreamFromInfo(info: YtDlpEntry, username: string): LiveStream {
+function headerRecord(value: unknown): Record<string, string> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([, item]) => typeof item === "string")) as Record<string, string>
+    : undefined;
+}
+
+/**
+ * The rendition a capped recording should follow.
+ *
+ * A capture sticks to one rendition for its whole length, so what the room is broadcasting when
+ * the capture starts decides the layout of every segment. A room that moves from 1080p to 1440p
+ * mid-broadcast therefore splits its recording into files that no longer share a layout, and the
+ * session splice refuses to fold them. Pinning the ceiling keeps that layout stable.
+ *
+ * `maxHeight` of 0 (or no ceiling at all) means "best available", and picking the best is what
+ * every recording did before the setting existed -- so the path there is unchanged.
+ */
+export function cappedRendition(info: YtDlpEntry, maxHeight: number): LiveStream | undefined {
+  if (!(maxHeight > 0)) return undefined;
+  const formats = (Array.isArray(info.formats) ? info.formats : []) as Array<Record<string, unknown>>;
+  const playable = (value: string) => /^https?:\/\//i.test(value);
+  const videos = formats.filter((entry) => {
+    const url = text(entry.url);
+    return Boolean(url && playable(url) && text(entry.vcodec) !== "none");
+  }).sort((left, right) => (number(right.height) ?? 0) - (number(left.height) ?? 0) || (number(right.tbr) ?? 0) - (number(left.tbr) ?? 0));
+  if (!videos.length) return undefined;
+  // Best at or below the ceiling; a room that offers nothing that small still gets recorded,
+  // at its smallest, rather than not at all.
+  const chosen = videos.find((entry) => (number(entry.height) ?? 0) <= maxHeight) ?? videos[videos.length - 1];
+  const url = text(chosen.url);
+  if (!url) return undefined;
+  const headers = headerRecord(chosen.http_headers ?? info.http_headers);
+  // A rendition that carries its own audio needs nothing beside it; a video-only ladder needs the
+  // room's best audio track, which is small next to the video and always worth taking in full.
+  if (text(chosen.acodec) !== "none") return { url, headers, contentType: /m3u8(?:$|\?)/i.test(url) ? "application/vnd.apple.mpegurl" : undefined };
+  const audio = formats.filter((entry) => {
+    const candidate = text(entry.url);
+    return Boolean(candidate && playable(candidate) && text(entry.vcodec) === "none" && text(entry.acodec) !== "none");
+  }).sort((left, right) => (number(right.abr) ?? number(right.tbr) ?? 0) - (number(left.abr) ?? number(left.tbr) ?? 0))[0];
+  const audioUrl = text(audio?.url);
+  if (!audioUrl) return { url, headers, contentType: /m3u8(?:$|\?)/i.test(url) ? "application/vnd.apple.mpegurl" : undefined };
+  return { url, audioUrl, headers: headerRecord(audio?.http_headers ?? chosen.http_headers ?? info.http_headers), contentType: "application/vnd.apple.mpegurl" };
+}
+
+export function liveStreamFromInfo(info: YtDlpEntry, username: string, maxHeight = 0): LiveStream {
+  const capped = cappedRendition(info, maxHeight);
+  if (capped) return capped;
   const formats = Array.isArray(info.formats) ? info.formats as Array<Record<string, unknown>> : [];
   const requested = Array.isArray(info.requested_formats) ? info.requested_formats as Array<Record<string, unknown>> : [];
   const entries = [info, ...requested, ...formats];
@@ -77,13 +123,13 @@ export function liveStreamFromInfo(info: YtDlpEntry, username: string): LiveStre
   return { url, headers, contentType: /\.m3u8(?:$|\?)/i.test(url) ? "application/vnd.apple.mpegurl" : undefined };
 }
 
-export async function ytDlpLiveStream(context: PluginContext, cam: LiveCam, options: { referer?: string; impersonate?: string; forceIpv4?: boolean } = {}): Promise<LiveStream> {
+export async function ytDlpLiveStream(context: PluginContext, cam: LiveCam, options: { referer?: string; impersonate?: string; forceIpv4?: boolean; maxHeight?: number } = {}): Promise<LiveStream> {
   const args = ["--skip-download", "--dump-single-json", "--socket-timeout", "20", ...configuredArgs(context.config)];
   if (options.forceIpv4) args.push("--force-ipv4");
   if (options.impersonate) args.push("--impersonate", options.impersonate);
   if (options.referer) args.push("--referer", options.referer);
   const info = await runYtDlpJson(context, [...args, cam.pageUrl], 90_000);
-  return liveStreamFromInfo(info, cam.username);
+  return liveStreamFromInfo(info, cam.username, options.maxHeight ?? cam.maxHeight ?? 0);
 }
 
 export function playlistCandidates(info: YtDlpEntry, sourceUrl: string, prefix: string, limit: number): MediaCandidate[] {
