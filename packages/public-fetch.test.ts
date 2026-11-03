@@ -14,6 +14,20 @@ describe("isInternalHost", () => {
     }
   });
 
+  it("rejects an IPv4 address written in IPv6 form", () => {
+    // ::ffff:127.0.0.1 is the loopback, and ::ffff:7f00:1 is the same one in hex. Reading only the
+    // dotted form let the loopback through, and a document could point the server at itself.
+    for (const host of ["[::ffff:127.0.0.1]", "::ffff:127.0.0.1", "[::ffff:7f00:1]", "[::ffff:a00:1]", "[::ffff:c0a8:1]"]) {
+      expect(isInternalHost(host), host).toBe(true);
+    }
+  });
+
+  it("rejects the ranges that carry nothing but trouble", () => {
+    for (const host of ["100.64.0.1", "100.127.255.254", "192.0.0.1", "198.18.0.1", "198.19.255.255", "224.0.0.1", "239.1.1.1", "255.255.255.255", "[fe80::1]", "[fec0::1]", "[2001:db8::1]", "[ff02::1]"]) {
+      expect(isInternalHost(host), host).toBe(true);
+    }
+  });
+
   it("allows public addresses and ordinary host names", () => {
     for (const host of ["edge-hls.doppiocdn.com", "8.8.8.8", "172.32.0.1", "169.253.1.1", "[2606:4700::1111]"]) {
       expect(isInternalHost(host), host).toBe(false);

@@ -16,10 +16,19 @@ describe("trusted network for proxy headers", () => {
     }
   });
 
-  it("defaults to trusting private peers only", () => {
-    expect(trustProxyOption(undefined)).toBe(isPrivateAddress);
-    expect(trustProxyOption("")).toBe(isPrivateAddress);
+  it("believes nobody by default", () => {
+    // The application is published straight to the internet, so a client can put any address it
+    // likes into X-Forwarded-For. Believing that header let anyone walk past the login limiter:
+    // every forged address was a fresh bucket. The limiter keeps working with one shared bucket,
+    // and its lockout is short.
+    expect(trustProxyOption(undefined)).toBe(false);
+    expect(trustProxyOption("")).toBe(false);
     expect(trustProxyOption("TRUE")).toBe(true);
     expect(trustProxyOption("false")).toBe(false);
+  });
+
+  it("trusts private peers only when a deployment says so", () => {
+    expect(trustProxyOption("private")).toBe(isPrivateAddress);
+    expect(trustProxyOption("PRIVATE")).toBe(isPrivateAddress);
   });
 });

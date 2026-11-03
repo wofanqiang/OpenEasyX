@@ -44,11 +44,44 @@ export function isInternalHost(hostname: string): boolean {
   if (/\.(localhost|local|internal|localdomain|home\.arpa)$/.test(host)) return true;
   // A colon only survives URL parsing inside a bracketed IPv6 literal, so these prefixes are safe
   // to read as addresses rather than as names.
-  if (host.includes(":")) return host === "::1" || host.startsWith("fe80:") || /^f[cd][0-9a-f]{2}:/.test(host);
+  if (host.includes(":")) {
+    // An IPv4 address written in IPv6 form is the same address: ::ffff:127.0.0.1 is the loopback,
+    // and ::ffff:7f00:1 is the same one in hex. Reading only the dotted form let the loopback
+    // through, and a document could point the server at itself.
+    const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(host);
+    if (mapped) return isInternalHost(mapped[1]);
+    const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+    if (hexMapped) {
+      const high = parseInt(hexMapped[1], 16);
+      const low = parseInt(hexMapped[2], 16);
+      const octets = [high >> 8, high & 0xff, low >> 8, low & 0xff];
+      return octets[0] === 0 || octets[0] === 10 || octets[0] === 127
+        || (octets[0] === 169 && octets[1] === 254) || (octets[0] === 192 && octets[1] === 168)
+        || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+        || (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127);
+    }
+    if (host === "::" || host === "::1") return true;
+    if (host.startsWith("fe80:")) return true;                       // link-local
+    if (/^f[cd][0-9a-f]{2}:/.test(host)) return true;                 // unique-local fc00::/7
+    if (/^fe[c0][0-9a-f]:/.test(host)) return true;                  // site-local fec0::/10
+    if (host.startsWith("2001:db8:")) return true;                   // documentation
+    if (host.startsWith("ff")) return true;                          // multicast
+    return false;
+  }
   const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
   if (!octets) return false;
   const [a, b] = [Number(octets[1]), Number(octets[2])];
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+  // 0.0.0.0/8 (this network), 10/8, 127/8, the link-local 169.254/16, the private ranges, the
+  // carrier-grade NAT 100.64/10, the IETF blocks 192.0.0/24 and 198.18/15, and everything above
+  // 223 (multicast and reserved).
+  return a === 0 || a === 10 || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 0)
+    || (a === 192 && b === 168)
+    || (a === 198 && (b === 18 || b === 19))
+    || a >= 224;
 }
 
 /**

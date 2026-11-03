@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import type { FastifyReply } from "fastify";
 import { coerceMouflonPlaylist } from "../packages/hls-mouflon.js";
+import { isInternalHost } from "../packages/public-fetch.js";
 import type { LiveStream } from "../packages/plugin-sdk/index.js";
 
 /**
@@ -319,6 +320,12 @@ export class HlsProxy {
   }
 
   private async fetchUpstream(url: URL, headers: Record<string, string>, range: string | undefined, fingerprinted?: typeof fetch): Promise<Response> {
+    // A playlist decides where the server fetches next: every segment address in it becomes a
+    // request the server makes. A provider (or anyone who can steer one) could therefore point
+    // the proxy at the machine's own network and read the answer back through the token.
+    if (isInternalHost(url.hostname)) {
+      throw Object.assign(new Error(`Refusing to fetch an internal address (${url.hostname})`), { statusCode: 403 });
+    }
     const request = fingerprinted ?? this.request;
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {

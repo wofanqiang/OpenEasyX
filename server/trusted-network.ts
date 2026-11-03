@@ -26,17 +26,23 @@ export function isPrivateAddress(address: string): boolean {
 /**
  * The `trustProxy` value for Fastify.
  *
- * The previous behaviour was no trust at all, so `request.ip` was the proxy for every request and
- * the login rate limiter kept a single shared bucket: six wrong passwords from anyone locked out
- * everyone, including the operator. Trusting a private peer by default fixes that without any
- * configuration, while a direct public client still cannot forge the header.
+ * The application is published directly (the container's port reaches the internet), so a client
+ * can put any address it likes into `X-Forwarded-For`. Believing that header by default let
+ * anyone walk past the login rate limiter: every forged address was a fresh bucket, so the
+ * password could be guessed as often as the attacker liked.
  *
- * `EASYX_TRUST_PROXY=true|false` overrides, for deployments behind something that connects from a
- * public address (a remote load balancer) or the opposite (do not trust anyone).
+ * The default is therefore to believe nobody. The limiter then counts every attempt against one
+ * bucket, which is a far better trade: attempts stay capped, and the lockout it applies is short
+ * (at most a minute) rather than an unlimited guessing budget.
+ *
+ * `EASYX_TRUST_PROXY=private` restores the old behaviour for a deployment that really does sit
+ * behind a reverse proxy on the same host -- the header is only believed when the socket peer is
+ * a private address. `true` believes it unconditionally, `false` is the default.
  */
 export function trustProxyOption(env: string | undefined = process.env.EASYX_TRUST_PROXY): boolean | ((address: string) => boolean) {
   const value = (env ?? "").trim().toLowerCase();
   if (value === "true") return true;
   if (value === "false") return false;
-  return isPrivateAddress;
+  if (value === "private") return isPrivateAddress;
+  return false;
 }

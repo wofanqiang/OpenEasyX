@@ -325,9 +325,12 @@ export class LibraryDatabase {
     if (query.watched === "unfinished") where.push("COALESCE(p.completed,0)=0");
     if (query.watched === "completed") where.push("COALESCE(p.completed,0)=1");
     const order = {
-      recent: "m.added_at DESC,m.modified_at DESC", oldest: "m.added_at ASC,m.modified_at ASC", title: "m.title COLLATE NOCASE ASC",
-      largest: "m.size DESC", "most-viewed": "COALESCE(p.view_count,0) DESC,m.modified_at DESC",
-      history: "p.last_viewed_at DESC,m.modified_at DESC",
+      // The id breaks ties: two files ingested in the same millisecond would otherwise come back
+      // in whatever order the scan happened to write them, so "oldest" was not the reverse of
+      // "recent" and paging could repeat or skip a row.
+      recent: "m.added_at DESC,m.modified_at DESC,m.id DESC", oldest: "m.added_at ASC,m.modified_at ASC,m.id ASC", title: "m.title COLLATE NOCASE ASC,m.id ASC",
+      largest: "m.size DESC,m.id ASC", "most-viewed": "COALESCE(p.view_count,0) DESC,m.modified_at DESC,m.id DESC",
+      history: "p.last_viewed_at DESC,m.modified_at DESC,m.id DESC",
     }[query.sort ?? "recent"];
     const pageSize = Math.max(1, Math.min(100, query.pageSize ?? 48));
     const page = Math.max(1, query.page ?? 1);
@@ -359,9 +362,12 @@ export class LibraryDatabase {
     if (query.watched === "unfinished") where.push("COALESCE(p.completed,0)=0");
     if (query.watched === "completed") where.push("COALESCE(p.completed,0)=1");
     const order = {
-      recent: "m.added_at DESC,m.modified_at DESC", oldest: "m.added_at ASC,m.modified_at ASC", title: "m.title COLLATE NOCASE ASC",
-      largest: "m.size DESC", "most-viewed": "COALESCE(p.view_count,0) DESC,m.modified_at DESC",
-      history: "p.last_viewed_at DESC,m.modified_at DESC",
+      // The id breaks ties: two files ingested in the same millisecond would otherwise come back
+      // in whatever order the scan happened to write them, so "oldest" was not the reverse of
+      // "recent" and paging could repeat or skip a row.
+      recent: "m.added_at DESC,m.modified_at DESC,m.id DESC", oldest: "m.added_at ASC,m.modified_at ASC,m.id ASC", title: "m.title COLLATE NOCASE ASC,m.id ASC",
+      largest: "m.size DESC,m.id ASC", "most-viewed": "COALESCE(p.view_count,0) DESC,m.modified_at DESC,m.id DESC",
+      history: "p.last_viewed_at DESC,m.modified_at DESC,m.id DESC",
     }[query.sort ?? "recent"];
     return (this.sqlite.prepare(`SELECT m.id FROM media m LEFT JOIN playback p ON p.media_id=m.id
       WHERE ${where.join(" AND ")} ORDER BY ${order}`).all(...values) as Array<{ id: string }>).map((row) => row.id);
