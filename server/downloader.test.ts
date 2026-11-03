@@ -1085,3 +1085,19 @@ describe("queued capture for a room that ended", () => {
     expect(db.getItem(item.id)?.status).not.toBe("cancelled");
   });
 });
+
+describe("recording progress accounting", () => {
+  it("counts the segments the recorder wrapper keeps in a subdirectory", () => {
+    // The wrapper writes its segments into live-parts/, so a top-level scan saw zero bytes and the
+    // queue took that for a stall: every wrapper-path capture was killed three minutes in, while
+    // the ones that write their segments flat ran for hours.
+    const directory = temp("easyx-live-parts");
+    fs.mkdirSync(path.join(directory, "live-parts"), { recursive: true });
+    fs.writeFileSync(path.join(directory, "live-parts", "part-001.ts"), Buffer.alloc(4096, 1));
+    expect(receivedBytes(directory)).toBe(4096);
+    // A capture that has written nothing yet still reads zero, so the stall timer keeps its meaning.
+    const empty = temp("easyx-live-parts-empty");
+    fs.mkdirSync(path.join(empty, "live-parts"), { recursive: true });
+    expect(receivedBytes(empty)).toBe(0);
+  });
+});

@@ -9,6 +9,12 @@ let currentMasterUrl = masterUrl;
 const gapMs = Number(gapArg) || 0;
 const pollMs = Number(pollArg) || 20000;
 const stallMs = Number(process.env.EASYX_LIVE_STALL_MS) || 60000;
+// How long to wait for the room to come back. The queue's stall watchdog ends the whole process
+// group once a capture has produced no bytes for the stall bound plus its grace window, so a wait
+// longer than that budget is cancelled by the very watchdog meant to protect it -- and nothing is
+// written during the wait, so the clock does not move. The queue passes its bound in through
+// EASYX_LIVE_STALL_MS, and the wait is held to a fraction of it.
+const waitMs = Math.min(gapMs, stallMs * 2);
 const partsDir = path.join(path.dirname(output), "live-parts");
 fs.rmSync(partsDir, { recursive: true, force: true });
 fs.mkdirSync(partsDir, { recursive: true });
@@ -138,8 +144,8 @@ async function liveVariant(resolution, codecs) {
         resolution = match?.resolution || ""; codecs = match?.codecs || codecs;
       } catch { resolution = ""; }
     }
-    say("stream stopped (ffmpeg exit " + code + "); waiting up to " + (gapMs >= 60000 ? Math.round(gapMs / 60000) + " min" : Math.round(gapMs / 1000) + " s") + " for the room to return");
-    const deadline = Date.now() + gapMs;
+    say("stream stopped (ffmpeg exit " + code + "); waiting up to " + (waitMs >= 60000 ? Math.round(waitMs / 60000) + " min" : Math.round(waitMs / 1000) + " s") + " for the room to return");
+    const deadline = Date.now() + waitMs;
     url = "";
     while (!stopping && Date.now() < deadline) {
       await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));

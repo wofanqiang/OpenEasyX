@@ -327,11 +327,33 @@ export function nextSegmentStart(directory: string): number {
  */
 export function receivedBytes(directory: string): number {
   try {
-    const files = fs.readdirSync(directory, { withFileTypes: true }).filter((entry) => entry.isFile());
+    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    const files = entries.filter((entry) => entry.isFile());
     const parts = files.filter((entry) => CAPTURE_SEGMENT_PATTERN.test(entry.name));
-    return (parts.length ? parts : files).reduce((total, entry) => {
-      try { return total + fs.statSync(path.join(directory, entry.name)).size; } catch { return total; }
+    const total = (parts.length ? parts : files).reduce((sum, entry) => {
+      try { return sum + fs.statSync(path.join(directory, entry.name)).size; } catch { return sum; }
     }, 0);
+    // The recorder wrapper writes its segments into a live-parts/ subdirectory, so a capture in
+    // progress was invisible to a top-level scan: the queue read zero bytes, took that for a stall
+    // and killed the very recording that was writing. Measured on a live box: every wrapper-path
+    // capture ended three minutes in, "no progress received", while the captures that write their
+    // segments flat ran for hours.
+    let segments = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name !== "live-parts") continue;
+      segments = sumFiles(path.join(directory, entry.name));
+    }
+    return total + segments;
+  } catch { return 0; }
+}
+
+/** The bytes held by the files of one directory. */
+function sumFiles(directory: string): number {
+  try {
+    return fs.readdirSync(directory, { withFileTypes: true }).filter((entry) => entry.isFile())
+      .reduce((sum, entry) => {
+        try { return sum + fs.statSync(path.join(directory, entry.name)).size; } catch { return sum; }
+      }, 0);
   } catch { return 0; }
 }
 
@@ -903,7 +925,7 @@ export class DownloadQueue {
             catch { return undefined; }
           }
         : undefined;
-      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream, captureInput, refreshStream)))
+      const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream, captureInput, refreshStream), recordingMaxHeight))
         ?? (plugin.resolveDownload ? await plugin.resolveDownload(context, candidate) : undefined);
       if (!request) throw new Error("This plugin cannot resolve downloads");
       // The resolve is done; from here on the clock is the capture's.
@@ -1486,6 +1508,14 @@ export class DownloadQueue {
   private containsMedia(directory: string): boolean {
     try {
       for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        // The recorder wrapper keeps its segments in a live-parts/ subdirectory. A directory that
+        // holds them is a recording in progress, not scaffolding: treating it as empty deleted
+        // what had already been captured on the next restart, right after the failure message
+        // promised the parts were preserved.
+        if (entry.isDirectory() && entry.name === "live-parts") {
+          if (sumFiles(path.join(directory, entry.name)) > 0) return true;
+          continue;
+        }
         if (!entry.isFile()) continue;
         if (!MEDIA_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
         try { if (fs.statSync(path.join(directory, entry.name)).size > 0) return true; } catch { /* vanished mid-scan */ }

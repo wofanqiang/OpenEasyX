@@ -207,12 +207,14 @@ export async function liveRecordingRequest(
   context: PluginContext,
   item: MediaCandidate,
   rewrite?: (stream: LiveStream) => string | undefined,
+  /** The tallest rendition the recording may follow; 0 or absent means best available. */
+  maxHeight?: number,
 ): Promise<CommandDownloadRequest | undefined> {
   const meta = item.metadata as Record<string, unknown> | undefined;
   if (meta?.live !== true || !plugin.resolveLiveStream) return undefined;
   const pageUrl = item.pageUrl ?? (typeof meta.extractorUrl === "string" ? meta.extractorUrl : undefined);
   if (!pageUrl) return undefined;
-  const cam: LiveCam = liveCamFor(item, pageUrl);
+  const cam: LiveCam = liveCamFor(item, pageUrl, maxHeight);
   try {
     const stream = await plugin.resolveLiveStream(context, cam);
     const proxied = rewrite?.(stream);

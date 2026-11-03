@@ -23,11 +23,28 @@ const PUBLIC_ENDPOINTS = new Set(["/api/auth/login", "/api/auth/me", "/api/healt
  * string: a stream URL carrying a valid media-link token (see media-links.ts) is its own
  * credential, scoped to that single media id.
  */
+/**
+ * The path the router will actually match.
+ *
+ * The gate and the router have to agree on what a request is asking for, or a request reaches a
+ * handler the gate never judged: the router decodes percent-encoding, while `URL.pathname` does
+ * not. Judging the raw pathname let an encoded first segment slip past the exemption and the
+ * session check alike -- `/%61pi/settings` is `/api/settings` to the router, and it answered the
+ * real settings API, reads and writes, to anyone. Decoding here closes that class of bypass; the
+ * `.`/`..` resolution the URL parser does on top keeps a path from hiding behind them.
+ */
+export function routedPath(path: string): string {
+  let decoded = path;
+  try { decoded = decodeURIComponent(path); } catch { /* malformed encoding stays encoded, which only asks for a session */ }
+  try { return new URL(decoded, "http://localhost").pathname; } catch { return decoded; }
+}
+
 export function isSessionExempt(path: string): boolean {
-  if (PUBLIC_ENDPOINTS.has(path)) return true;
-  if (isLiveProxyPath(path)) return true;
-  if (path === "/browser" || path.startsWith("/browser/")) return false;
-  return !path.startsWith("/api/");
+  const routed = routedPath(path);
+  if (PUBLIC_ENDPOINTS.has(routed)) return true;
+  if (isLiveProxyPath(routed)) return true;
+  if (routed === "/browser" || routed.startsWith("/browser/")) return false;
+  return !routed.startsWith("/api/");
 }
 
 export type SessionGateOptions = {
@@ -46,7 +63,7 @@ export type SessionGateOptions = {
  */
 export function createSessionGate(options: SessionGateOptions) {
   return (request: FastifyRequest, reply: FastifyReply, done: () => void): void => {
-    const path = new URL(request.url, "http://localhost").pathname;
+    const path = routedPath(new URL(request.url, "http://localhost").pathname);
     if (isSessionExempt(path)) return done();
     // Send and stop: the reply is already on its way, so the hook must not continue.
     if (!options.verifySession(options.readSessionCookie(request))) {

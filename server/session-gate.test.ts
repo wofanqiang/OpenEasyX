@@ -76,6 +76,22 @@ describe("session gate", () => {
     }
   });
 
+  it("requires a session when the path is spelled with an encoded segment", () => {
+    // The router decodes percent-encoding; the gate has to decode the same way, or a request
+    // reaches a handler the gate never judged. This was live: /%61pi/settings answered the real
+    // settings API -- reads and writes -- to anyone, and /%62rowser/vnc.html the remote desktop.
+    for (const path of ["/%61pi/settings", "/%61pi/items", "/%61pi/plugin-repositories", "/api%2fsettings", "/%62rowser/vnc.html"]) {
+      expect(isSessionExempt(path), path).toBe(false);
+    }
+  });
+
+  it("refuses an encoded API path over a real request", async () => {
+    const app = await appWithGate();
+    expect((await app.inject({ method: "GET", url: "/%61pi/items" })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/%61pi/items", headers: { "x-requested-with": "EasyX" } })).statusCode).toBe(401);
+    await app.close();
+  });
+
   it("requires a session for the browser proxy", () => {
     // It sits outside /api/, which used to be enough to skip authentication entirely while a VNC
     // session was running. It is a same-origin iframe, so the cookie is available.
