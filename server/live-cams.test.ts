@@ -931,3 +931,26 @@ describe("live-cam provider cache borrow fallback (per-query-key outage)", () =>
     }
   });
 });
+
+describe("auto-record status budget", () => {
+  it("asks every armed room about its status, not only the first few", async () => {
+    // A pass may ask the provider about a limited number of rooms, and the order of the armed
+    // rooms does not change from one pass to the next. Without a cursor the same rooms took the
+    // budget every time and the rest were never asked about: armed, live, and never recorded --
+    // silently.
+    const { plugins, service } = await fixture(); plugins.install("test.live");
+    const plugin = plugins.get("test.live");
+    const asked: string[] = [];
+    const lookup = vi.fn(async (_context: unknown, cam: { username: string }) => {
+      asked.push(cam.username);
+      return { ...cam, online: true, status: "public" };
+    });
+    plugin.getLiveCam = lookup as unknown as typeof plugin.getLiveCam;
+    const targets = Array.from({ length: 9 }, (_unused, index) => ({ username: `room${index}`, pageUrl: `https://live.test/room${index}` }));
+
+    await service.autoRecordStatuses("test.live", targets);
+    await service.autoRecordStatuses("test.live", targets);
+
+    expect(new Set(asked).size).toBe(9);
+  });
+});

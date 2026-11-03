@@ -143,6 +143,9 @@ export function startAutoRecorder({ db, liveCams, log, mediaRoot, freeSpace = fr
             log?.(`auto-record: ${providerId} status check failed: ${result.error ?? "unknown error"}`);
             continue;
           }
+          // Rooms the pass had no budget for are asked about in the next one; saying so keeps a
+          // room that waits its turn from looking like a room that was never asked about.
+          if (result.unchecked) log?.(`auto-record: ${providerId} left ${result.unchecked} armed room(s) without an exact status this pass; they are asked about next pass`);
           items = result.cams;
         } catch (error) {
           log?.(`auto-record: ${providerId} status check threw: ${error instanceof Error ? error.message : String(error)}`);

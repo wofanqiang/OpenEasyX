@@ -100,6 +100,17 @@ export class LiveCamService {
   private favoriteSyncs = new Map<string, Promise<LiveCamFavoriteSyncResult>>();
   private favoriteSnapshots = new Map<string, { snapshot: LiveCamFavoriteSnapshot; expiresAt: number }>();
   private favoriteStatuses = new Map<string, { cam: LiveCam; expiresAt: number }>();
+  /**
+   * Where the next pass starts asking for exact room statuses.
+   *
+   * A pass may only ask a provider about a limited number of rooms (see
+   * MAX_EXACT_STATUS_CHECKS_PER_PASS), and the order of the armed rooms does not change from one
+   * pass to the next. Without a cursor the same rooms took the budget every time and the ones
+   * past it were never asked about: they kept an "unknown" status, and the watcher skipped them
+   * without a word -- armed, live, and never recorded. Starting each pass where the last one
+   * stopped gives every armed room a turn.
+   */
+  private statusCursor = new Map<string, number>();
   private favoriteWrites = new Map<string, Promise<void>>();
   private favoriteEpoch = new Map<string, number>();
   // Confirmed-offline verdicts from failed capture attempts (`providerId:username` -> until).
@@ -605,7 +616,7 @@ export class LiveCamService {
   // followed-account snapshot when available; every target is then validated with the plugin's
   // exact-room lookup (getLiveCam) or a bounded catalogue search, sharing the per-cam status
   // cache with the favorites path. This is what lets a favorite-less performer be recorded.
-  async autoRecordStatuses(providerId: string, targets: Array<{ username: string; pageUrl: string }>): Promise<{ ok: boolean; error?: string; cams: LiveCam[] }> {
+  async autoRecordStatuses(providerId: string, targets: Array<{ username: string; pageUrl: string }>): Promise<{ ok: boolean; error?: string; cams: LiveCam[]; unchecked?: number }> {
     const entry = this.livePlugins(providerId)[0];
     if (!entry) return { ok: false, error: "The live-cam plugin is not installed or enabled", cams: [] };
     const plugin = this.plugins.get(providerId);
@@ -619,8 +630,13 @@ export class LiveCamService {
     }
     const cams: LiveCam[] = [];
     let checks = 0;
-    for (let offset = 0; offset < targets.length; offset += 4) {
-      const batch = await Promise.all(targets.slice(offset, offset + 4).map(async (target): Promise<LiveCam> => {
+    // The budget is spent in turn: each pass starts where the last one stopped, so a room past
+    // the limit is asked about in the next pass instead of never.
+    const start = targets.length ? this.statusCursor.get(providerId) ?? 0 : 0;
+    const ordered = targets.length ? [...targets.slice(start % targets.length), ...targets.slice(0, start % targets.length)] : targets;
+    let unchecked = 0;
+    for (let offset = 0; offset < ordered.length; offset += 4) {
+      const batch = await Promise.all(ordered.slice(offset, offset + 4).map(async (target): Promise<LiveCam> => {
         const username = target.username.trim();
         const followed = remote.get(username.toLowerCase());
         if (followed) return followed;
@@ -629,7 +645,10 @@ export class LiveCamService {
         if (cached && cached.expiresAt > Date.now()) return cached.cam;
         const offline: LiveCam = { id: username, username, pageUrl: target.pageUrl, online: false };
         // Never auto-start from an uncertain status; a missing check is better than a false live.
-        if (transientFailure || checks >= MAX_EXACT_STATUS_CHECKS_PER_PASS) return { ...(cached?.cam ?? offline), statusUnavailable: true };
+        if (transientFailure || checks >= MAX_EXACT_STATUS_CHECKS_PER_PASS) {
+          unchecked += 1;
+          return { ...(cached?.cam ?? offline), statusUnavailable: true };
+        }
         checks += 1;
         try {
           let cam: LiveCam;
@@ -657,7 +676,9 @@ export class LiveCamService {
     for (const cam of cams) {
       if (this.offlineOverrides.has(`${providerId}:${cam.username.trim().toLowerCase()}`)) cam.online = false;
     }
-    return { ok: true, cams };
+    // The next pass starts after the rooms this one asked about.
+    this.statusCursor.set(providerId, (start + Math.max(1, checks)) % Math.max(1, ordered.length));
+    return { ok: true, cams, unchecked };
   }
 
   /**
