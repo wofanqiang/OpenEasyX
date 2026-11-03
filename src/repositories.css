@@ -16,3 +16,37 @@
 .repository-add input { min-width: 0; padding: 11px 12px; background: #0e0e11; border: 1px solid #29292f; border-radius: 9px; color: inherit; }
 .repository-add button { white-space: nowrap; }
 @media (max-width: 900px) { .repository-add { grid-template-columns: 1fr; } .repository-list article { grid-template-columns: auto 1fr; } .repository-list article > div:last-child { grid-column: 1 / -1; justify-content: flex-end; } }
+
+/* What an update would bring, shown before anything is replaced. */
+.repository-update {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 10px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+}
+.repository-update > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.repository-update strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.repository-update code {
+  font-size: 11px;
+  opacity: 0.72;
+  word-break: break-all;
+}
+.repository-update > div:last-child {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}

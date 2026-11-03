@@ -12,12 +12,26 @@
 #   :8443 { reverse_proxy open-easyx:3210 }
 # and browse https://<host-ip>:8443 (self-signed certificate).
 
+# The clear-text port never serves the application: it sends the browser to the encrypted
+# address, so the session cookie is always marked Secure and no request travels in clear text.
+http:// {
+	redir https://{host}{uri} permanent
+}
+
 {$EASYX_DOMAIN} {
 	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
 
 	reverse_proxy open-easyx:3210 {
 		# Required: lets the app detect HTTPS and mark the session cookie Secure.
 		header_up X-Forwarded-Proto {scheme}
+		# Replaced, not appended: the client cannot name someone else's address.
 		header_up X-Forwarded-For {remote_host}
 	}
 }

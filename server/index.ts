@@ -283,9 +283,14 @@ app.post<{ Body: { url?: unknown; name?: unknown } }>("/api/plugin-repositories"
   const repository = await pluginRepositories.add(request.body.url, typeof request.body.name === "string" ? request.body.name : undefined);
   plugins.setRoots(pluginRepositories.roots()); await plugins.load(); return { repository, plugins: plugins.list() };
 });
-app.post<{ Params: { id: string } }>("/api/plugin-repositories/:id/refresh", async (request) => {
+app.post<{ Params: { id: string }; Body: { confirm?: unknown } }>("/api/plugin-repositories/:id/refresh", async (request) => {
   if (request.params.id === "official") throw Object.assign(new Error("The official store is updated with OpenEasyX"), { statusCode: 409 });
-  const repository = await pluginRepositories.refresh(request.params.id); plugins.setRoots(pluginRepositories.roots()); await plugins.load(); return { repository, plugins: plugins.list() };
+  // Without a confirmation this only reports what an update would bring: the new commit and the
+  // files that differ. Nothing is replaced and no code is run until the operator agrees.
+  const confirm = request.body?.confirm === true;
+  const result = await pluginRepositories.refresh(request.params.id, confirm);
+  if (!confirm) return { preview: result };
+  plugins.setRoots(pluginRepositories.roots()); await plugins.load(); return { repository: result, plugins: plugins.list() };
 });
 app.delete<{ Params: { id: string } }>("/api/plugin-repositories/:id", async (request) => {
   if (request.params.id === "official") throw Object.assign(new Error("The official store cannot be removed"), { statusCode: 409 });

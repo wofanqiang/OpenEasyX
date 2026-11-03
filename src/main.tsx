@@ -32,7 +32,9 @@ import "./performer-discovery.css";
 import "./responsive.css";
 
 type Plugin = { manifest: { id: string; name: string; version: string; description: string; author: string; homepage?: string; capabilities: string[]; settings?: Array<{ key: string; label: string; type: string; required?: boolean; default?: unknown; placeholder?: string; help?: string; cookieDomains?: string[]; sessionFormat?: "cookies" | "raw-json" }>; browserAuth?: { loginUrl: string; sessionSetting: string; capture?: "cookies" | "onlyfans" | "manyvids" | "authorization-header"; requestDomains?: string[] }; sourceUrlPatterns?: string[]; fallback?: boolean; polling?: { mode: "periodic" | "live"; defaultIntervalSeconds: number; minimumIntervalSeconds: number } }; installed: boolean; enabled: boolean; config: Record<string, unknown>; origin: string };
-type PluginRepository = { id: string; name: string; url: string; official: boolean; removable: boolean; addedAt: string; updatedAt: string; pluginCount: number };
+type PluginRepository = { id: string; name: string; url: string; official: boolean; removable: boolean; addedAt: string; updatedAt: string; pluginCount: number; commit?: string; plugins?: { id: string; name: string; version: string; directory: string }[] };
+/** What an update would bring, asked for before anything is replaced. */
+type RepositoryUpdate = { id: string; currentCommit?: string; newCommit?: string; changedFiles?: string[]; changedCount: number; plugins: { id: string; name: string; version: string; directory: string }[] };
 type Performer = { id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>; autoRecord?: boolean; priority?: number };
 const priorityKey = (value?: number) => value && value > 0 ? "high" : value && value < 0 ? "low" : "normal";
 const priorityLabels = { high: "High", normal: "Normal", low: "Low" } as const;
@@ -496,6 +498,13 @@ function ActivityPage({ performers, sources, run }: { performers: Performer[]; s
 }
 
 function PluginsPage({ plugins, repositories, run }: { plugins: Plugin[]; repositories: PluginRepository[]; run: (op: () => Promise<unknown>, msg: string | ((result: unknown) => string)) => Promise<void> }) {
+  // An update replaces code that runs inside the server, so it is asked for first: the new commit
+  // and the files that differ are shown, and nothing is replaced until the operator agrees.
+  const [update, setUpdate] = useState<{ id: string; preview: RepositoryUpdate } | null>(null);
+  const previewUpdate = async (id: string) => {
+    const result = await api<{ preview: RepositoryUpdate }>(`/api/plugin-repositories/${id}/refresh`, { method: "POST" });
+    setUpdate({ id, preview: result.preview });
+  };
   const [configuring, setConfiguring] = useState<{ plugin: Plugin; installing: boolean } | null>(null);
   const [query, setQuery] = useState("");
   const [installationFilter, setInstallationFilter] = useState<"installed" | "available">("installed");
@@ -532,7 +541,8 @@ function PluginsPage({ plugins, repositories, run }: { plugins: Plugin[]; reposi
   return <>
     <div className="plugin-intro"><div><p>TRUSTED EXTENSIONS</p><h2>Choose what Open EasyX<br/>can do.</h2></div><div className="plugin-page-stats"><span><strong>{installed}</strong> installed</span><i/><span><strong>{active}</strong> active</span></div></div>
     <section className="repository-store"><div className="repository-head"><div><p>PLUGIN STORES</p><h3>Repositories</h3><span>The official store is built in. Add any compatible GitHub, Gitea, Forgejo, GitLab, or generic Git repository.</span></div></div>
-      <div className="repository-list">{repositories.map((repository) => <article key={repository.id}><span className={`repository-mark ${repository.official ? "official" : ""}`}><Plug/></span><div><strong>{repository.name}{repository.official && <i>Official</i>}</strong><code>{repository.url}</code><small>{repository.pluginCount} {repository.pluginCount === 1 ? "plugin" : "plugins"}</small></div><div>{!repository.official && <><button className="secondary" onClick={() => void run(() => api(`/api/plugin-repositories/${repository.id}/refresh`, { method: "POST" }), `${repository.name} updated`)}><RefreshCw size={14}/>Update</button><button className="danger-soft" onClick={() => void run(() => api(`/api/plugin-repositories/${repository.id}`, { method: "DELETE" }), `${repository.name} removed`)}><Trash2 size={14}/>Remove</button></>}</div></article>)}</div>
+      <div className="repository-list">{repositories.map((repository) => <article key={repository.id}><span className={`repository-mark ${repository.official ? "official" : ""}`}><Plug/></span><div><strong>{repository.name}{repository.official && <i>Official</i>}</strong><code>{repository.url}</code><small>{repository.pluginCount} {repository.pluginCount === 1 ? "plugin" : "plugins"}{repository.commit ? ` · ${repository.commit.slice(0, 7)}` : ""}</small></div><div>{!repository.official && <><button className="secondary" onClick={() => void previewUpdate(repository.id)}><RefreshCw size={14}/>Update</button><button className="danger-soft" onClick={() => void run(() => api(`/api/plugin-repositories/${repository.id}`, { method: "DELETE" }), `${repository.name} removed`)}><Trash2 size={14}/>Remove</button></>}</div></article>)}</div>
+      {update && <div className="repository-update"><div><strong>{update.preview.newCommit?.slice(0, 7) ?? "unknown"}</strong><small> {update.preview.changedCount ? `${update.preview.changedCount} 个文件变更` : "没有文件变更"}{update.preview.currentCommit ? ` · 当前 ${update.preview.currentCommit.slice(0, 7)}` : ""}</small>{(update.preview.changedFiles ?? []).slice(0, 6).map((file) => <code key={file}>{file}</code>)}</div><div><button className="primary" onClick={() => void run(() => api(`/api/plugin-repositories/${update.id}/refresh`, { method: "POST", body: JSON.stringify({ confirm: true }) }), "Plugin repository updated").then(() => setUpdate(null))}><Check size={14}/>确认更新</button><button className="secondary" onClick={() => setUpdate(null)}>取消</button></div></div>}
       <div className="repository-add"><input aria-label="Repository name" placeholder="Name (optional)" value={repositoryName} onChange={(event) => setRepositoryName(event.target.value)}/><input aria-label="Git repository URL" placeholder="https://gitea.example/user/open-easyx-plugins.git" value={repositoryUrl} onChange={(event) => setRepositoryUrl(event.target.value)}/><button className="primary" disabled={!repositoryUrl.trim()} onClick={async () => { await run(() => api("/api/plugin-repositories", { method: "POST", body: JSON.stringify({ url: repositoryUrl, name: repositoryName }) }), "Plugin repository installed"); setRepositoryUrl(""); setRepositoryName(""); }}><Plus size={15}/>Install new repository</button></div>
     </section>
     <section className="plugin-browser">

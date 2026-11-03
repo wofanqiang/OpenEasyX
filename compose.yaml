@@ -25,7 +25,9 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
     ports:
-      - "3210:3210"
+      # The application answers on the loopback only. The reverse proxy in front of it (see the
+      # `tls` profile below) is the way in, so nothing reaches the server process in clear text.
+      - "127.0.0.1:3210:3210"
     environment:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
