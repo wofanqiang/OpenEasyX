@@ -140,6 +140,24 @@ describe.skipIf(!hasFfmpeg)("residual TS recovery", () => {
     expect(await env.queue.listRecovered()).toEqual([]);
   });
 
+  it("keeps the capture's real end time when a rescue is filed into the library", async () => {
+    const env = await harness();
+    const rescued = env.item("keeps-end-time");
+    writePlayableCapture(path.join(env.captureDir(rescued.id), "capture.ts"));
+    await env.queue.recoverResidualTs({ execute: true });
+
+    // A capture that failed at 18:34 and was archived the next morning: filing the bytes must not
+    // move the end time, or the live-session splicer reads the overnight silence as one continuous
+    // broadcast and folds the room's separate appearances into a single file.
+    const realEnd = "2026-11-03T18:34:40.000Z";
+    env.db.setItemStatus(rescued.id, "failed", { error: "ffmpeg exited", finishedAt: realEnd });
+
+    const result = await env.queue.catalogRecovered(rescued.id);
+    expect(result.cataloged).toBe(true);
+    expect(env.db.getItem(rescued.id)?.status).toBe("completed");
+    expect(env.db.getItem(rescued.id)?.downloadFinishedAt).toBe(realEnd);
+  });
+
   it("archives a recovered recording into its canonical library path", async () => {
     const env = await harness();
     const rescued = env.item("archive-me");

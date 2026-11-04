@@ -2299,13 +2299,23 @@ export class DownloadQueue {
         const relativePath = path.relative(this.mediaRoot, finalPath);
         const checksum = await this.hashFile(finalPath);
         const duplicate = this.db.findByChecksum(checksum, item.id, item.performerId);
+        // Filing rescued footage is bookkeeping, not broadcasting. The row must keep the moment the
+        // capture actually ended: writing the moment the operator clicked "archive" makes the
+        // live-session splicer read a multi-hour silence as a continuous broadcast and fold the
+        // room's separate appearances into one file. A row rebuilt from the rescue sidecar has no
+        // end time of its own, so the rescued file's mtime -- written as the capture stopped -- is
+        // the honest stand-in.
+        const rescuedAt = (() => {
+          if (item.downloadFinishedAt) return item.downloadFinishedAt;
+          try { return fs.statSync(mp4).mtime.toISOString(); } catch { return null; }
+        })();
         if (duplicate && duplicate.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
           fs.unlinkSync(finalPath);
-          this.db.setItemStatus(item.id, "duplicate", { progress: 1, checksum, duplicateOf: duplicate.id });
+          this.db.setItemStatus(item.id, "duplicate", { progress: 1, checksum, duplicateOf: duplicate.id, finishedAt: rescuedAt });
           const leftovers = this.consumeRecovered(itemId);
           return { cataloged: false, reason: "duplicate", leftovers };
         }
-        this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+        this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath, finishedAt: rescuedAt });
         const leftovers = this.consumeRecovered(itemId);
         return { cataloged: true, storagePath: relativePath, leftovers };
       });

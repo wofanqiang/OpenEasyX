@@ -910,8 +910,13 @@ export class Database {
       .run(error, attempts, nextRetryAt, now(), itemId);
   }
 
-  setItemStatus(itemId: string, status: string, values: { progress?: number; downloadedBytes?: number; error?: string | null; checksum?: string; storagePath?: string; duplicateOf?: string } = {}) {
+  setItemStatus(itemId: string, status: string, values: { progress?: number; downloadedBytes?: number; error?: string | null; checksum?: string; storagePath?: string; duplicateOf?: string; finishedAt?: string | null } = {}) {
     const stamp = now();
+    // `finishedAt` keeps a capture's real end time when a later step (filing a rescued recording
+    // into the library) changes its status without the recording having continued. Writing the
+    // bookkeeping moment instead would tell the live-session splicer the room kept broadcasting
+    // through the gap, folding separate appearances into one file.
+    const finishedAt = values.finishedAt ?? stamp;
     this.sqlite.prepare(`UPDATE items SET status=?,progress=COALESCE(?,progress),downloaded_bytes=CASE WHEN ?='queued' THEN 0 ELSE COALESCE(?,downloaded_bytes) END,error=?,checksum_sha256=COALESCE(?,checksum_sha256),storage_path=COALESCE(?,storage_path),duplicate_of=CASE WHEN ?='queued' THEN NULL ELSE COALESCE(?,duplicate_of) END,
       duplicate_reason=CASE WHEN ?='duplicate' THEN duplicate_reason ELSE NULL END,
       published_at=CASE WHEN ?='downloading' AND json_extract(metadata_json,'$.live')=1 THEN COALESCE(download_started_at,?) ELSE published_at END,
@@ -920,7 +925,7 @@ export class Database {
       download_finished_at=CASE WHEN ? IN ('queued','downloading','paused','stopping','cancelling') THEN NULL WHEN ? IN ('completed','duplicate','failed','cancelled','deleted') THEN ? ELSE download_finished_at END,
       capture_ended_at=CASE WHEN ?='queued' THEN NULL ELSE capture_ended_at END,
       updated_at=? WHERE id=?`)
-      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, status, values.duplicateOf ?? null, status, status, stamp, status, status, status, status, stamp, status, status, stamp, status, stamp, itemId);
+      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, status, values.duplicateOf ?? null, status, status, stamp, status, status, status, status, stamp, status, status, finishedAt, status, stamp, itemId);
     return this.getItem(itemId);
   }
 
