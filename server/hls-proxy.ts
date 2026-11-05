@@ -68,6 +68,16 @@ const REJECT_STATUSES = new Set([403, 410, 429]);
 const REFRESH_COOLDOWN_MS = 30_000;
 const REFRESH_MEMORY_MS = 30_000;
 /**
+ * How long a refused playlist may be held open while the re-resolve runs.
+ *
+ * The recorder runs with `-rw_timeout 15s` (see `packages/live-capture.ts`), and a stall is what
+ * that timeout ends, so the hold has to stay inside it. Measured on the recorder's own binary
+ * (ffmpeg 5.1.9 in the image): a playlist request held for 10 s, and another held for 14 s, both
+ * left the capture running -- 12 s keeps a normal re-resolve (2-10 s) and a few seconds of retry
+ * inside the budget without reaching the timeout.
+ */
+const PLAYLIST_WAIT_MS = 12_000;
+/**
  * How often expired entries are actually swept. `url()` runs on every line of every rewritten
  * playlist, and a full scan per line made the proxy's cost grow with the recording's length; a
  * sweep 30 seconds apart keeps the map at its steady state for free. The cost of waiting is that
@@ -216,6 +226,50 @@ export class HlsProxy {
   }
 
   /**
+   * True for a playlist request, which is the only kind worth holding open.
+   *
+   * The suffix in the token path is what the client actually asked for, so it is authoritative;
+   * it is empty only when the address carried no extension, and then the entry's own address
+   * decides. Media segments must answer immediately: a segment 403 is routine (an LL-HLS CDN
+   * drops segments a lagging recorder never reached) and ffmpeg retries those by itself.
+   */
+  private isPlaylistRequest(tokenPath: string, entry: ProxyEntry): boolean {
+    const token = tokenPath.split(".", 1)[0];
+    const suffix = tokenPath.slice(token.length).toLowerCase();
+    if (suffix === ".m3u8" || suffix === ".m3u") return true;
+    if (suffix) return false;
+    try { return /\.m3u8?$/i.test(new URL(entry.url!).pathname); } catch { return false; }
+  }
+
+  /**
+   * Wait out an in-flight re-resolve and report whether it cleared the refusal.
+   *
+   * `beginRefresh` runs in the background, so without this the refusal it is repairing gets
+   * answered while the repair is still on its way -- and a refused playlist is fatal, so the
+   * capture dies in the gap. Bounded twice: by the refresh itself (a provider that cannot mint a
+   * new address has to fail fast, or every playlist request would sit out the full timeout) and
+   * by `PLAYLIST_WAIT_MS`.
+   */
+  private async awaitRefresh(entry: ProxyEntry, log?: (message: string) => void): Promise<boolean> {
+    const pending = entry.refresher?.pending;
+    if (!pending) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const waitedTooLong = await Promise.race([
+      // A failed refresh is caught inside `beginRefresh`; a throwing `.then` is not, so treat both
+      // as "nothing arrived" rather than letting the proxy throw on a refusal.
+      pending.then(() => false, () => false),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), PLAYLIST_WAIT_MS); timer.unref?.(); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (waitedTooLong) {
+      log?.("live proxy: the re-resolve did not land in time, answering the refusal");
+      return false;
+    }
+    // A refresh that produced nothing leaves the verdict in place; one that succeeded clears it.
+    return !(entry.reject !== undefined && entry.reject.until > Date.now());
+  }
+
+  /**
    * `log` receives the proxy's failures. The route is registered with Fastify's per-request
    * logging silenced -- one capture would otherwise flood the whole log buffer with
    * "incoming request" lines and bury every real message -- so without this, a stale link or an
@@ -232,8 +286,14 @@ export class HlsProxy {
     entry.expiresAt = Date.now() + ENTRY_TTL_MS;
     if (entry.body !== undefined) return reply.type(PLAYLIST_MIME).header("cache-control", "no-store").send(entry.body);
 
-    const sourceUrl = new URL(entry.url!);
-    for (const key of FORWARDED_QUERY) { const value = text(query[key]); if (value) sourceUrl.searchParams.set(key, value); }
+    // Rebuilt rather than captured, because a refusal may install a fresh address and the retry
+    // has to follow it.
+    const buildTarget = () => {
+      const url = new URL(entry.url!);
+      for (const key of FORWARDED_QUERY) { const value = text(query[key]); if (value) url.searchParams.set(key, value); }
+      return url;
+    };
+    let sourceUrl = buildTarget();
 
     // Answer a remembered refusal without touching the network. Deliberately silent: the refusal
     // was logged once when it happened, and repeating it per retry is the log spam this replaces.
@@ -257,9 +317,30 @@ export class HlsProxy {
       // in the URL has a lifetime. Re-resolving hands the recorder a fresh address, so the capture
       // continues on a stream that never stopped. Only a provider that can be asked again gets
       // this; a stream without a refresher simply keeps refusing.
-      if (REJECT_STATUSES.has(response.status)) this.beginRefresh(entry, log);
-      log?.("live proxy: provider returned HTTP " + response.status + " for " + sourceUrl.host + sourceUrl.pathname);
-      return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
+      if (REJECT_STATUSES.has(response.status)) {
+        this.beginRefresh(entry, log);
+        // A refused PLAYLIST is fatal on the recording side. Measured against the recorder's own
+        // binary (ffmpeg 5.1.9, the one in the image): a single 403 on a playlist *reload* yields
+        // "Failed to reload playlist 0" and the process exits about 2 s later -- with exit status
+        // 0, which is why those captures were filed as completed rather than failed -- while the
+        // very same stall that never answers is survived (held 10 s, then 14 s: still capturing).
+        // `-reconnect_on_http_error 403,5xx` covers opening the input, not reloading a playlist.
+        // So the re-resolve is only worth anything if this request waits for it: answering 403 at
+        // once throws away a capture that a few seconds of patience would have saved.
+        // Segments are deliberately excluded: a segment 403 is routine, ffmpeg retries those by
+        // itself, and holding every one of them open would pile up sleeping requests all broadcast.
+        if (this.isPlaylistRequest(tokenPath, entry) && await this.awaitRefresh(entry, log)) {
+          sourceUrl = buildTarget();
+          try { response = await this.fetchUpstream(sourceUrl, entry.headers, range, entry.fingerprint ? this.fingerprinted : undefined); }
+          catch { /* keep the original refusal: the retry is a second chance, not a promise */ }
+        }
+        // Deliberately no refusal memory on the way out: remembering this verdict would make the
+        // next playlist request answer 403 on the spot, which is the behaviour being removed here.
+      }
+      if (!response.ok) {
+        log?.("live proxy: provider returned HTTP " + response.status + " for " + sourceUrl.host + sourceUrl.pathname);
+        return reply.status(response.status).send({ error: `Live provider returned HTTP ${response.status}` });
+      }
     }
     entry.reject = undefined;
 

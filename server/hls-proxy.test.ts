@@ -298,21 +298,21 @@ describe("hls proxy re-resolves a refused stream", () => {
       return playlist();
     }) as unknown as typeof fetch;
     const proxy = new HlsProxy(request, undefined, 0);
-    let refreshed = false;
-    const refresh = vi.fn(async () => { refreshed = true; return { url: "https://cdn.test/new.m3u8", headers: { "referer": "https://chaturbate.com/" } }; });
+    const refresh = vi.fn(async () => ({ url: "https://cdn.test/new.m3u8", headers: { "referer": "https://chaturbate.com/" } }));
     const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
 
     const first = stubReply();
     await proxy.serve(token, first.reply);
-    expect(first.status()).toBe(403);
+    // The fresh address arrives within the wait, so even the very first request is served from it
+    // rather than answered with the refusal (see "holds a refused playlist open ...").
+    expect(first.status()).toBe(200);
     expect(refresh).toHaveBeenCalledTimes(1);
-    // The refresh lands on the entry, so the next request follows the new address.
-    await vi.waitFor(() => expect(refreshed).toBe(true));
+    expect(seen).toContain("https://cdn.test/new.m3u8");
+    // The replacement lands on the entry itself, so later polls ask the new address directly.
     const second = stubReply();
     await proxy.serve(token, second.reply);
     expect(second.status()).toBe(200);
     expect(second.body()).toContain("#EXTM3U");
-    expect(seen).toContain("https://cdn.test/new.m3u8");
   });
 
   it("does not ask the provider again while the re-resolve is running", async () => {
@@ -325,15 +325,22 @@ describe("hls proxy re-resolves a refused stream", () => {
     const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
 
     const first = stubReply();
-    await proxy.serve(token, first.reply);
-    expect(upstreamCalls).toBe(1);
+    const answered = proxy.serve(token, first.reply);
+    // Wait for the re-resolve to *start*, not for the upstream call: `upstreamCalls` reaches 1
+    // synchronously inside `serve`, so polling it passes before the refusal has even been handled.
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
     // The address is known to be refused and a new one is on its way: ask from memory instead.
+    // This request must not queue behind the one already waiting, or a polling recorder would
+    // stack up sleepers against a CDN that just said no.
     const second = stubReply();
     await proxy.serve(token, second.reply);
     expect(upstreamCalls).toBe(1);
     expect(second.status()).toBe(403);
+    // A re-resolve that yields nothing must not leave the waiting request hanging: it answers the
+    // refusal as soon as the outcome is known.
     release(undefined);
-    await pending;
+    await answered;
+    expect(first.status()).toBe(403);
   });
 
   it("refuses to fetch an address inside the machine's own network", async () => {
@@ -381,5 +388,69 @@ describe("hls proxy re-resolves a refused stream", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(seen).toContain("https://cdn.test/new-video.m3u8");
     expect(seen).toContain("https://cdn.test/new-audio.m3u8");
+  });
+
+  it("holds a refused playlist open for the re-resolve instead of answering 403", async () => {
+    // Measured on VPS2: a chaturbate capture ended 0-4 seconds after a playlist 403, on 10 of 11
+    // segments in one night, while the room stayed `public`. Reproduced against the recorder's own
+    // binary (ffmpeg 5.1.9): one refused playlist reload gives "Failed to reload playlist 0" and
+    // the process exits ~2 s later, exit status 0. The same request *held* instead of refused
+    // survives -- 10 s and 14 s holds both kept capturing. So answering 403 immediately throws
+    // away a capture that a few seconds of patience would have saved.
+    const request = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("old")) return new Response("no", { status: 403 });
+      return playlist();
+    }) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    const refresh = vi.fn(async () => {
+      // The real refresher shells out to yt-dlp; make it finish a beat later so the wait is real.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { url: "https://cdn.test/new.m3u8", headers: {} };
+    });
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+
+    const reply = stubReply();
+    await proxy.serve(token, reply.reply);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(reply.status()).toBe(200);
+    expect(reply.body()).toContain("#EXTM3U");
+  });
+
+  it("still answers 403 when the re-resolve yields nothing", async () => {
+    // The wait must be bounded by the outcome, not by hope: a provider that cannot mint a new
+    // address has to fail fast, or every playlist request would sit for the full timeout.
+    const request = vi.fn(async () => new Response("no", { status: 403 })) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    const refresh = vi.fn(async () => undefined);
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+
+    const reply = stubReply();
+    await proxy.serve(token, reply.reply);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(reply.status()).toBe(403);
+  });
+
+  it("does not hold a refused media segment open", async () => {
+    // A segment 403 is routine (an LL-HLS CDN drops segments a lagging recorder never reached) and
+    // ffmpeg retries those by itself. Waiting on each one would pile up hundreds of sleeping
+    // requests during a broadcast, so the patience is for playlists only. Triggering the refresh is
+    // still fine and useful -- it just must not block this response.
+    const request = vi.fn(async () => new Response("no", { status: 403 })) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    // A refresh that never settles: if the segment response waited on it, this test would hang.
+    const refresh = vi.fn(() => new Promise<{ url: string } | undefined>(() => {}));
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+
+    const reply = stubReply();
+    // Ask for a media segment through the same stream: the suffix is what marks it as one.
+    const startedAt = Date.now();
+    await proxy.serve(`${token.split(".")[0]}.ts`, reply.reply);
+    const elapsed = Date.now() - startedAt;
+
+    expect(reply.status()).toBe(403);
+    expect(elapsed).toBeLessThan(1000);
   });
 });
