@@ -433,11 +433,40 @@ describe("hls proxy re-resolves a refused stream", () => {
     expect(reply.status()).toBe(403);
   });
 
+  it("does not spend the re-resolve on a refused media segment", async () => {
+    // Measured on the live box, hours after the wait landed: a segment 403 at 07:07:10 and another
+    // at 10:26:34 were each followed by a playlist 403 five and one second later, and both playlists
+    // came back refused. The segment had started a re-resolve, which consumed the 30 s cooldown, so
+    // the refusal that actually ends a capture found no repair in flight and was answered at once.
+    // A re-resolve is for the address, and the address is what a playlist reports.
+    const request = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      return url.includes("old") ? new Response("no", { status: 403 }) : playlist();
+    }) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    const refresh = vi.fn(async () => ({ url: "https://cdn.test/new.m3u8", headers: {} }));
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+    const bare = token.split(".")[0];
+
+    const segment = stubReply();
+    await proxy.serve(`${bare}.ts`, segment.reply);
+    expect(segment.status()).toBe(403);
+    expect(refresh).not.toHaveBeenCalled();
+
+    // The playlist refusal that follows must still be able to re-resolve -- the cooldown has not
+    // been spent, so the capture is saved instead of answered.
+    const refused = stubReply();
+    await proxy.serve(`${bare}.m3u8`, refused.reply);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refused.status()).toBe(200);
+    expect(refused.body()).toContain("#EXTM3U");
+  });
+
   it("does not hold a refused media segment open", async () => {
     // A segment 403 is routine (an LL-HLS CDN drops segments a lagging recorder never reached) and
     // ffmpeg retries those by itself. Waiting on each one would pile up hundreds of sleeping
-    // requests during a broadcast, so the patience is for playlists only. Triggering the refresh is
-    // still fine and useful -- it just must not block this response.
+    // requests during a broadcast, so the patience -- and the re-resolve behind it -- is for
+    // playlists only: see "does not spend the re-resolve on a refused media segment".
     const request = vi.fn(async () => new Response("no", { status: 403 })) as unknown as typeof fetch;
     const proxy = new HlsProxy(request, undefined, 0);
     // A refresh that never settles: if the segment response waited on it, this test would hang.

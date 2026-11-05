@@ -318,24 +318,34 @@ export class HlsProxy {
       // continues on a stream that never stopped. Only a provider that can be asked again gets
       // this; a stream without a refresher simply keeps refusing.
       if (REJECT_STATUSES.has(response.status)) {
-        this.beginRefresh(entry, log);
-        // A refused PLAYLIST is fatal on the recording side. Measured against the recorder's own
-        // binary (ffmpeg 5.1.9, the one in the image): a single 403 on a playlist *reload* yields
-        // "Failed to reload playlist 0" and the process exits about 2 s later -- with exit status
-        // 0, which is why those captures were filed as completed rather than failed -- while the
-        // very same stall that never answers is survived (held 10 s, then 14 s: still capturing).
-        // `-reconnect_on_http_error 403,5xx` covers opening the input, not reloading a playlist.
-        // So the re-resolve is only worth anything if this request waits for it: answering 403 at
-        // once throws away a capture that a few seconds of patience would have saved.
-        // Segments are deliberately excluded: a segment 403 is routine, ffmpeg retries those by
-        // itself, and holding every one of them open would pile up sleeping requests all broadcast.
-        if (this.isPlaylistRequest(tokenPath, entry) && await this.awaitRefresh(entry, log)) {
-          sourceUrl = buildTarget();
-          try { response = await this.fetchUpstream(sourceUrl, entry.headers, range, entry.fingerprint ? this.fingerprinted : undefined); }
-          catch { /* keep the original refusal: the retry is a second chance, not a promise */ }
+        // A re-resolve repairs the *address*, and a playlist is the only thing that reports one. A
+        // segment 403 is routine -- an LL-HLS CDN evicts segments a lagging recorder never reached
+        // -- and ffmpeg retries those by itself, so spending the provider's extractor on one buys
+        // nothing and costs the 30 s cooldown. Measured on a live box after the wait below landed:
+        // a segment refusal at 07:07:10 and another at 10:26:34 were each followed by a *playlist*
+        // refusal five and one second later, and both playlists were answered 403 because the
+        // cooldown had already been spent on the segment -- the one refusal that ends a capture
+        // went unrepaired by the machinery meant to repair it.
+        if (this.isPlaylistRequest(tokenPath, entry)) {
+          this.beginRefresh(entry, log);
+          // A refused playlist is fatal on the recording side. Measured against the recorder's own
+          // binary (ffmpeg 5.1.9, the one in the image): a single 403 on a playlist *reload* yields
+          // "Failed to reload playlist 0" and the process exits about 2 s later -- with exit status
+          // 0, which is why those captures were filed as completed rather than failed -- while the
+          // very same stall that never answers is survived (held 10 s, then 14 s: still capturing).
+          // `-reconnect_on_http_error 403,5xx` covers opening the input, not reloading a playlist.
+          // So the re-resolve is only worth anything if this request waits for it: answering 403 at
+          // once throws away a capture that a few seconds of patience would have saved. Segments are
+          // excluded from that wait too: holding each one open would pile up sleepers all broadcast.
+          if (await this.awaitRefresh(entry, log)) {
+            sourceUrl = buildTarget();
+            try { response = await this.fetchUpstream(sourceUrl, entry.headers, range, entry.fingerprint ? this.fingerprinted : undefined); }
+            catch { /* keep the original refusal: the retry is a second chance, not a promise */ }
+          }
         }
         // Deliberately no refusal memory on the way out: remembering this verdict would make the
         // next playlist request answer 403 on the spot, which is the behaviour being removed here.
+        // Segment refusals keep theirs -- the per-entry memory set above still answers their retries.
       }
       if (!response.ok) {
         log?.("live proxy: provider returned HTTP " + response.status + " for " + sourceUrl.host + sourceUrl.pathname);
