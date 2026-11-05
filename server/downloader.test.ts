@@ -704,6 +704,58 @@ it("runs a recording and a download side by side, one slot per pool", async () =
   } finally { queue.stop(); server.close(); }
 });
 
+it("opens one capture per room and closes the second live item as a duplicate", async () => {
+  // Two entry points reach one broadcast: the recorder, and a scraper that lists the live stream as
+  // media. Both land on the same source, and two ffmpeg captures of one room starve each other
+  // (same viewer session, same CPU, same disk) until both die -- so the queue must open exactly one
+  // and close the newcomer. Slots are deliberately not the limit here: with two recording slots
+  // available, only the duplicate rule can keep the second from starting.
+  const dataDir = temp("easyx-room-data"); const mediaDir = temp("easyx-room-media"); const pluginDir = temp("easyx-room-plugins");
+  const hits: string[] = [];
+  const server = http.createServer((request, response) => {
+    // Never answers: the first capture stays in flight for the whole test, which is the state the
+    // second item has to be refused in.
+    hits.push(request.url ?? "");
+    if (hits.length === 1) return;
+    response.end("late");
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("Missing test server address");
+  const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+  fs.writeFileSync(path.join(packageDir, "index.mjs"), `export default { manifest: { id: "test.room", name: "Room", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] }, async resolveDownload(_context, item) { return { url: item.metadata.url, filename: item.filename }; } };`);
+  const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+  db.setPluginState("test.room", { installed: true, enabled: true });
+  db.updateSettings({ maxConcurrentDownloads: 2, maxConcurrentRecordings: 2, autoRecordMinBytes: 0 });
+  const person = db.upsertPerformer({ externalId: "person", name: "Room Performer" }, "test.room");
+  const source = db.addSource(person.id, "test.room", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+  db.ingestItems(source, [
+    { externalId: "auto-live:room:session-one", mediaType: "video", filename: "one.mp4", metadata: { url: `http://127.0.0.1:${address.port}/one.mp4`, live: true, liveRoom: "room" } },
+    { externalId: "manual-live:room:session-two", mediaType: "video", filename: "two.mp4", metadata: { url: `http://127.0.0.1:${address.port}/two.mp4`, live: true, liveRoom: "room" } },
+  ]);
+  const items = db.listItems();
+  for (const item of items) db.setItemStatus(item.id, "queued");
+  const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+  try {
+    await waitFor(() => items.some((item) => db.getItem(item.id)?.status === "duplicate"), 15_000);
+    const states = items.map((item) => ({ id: item.id, status: db.getItem(item.id)?.status, duplicateOf: db.getItem(item.id)?.duplicateOf }));
+    const duplicate = states.find((state) => state.status === "duplicate");
+    const capturing = states.find((state) => state.status === "downloading");
+    expect(capturing).toBeDefined();
+    // The newcomer points at the capture it would have duplicated, so the Activity page can say why.
+    expect(duplicate?.duplicateOf).toBe(capturing?.id);
+    // And nothing was asked of the provider on its behalf: the refusal happens before any fetch.
+    // The capture that *was* allowed gets its request in, and then must stay alone -- one room, one
+    // stream being read.
+    await waitFor(() => hits.length === 1, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(hits).toHaveLength(1);
+  } finally {
+    queue.stop();
+    (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+    server.close();
+  }
+});
+
 it("moves a tiny auto-ended live recording to recovery as a fragment (C3)", async () => {
   const dataDir = temp("easyx-fragment-data"); const mediaDir = temp("easyx-fragment-media"); const pluginDir = temp("easyx-fragment-plugins");
   const releases: Array<() => void> = [];

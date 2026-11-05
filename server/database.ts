@@ -892,11 +892,6 @@ export class Database {
     return row ? this.mapItem(row) : undefined;
   }
 
-  // The live capture that is already in flight for a source, if any. One broadcast can be
-  // reached from two entry points (the recorder, and a scraper that lists the live stream as
-  // media), and two ffmpeg captures of one room fight over the same viewer session, the same
-  // CPU and the same disk budget until both die. Callers that would open or create a live
-  // capture consult this first, so the room only ever has one capture in flight.
   /**
    * Record that the capture process for a live item has ended, while the item is still being
    * packaged (concat, TS remux, re-encode).
@@ -912,6 +907,19 @@ export class Database {
     this.sqlite.prepare("UPDATE items SET capture_ended_at=COALESCE(capture_ended_at,?),updated_at=? WHERE id=?").run(stamp, stamp, itemId);
   }
 
+  /**
+   * The live capture already in flight for a source, if any.
+   *
+   * One broadcast can be reached from two entry points -- the recorder, and a scraper that lists
+   * the live stream as media -- and two ffmpeg captures of one room fight over the same viewer
+   * session, the same CPU and the same disk budget until both die. `capture_ended_at IS NULL` is
+   * part of the test, not an afterthought: a live item stays `downloading` while it is packaged
+   * (concat, remux, faststart), and during that stretch it no longer occupies the broadcast.
+   *
+   * Every caller that would open a capture consults this first: `live-cams.record()` returns the
+   * capture already running instead of creating a second, the download queue closes the newcomer
+   * as `duplicate`, and a plugin scan defers while its room is being captured.
+   */
   activeLiveItemForSource(sourceId: string, exceptItemId?: string): DownloadItem | undefined {
     const row = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND id<>? AND is_live=1
       AND status IN ('queued','downloading','paused','stopping','cancelling') AND capture_ended_at IS NULL ORDER BY created_at LIMIT 1`)
