@@ -1,5 +1,6 @@
 import { concurrentDownloads } from "./download-limits.js";
 import { validMediaDate } from "../packages/media-date.js";
+import { shortfallReason, type ShortfallFacts } from "../packages/capture-shortfall.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -1165,11 +1166,13 @@ export class DownloadQueue {
         }
       }
 
-      // Truncation check: the fragment bound above is only a floor, so a capture that
-      // silently fell behind (3 recorded minutes of a 30-minute broadcast) still entered
-      // the library looking healthy. Compare the real media duration against the wall
-      // clock the capture session ran for; a large shortfall stays in the library but is
-      // flagged (visible in the UI) and logged instead of being silently accepted.
+      // Truncation checks, in two shapes: the whole capture fell behind the wall clock, or the
+      // picture stopped while the audio kept encoding. Both used to flag the item in metadata and
+      // then file it as `completed` like any healthy capture -- and nothing ever read those flags,
+      // so an 18-second clip of a 292-second broadcast entered the library looking perfect. The
+      // facts are collected here and recorded once, in words, so the Activity page and the library
+      // card can say what happened instead of showing a healthy recording.
+      const shortfall: ShortfallFacts = {};
       if (item.mediaType === "video" && item.metadata.live === true && !control.manualStop) {
         // Re-read from the DB: the in-memory row was fetched before setItemStatus stamped
         // download_started_at, and scheduleRetry re-stamps it per attempt.
@@ -1182,6 +1185,7 @@ export class DownloadQueue {
             if (actualSec > 0 && actualSec < expectedSec * 0.8) {
               this.db.setItemMetadata(item.id, { truncated: true, expectedDurationSec: Math.round(expectedSec), actualDurationSec: Math.round(actualSec) });
               this.writeLog?.("warn", "download", `Live recording looks truncated: captured ${Math.round(actualSec)}s of a ${Math.round(expectedSec)}s session`, { itemId: item.id, expectedSec: Math.round(expectedSec), actualSec: Math.round(actualSec) });
+              Object.assign(shortfall, { expectedSec, actualSec });
             }
           } catch { /* Best-effort: a failed probe must never fail the finalize. */ }
         }
@@ -1202,8 +1206,15 @@ export class DownloadQueue {
           if (tracks.container >= 120 && tracks.video > 0 && tracks.video < tracks.container * 0.9) {
             this.db.setItemMetadata(item.id, { videoTruncated: true, containerDurationSec: Math.round(tracks.container), videoTrackSec: Math.round(tracks.video) });
             this.writeLog?.("warn", "download", `Live recording keeps its picture for only ${Math.round(tracks.video)}s of ${Math.round(tracks.container)}s: the video track stopped while the audio kept recording`, { itemId: item.id, containerSec: Math.round(tracks.container), videoTrackSec: Math.round(tracks.video), videoFrames: tracks.frames });
+            Object.assign(shortfall, { containerSec: tracks.container, videoSec: tracks.video });
           }
         } catch { /* Best-effort: a failed probe must never fail the finalize. */ }
+      }
+
+      const reason = shortfallReason(shortfall);
+      if (reason) {
+        this.db.setItemMetadata(item.id, { incomplete: true, incompleteReason: reason });
+        this.writeLog?.("warn", "download", `Live recording filed as incomplete: ${reason}`, { itemId: item.id, shortfall: reason });
       }
 
       await this.withFinalizeLock(`output:${item.id}`, async () => {

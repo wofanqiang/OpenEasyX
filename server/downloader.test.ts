@@ -963,6 +963,10 @@ describe("live recording completeness gates", () => {
     expect(metadata.truncated).toBe(true);
     expect(metadata.expectedDurationSec).toBeGreaterThanOrEqual(590);
     expect(metadata.actualDurationSec).toBeLessThanOrEqual(5);
+    // The shortfall is what the Activity page and the library card read. The file stays catalogued
+    // and playable -- it is real footage -- but it must not read as a finished capture.
+    expect(metadata.incomplete).toBe(true);
+    expect(String(metadata.incompleteReason)).toMatch(/captured \d+s of a \d+s session/);
   });
 
   it("does not flag a capture whose duration matches the wall clock", async () => {
@@ -988,6 +992,7 @@ describe("live recording completeness gates", () => {
     queue.stop();
     const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
     expect(metadata.truncated).toBeUndefined();
+    expect(metadata.incomplete).toBeUndefined();
     // Deliberately below the two-minute floor of the video-track check: the ratio between the two
     // tracks says nothing useful on a capture this short, so it is not judged at all.
     expect(metadata.videoTruncated).toBeUndefined();
@@ -1025,6 +1030,10 @@ describe("live recording completeness gates", () => {
     // honest, so even that sees nothing wrong.
     expect(fs.existsSync(path.join(mediaDir, "VTrack Performer", "example.test", "live.mp4"))).toBe(true);
     expect(metadata.truncated).toBeUndefined();
+    // The container is honest, so the wall-clock gate stays quiet -- which is exactly why the
+    // marker has to be set from the track measurement, or this capture files as healthy.
+    expect(metadata.incomplete).toBe(true);
+    expect(String(metadata.incompleteReason)).toMatch(/^picture stopped at \d+s of \d+s$/);
   });
 });
 

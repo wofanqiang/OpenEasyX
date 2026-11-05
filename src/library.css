@@ -178,3 +178,7 @@
 
 /* A leftovers-only row names the salvages it holds; truncating them would hide the point. */
 .media-copy p.leftover-line{white-space:normal;overflow-wrap:anywhere;color:#c09a5a}
+
+/* A recording that fell short of its session keeps its card -- the footage is real and plays -- but
+   the poster says so, because a card that looks complete is how a 18-second clip passes for one. */
+.poster .short-capture{position:absolute;left:9px;bottom:8px;z-index:3;background:rgba(120,58,10,.92);color:#ffd9a3;border-radius:5px;padding:4px 6px;font-size:8px;font-weight:800;letter-spacing:.04em;text-transform:uppercase}

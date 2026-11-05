@@ -10,6 +10,18 @@ export function confirmItemDeletion(status: string, confirm: (message: string) =
   return status !== "completed" || confirm(COMPLETED_DELETE_CONFIRMATION);
 }
 
+/**
+ * The reason a capture was filed while its content fell short of the session, if the recorder wrote
+ * one. Kept here rather than inline in the row so the "no metadata / not flagged / flag without a
+ * reason" cases can be tested without rendering the page.
+ */
+export function incompleteOf(item: { metadata?: Record<string, unknown> }): string | undefined {
+  const metadata = item.metadata;
+  if (!metadata || metadata.incomplete !== true) return undefined;
+  const reason = metadata.incompleteReason;
+  return typeof reason === "string" && reason.trim() ? reason : "it ended before the session did";
+}
+
 export function activitySourceDomains(sources: Array<{ domain: string }>): string[] {
   return [...new Set(sources.map((source) => source.domain.trim().toLowerCase()).filter(Boolean))]
     .sort((left, right) => left.localeCompare(right));

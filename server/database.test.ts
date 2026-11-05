@@ -324,6 +324,62 @@ describe("Database", () => {
     expect(third.mediaTypes).toEqual(["image", "video"]);
   });
 
+  it("carries a short capture's reason into the library metadata", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
+    const db = new Database(dir);
+    const person = db.createPerformer({ name: "Short Creator" });
+    const source = db.addSource(person.id, "plugin.one", { externalId: "short", label: "Feed", profileUrl: "https://example.test", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "s1", title: "Short", mediaType: "video", metadata: { live: true } }]);
+    const item = db.listItems(10)[0];
+    db.setItemStatus(item.id, "completed", { storagePath: "Short Creator/example.test/short.mp4" });
+    db.setItemMetadata(item.id, { incomplete: true, incompleteReason: "captured 18s of a 292s session" });
+
+    // The library scan merges this into media.metadata_json, which is where a card reads it: a
+    // capture that fell short has to arrive in the library saying so, not looking finished.
+    expect(db.storedMediaMetadata("Short Creator/example.test/short.mp4"))
+      .toMatchObject({ incomplete: true, incompleteReason: "captured 18s of a 292s session" });
+    db.close();
+  });
+
+  it("gives the recordings already on disk a name for their shortfall", () => {
+    // Before the marker existed a short capture was flagged with `truncated` and filed as
+    // `completed`, and nothing read the flag -- so the recordings already in the library kept
+    // looking finished. Booting promotes those flags, which is what makes the fix apply to them and
+    // not only to the next recording.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
+    const first = new Database(dir);
+    const person = first.createPerformer({ name: "Old Short" });
+    const source = first.addSource(person.id, "plugin.one", { externalId: "old", label: "Feed", profileUrl: "https://example.test", domain: "example.test" });
+    first.ingestItems(source, [{ externalId: "o1", title: "Old", mediaType: "video", metadata: { live: true } }]);
+    const item = first.listItems(10)[0];
+    first.setItemStatus(item.id, "completed", { storagePath: "Old Short/example.test/old.mp4" });
+    first.setItemMetadata(item.id, { truncated: true, expectedDurationSec: 292, actualDurationSec: 18 });
+    first.close();
+
+    const second = new Database(dir);
+    const metadata = second.getItem(item.id)?.metadata as Record<string, unknown>;
+    expect(metadata.incomplete).toBe(true);
+    expect(metadata.incompleteReason).toBe("captured 18s of a 292s session");
+    // The original flags stay: they are what said *which* check fired.
+    expect(metadata.truncated).toBe(true);
+    second.close();
+  });
+
+  it("leaves a healthy recording unflagged on boot", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
+    const first = new Database(dir);
+    const person = first.createPerformer({ name: "Fine" });
+    const source = first.addSource(person.id, "plugin.one", { externalId: "fine", label: "Feed", profileUrl: "https://example.test", domain: "example.test" });
+    first.ingestItems(source, [{ externalId: "f1", title: "Fine", mediaType: "video", metadata: { live: true } }]);
+    const item = first.listItems(10)[0];
+    first.setItemStatus(item.id, "completed", { storagePath: "Fine/example.test/fine.mp4" });
+    first.close();
+
+    const second = new Database(dir);
+    expect((second.getItem(item.id)?.metadata as Record<string, unknown>).incomplete).toBeUndefined();
+    second.close();
+  });
+
   it("resolves a stored media file through an index instead of scanning items", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-test-")); dirs.push(dir);
     const db = new Database(dir);

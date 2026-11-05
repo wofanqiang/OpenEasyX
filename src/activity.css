@@ -156,3 +156,7 @@
     min-width: 980px;
   }
 }
+
+/* A capture the recorder filed while its content fell short of the session: the row stays a
+   finished download (the file is catalogued and plays), but the badge says what it really is. */
+.activity-status .badge.incomplete { color: #ffca67; background: rgba(255, 190, 70, .1); }

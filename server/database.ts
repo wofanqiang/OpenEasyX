@@ -1,6 +1,7 @@
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
+import { shortfallReason } from "../packages/capture-shortfall.js";
 import { asJson, id, now, safeSegment } from "./utils.js";
 import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packages/plugin-sdk/index.js";
 import { firstMediaDate, oldestMediaDate, validMediaDate } from "../packages/media-date.js";
@@ -198,6 +199,27 @@ export class Database {
       this.sqlite.exec("ALTER TABLE items ADD COLUMN is_live INTEGER NOT NULL DEFAULT 0");
       this.sqlite.exec("UPDATE items SET is_live=1 WHERE json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.live')=1");
     }
+    // Recordings filed before a shortfall had a name carry `truncated`/`videoTruncated` and nothing
+    // ever read them, so they sit in the library looking complete. Promote those flags to the marker
+    // the Activity page and the card show, which is also what makes the recordings already on disk
+    // visible instead of only the ones recorded from now on. Runs once: the promoted rows stop
+    // matching the query.
+    const unnamedShortfall = this.sqlite.prepare(`SELECT id,metadata_json FROM items WHERE
+      (json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.truncated')=1
+        OR json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.videoTruncated')=1)
+      AND json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.incomplete') IS NULL`).all() as Array<{ id: string; metadata_json: string }>;
+    for (const row of unnamedShortfall) {
+      try {
+        const stored = JSON.parse(row.metadata_json) as Record<string, unknown>;
+        const reason = shortfallReason({
+          expectedSec: typeof stored.expectedDurationSec === "number" ? stored.expectedDurationSec : undefined,
+          actualSec: typeof stored.actualDurationSec === "number" ? stored.actualDurationSec : undefined,
+          containerSec: typeof stored.containerDurationSec === "number" ? stored.containerDurationSec : undefined,
+          videoSec: typeof stored.videoTrackSec === "number" ? stored.videoTrackSec : undefined,
+        });
+        if (reason) this.setItemMetadata(row.id, { incomplete: true, incompleteReason: reason });
+      } catch { /* A row whose metadata will not parse stays as it is; a repair must not block boot. */ }
+    }
     // storedMediaMetadata matches items by their storage path with the separator normalised, which
     // wraps the column in replace() and therefore defeats every index on storage_path -- a library
     // scan ran one full table scan per media file (O(files x items)). A generated column keeps the
@@ -287,11 +309,17 @@ export class Database {
     this.storedMediaStmt ??= this.sqlite.prepare(STORED_MEDIA_SQL);
     const row = this.storedMediaStmt.get(normalized) as any;
     if (!row) return {};
-    const live = asJson<Record<string, unknown>>(row.metadata_json, {}).live === true;
+    const stored = asJson<Record<string, unknown>>(row.metadata_json, {});
+    const live = stored.live === true;
     const recordedAt = live ? firstMediaDate(row.download_started_at, row.created_at) : undefined;
     const publishedAt = live ? recordedAt : validMediaDate(row.published_at);
+    // A capture that was filed while its content fell short is carried into the library with the
+    // reason attached: the file stays catalogued and playable (it is real footage), but a card that
+    // silently looks like a complete recording is how a 18-second clip passes for a finished one.
+    const incompleteReason = stored.incomplete === true && typeof stored.incompleteReason === "string" ? stored.incompleteReason : undefined;
     return { performer: row.performer, source: row.source, ...(row.title ? { title: row.title } : {}),
       live, ...(recordedAt ? { recordedAt } : {}), ...(publishedAt ? { publishedAt } : {}),
+      ...(incompleteReason ? { incomplete: true, incompleteReason } : {}),
       downloadedAt: firstMediaDate(row.download_started_at, row.created_at) };
   }
 

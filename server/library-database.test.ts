@@ -402,3 +402,32 @@ describe("media catalog", () => {
     db.close();
   });
 });
+
+describe("incomplete recordings", () => {
+  // A capture that fell short of its session keeps its file (it is real footage and it plays), so
+  // the library has to say what it is on the record the cards read. Otherwise an 18-second clip of
+  // a five-minute broadcast looks exactly like a finished recording.
+  const row = (overrides: Partial<Parameters<LibraryDatabase["upsertMedia"]>[0]> = {}) => ({
+    id: "m-short", relativePath: "Example Performer/example.com/live.mp4", kind: "video" as const, title: "live",
+    performer: "Example Performer", source: "example.com", extension: ".mp4", mimeType: "video/mp4",
+    size: 1024, modifiedAt: "2026-11-05T00:00:00.000Z", addedAt: "2026-11-05T00:00:00.000Z",
+    duration: 0, width: 0, height: 0, scanId: "scan-1", metadata: {} as Record<string, unknown>,
+    ...overrides,
+  });
+
+  it("surfaces the reason the recorder wrote", () => {
+    const { db } = fixture();
+    db.upsertMedia(row({ metadata: { live: true, incomplete: true, incompleteReason: "captured 18s of a 292s session" } }));
+    expect(db.getMedia("m-short")).toMatchObject({ incomplete: true, incompleteReason: "captured 18s of a 292s session" });
+    db.close();
+  });
+
+  it("says nothing about a recording that ran its course", () => {
+    const { db } = fixture();
+    db.upsertMedia(row({ metadata: { live: true } }));
+    const stored = db.getMedia("m-short");
+    expect(stored?.incomplete).toBeUndefined();
+    expect(stored?.incompleteReason).toBeUndefined();
+    db.close();
+  });
+});

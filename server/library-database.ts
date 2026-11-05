@@ -26,6 +26,14 @@ export type Media = {
   completed: boolean;
   viewCount: number;
   lastViewedAt?: string;
+  /**
+   * Set when the recording behind this file fell short of the session it was capturing (a capture
+   * that fell behind the wall clock, or one whose picture stopped while the audio kept encoding).
+   * The file is still real footage and stays playable; the flag is what stops a card from looking
+   * like a complete recording.
+   */
+  incomplete?: boolean;
+  incompleteReason?: string;
 };
 
 export type LibraryQuery = {
@@ -291,6 +299,7 @@ export class LibraryDatabase {
       width: Number(row.width), height: Number(row.height), favorite: !!row.favorite,
       progressSeconds: Number(row.progress_seconds), completed: !!row.completed, viewCount: Number(row.view_count),
       lastViewedAt: row.last_viewed_at ? String(row.last_viewed_at) : undefined,
+      ...incompleteMarker(row.metadata_json),
     };
   }
 
@@ -554,5 +563,22 @@ export class LibraryDatabase {
       counts: { total: Number(counts.total ?? 0), complete: Number(counts.complete ?? 0), pending: Number(counts.pending ?? 0), errors: Number(counts.errors ?? 0) },
       worker,
     };
+  }
+}
+
+/**
+ * Read the recorder's "this capture fell short" marker out of a media row.
+ *
+ * The scan copies it into `media.metadata_json` (see `storedMediaMetadata`), so the reason reaches
+ * the library without a second query against the items table -- and without a schema change for a
+ * fact that belongs to one file, not to the library's shape.
+ */
+function incompleteMarker(value: unknown): { incomplete?: boolean; incompleteReason?: string } {
+  try {
+    const metadata = JSON.parse(typeof value === "string" ? value : "{}") as Record<string, unknown>;
+    if (metadata.incomplete !== true) return {};
+    return { incomplete: true, incompleteReason: typeof metadata.incompleteReason === "string" ? metadata.incompleteReason : "" };
+  } catch {
+    return {};
   }
 }
