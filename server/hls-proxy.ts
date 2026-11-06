@@ -58,14 +58,18 @@ const DEFAULT_REJECT_BACKOFF_MS = 5_000;
 /** Statuses that mean "no" rather than "not now": a 5xx or a dropped connection is worth retrying. */
 const REJECT_STATUSES = new Set([403, 410, 429]);
 /**
- * How long one re-resolve may take before another is attempted, and how long the proxy keeps
+ * How long one stream waits before another re-resolve may start, and how long the proxy keeps
  * answering from memory while it runs.
  *
- * The refresher is the provider's extractor (yt-dlp for Chaturbate), which takes seconds and
- * costs a process. A refusal storm must not turn into a spawn storm, and the CDN that just said
- * no must not be asked again while the new address is on its way.
+ * The refresher is the provider's extractor (yt-dlp for Chaturbate), which costs a process and
+ * takes seconds. Only playlists start one now, and a failed one leaves every entry answering from
+ * memory for `REFRESH_MEMORY_MS`, so the cooldown only has to stop one burst of reloads from
+ * spawning several extractors. It must stay well inside `PLAYLIST_WAIT_MS`: a playlist that
+ * arrives during the cooldown waits it out and then retries rather than being answered 403 with no
+ * repair at all. At 30 s it used to outlast the recorder's 15 s read timeout, so a failed
+ * re-resolve made every following refusal in that half-minute fatal.
  */
-const REFRESH_COOLDOWN_MS = 30_000;
+const REFRESH_COOLDOWN_MS = 3_000;
 const REFRESH_MEMORY_MS = 30_000;
 /**
  * How long a refused playlist may be held open while the re-resolve runs.
@@ -193,11 +197,21 @@ export class HlsProxy {
    * on a CDN that just said no. The refresh lands on the entries it belongs to, so the recorder
    * keeps polling the same URL and simply gets the new address behind it.
    */
-  private beginRefresh(entry: ProxyEntry, log?: (message: string) => void) {
+  private beginRefresh(entry: ProxyEntry, log?: (message: string) => void, ignoreCooldown = false) {
     const refresher = entry.refresher;
-    if (!refresher) return;
-    if (refresher.pending) return;
-    if (refresher.lastAt !== undefined && Date.now() - refresher.lastAt < REFRESH_COOLDOWN_MS) return;
+    if (!refresher) {
+      log?.("live proxy: this entry has no re-resolver, so a refused playlist cannot be repaired");
+      return;
+    }
+    if (refresher.pending) {
+      log?.("live proxy: a re-resolve is already in flight for this stream");
+      return;
+    }
+    const elapsed = refresher.lastAt === undefined ? Number.POSITIVE_INFINITY : Date.now() - refresher.lastAt;
+    if (!ignoreCooldown && elapsed < REFRESH_COOLDOWN_MS) {
+      log?.(`live proxy: re-resolve is cooling down (${Math.round(REFRESH_COOLDOWN_MS - elapsed)}ms left)`);
+      return;
+    }
     refresher.lastAt = Date.now();
     for (const target of refresher.entries) {
       target.reject = { status: target.reject?.status ?? 403, until: Date.now() + REFRESH_MEMORY_MS };
@@ -208,7 +222,10 @@ export class HlsProxy {
         return undefined;
       })
       .then((fresh) => {
-        if (!fresh) return undefined;
+        if (!fresh) {
+          log?.("live proxy: the re-resolve produced no address");
+          return undefined;
+        }
         let moved = 0;
         for (const target of refresher.entries) {
           const next = target.slot === "audio" ? fresh.audioUrl : fresh.url;
@@ -246,19 +263,43 @@ export class HlsProxy {
    *
    * `beginRefresh` runs in the background, so without this the refusal it is repairing gets
    * answered while the repair is still on its way -- and a refused playlist is fatal, so the
-   * capture dies in the gap. Bounded twice: by the refresh itself (a provider that cannot mint a
-   * new address has to fail fast, or every playlist request would sit out the full timeout) and
-   * by `PLAYLIST_WAIT_MS`.
+   * capture dies in the gap. Bounded by the refresh itself and by `PLAYLIST_WAIT_MS`, including
+   * any time spent waiting out a cooldown. Every exit says why, because a swallowed re-resolve
+   * used to leave no trace at all in the logs.
    */
   private async awaitRefresh(entry: ProxyEntry, log?: (message: string) => void): Promise<boolean> {
-    const pending = entry.refresher?.pending;
-    if (!pending) return false;
+    const refresher = entry.refresher;
+    if (!refresher) {
+      log?.("live proxy: no re-resolver on this entry, answering the refusal");
+      return false;
+    }
+    let pending = refresher.pending;
+    let waited = 0;
+    if (!pending && refresher.lastAt !== undefined) {
+      const remaining = REFRESH_COOLDOWN_MS - (Date.now() - refresher.lastAt);
+      if (remaining > 0) {
+        // A playlist refused just after a successful re-resolve used to be answered 403 at once:
+        // the cooldown blocked a new refresh and there was nothing in flight to wait for. Wait the
+        // short cooldown out and start one, so the refusal still gets a repair attempt.
+        log?.(`live proxy: waiting ${Math.round(remaining)}ms out the re-resolve cooldown`);
+        await new Promise<void>((resolve) => { setTimeout(resolve, remaining); });
+        waited = remaining;
+        // The cooldown has just been waited out. Force the start rather than racing the last
+        // millisecond of the clock, which would leave the request with nothing in flight.
+        this.beginRefresh(entry, log, true);
+        pending = refresher.pending;
+      }
+    }
+    if (!pending) {
+      log?.("live proxy: no re-resolve is in flight, answering the refusal");
+      return false;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const waitedTooLong = await Promise.race([
       // A failed refresh is caught inside `beginRefresh`; a throwing `.then` is not, so treat both
       // as "nothing arrived" rather than letting the proxy throw on a refusal.
       pending.then(() => false, () => false),
-      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), PLAYLIST_WAIT_MS); timer.unref?.(); }),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(true), Math.max(1, PLAYLIST_WAIT_MS - waited)); timer.unref?.(); }),
     ]);
     if (timer) clearTimeout(timer);
     if (waitedTooLong) {
@@ -266,7 +307,9 @@ export class HlsProxy {
       return false;
     }
     // A refresh that produced nothing leaves the verdict in place; one that succeeded clears it.
-    return !(entry.reject !== undefined && entry.reject.until > Date.now());
+    const rejected = entry.reject !== undefined && entry.reject.until > Date.now();
+    if (rejected) log?.("live proxy: the re-resolve produced no usable address, answering the refusal");
+    return !rejected;
   }
 
   /**

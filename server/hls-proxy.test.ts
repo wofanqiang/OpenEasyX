@@ -482,4 +482,59 @@ describe("hls proxy re-resolves a refused stream", () => {
     expect(reply.status()).toBe(403);
     expect(elapsed).toBeLessThan(1000);
   });
+
+  it("waits out the refresh cooldown instead of answering a second refusal with 403", async () => {
+    // A successful re-resolve clears the refusal memory, so a playlist refused a moment later used
+    // to hit the (30 s) cooldown: no refresh was in flight, `awaitRefresh` found nothing to wait
+    // for, and the proxy answered 403 at once. The recorder died on a broadcast that never stopped.
+    let reads = 0;
+    const request = vi.fn(async () => {
+      reads += 1;
+      // old refused -> fresh address works -> fresh address refused -> next address works
+      return reads === 1 || reads === 3 ? new Response("no", { status: 403 }) : playlist();
+    }) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    const addresses = ["https://cdn.test/new1.m3u8", "https://cdn.test/new2.m3u8"];
+    const refresh = vi.fn(async () => ({ url: addresses[refresh.mock.calls.length - 1] ?? addresses[1], headers: {} }));
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+
+    const first = stubReply();
+    await proxy.serve(token, first.reply);
+    expect(first.status()).toBe(200);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    // Refused again on the freshly installed address, still inside the cooldown.
+    const second = stubReply();
+    await proxy.serve(token, second.reply);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(second.status()).toBe(200);
+  }, 15_000);
+
+  it("says why a refusal was answered instead of repaired", async () => {
+    // A re-resolve that returns nothing used to be completely silent: the logs showed only the
+    // 403, with no way to tell a dead room from a broken resolver.
+    const logs: string[] = [];
+    const request = vi.fn(async () => new Response("no", { status: 403 })) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    const refresh = vi.fn(async () => undefined);
+    const token = proxy.register({ url: "https://cdn.test/old.m3u8" }, refresh).slice(LIVE_PROXY_PREFIX.length);
+    const reply = stubReply();
+    await proxy.serve(token, reply.reply, {}, undefined, (message) => logs.push(message));
+    expect(reply.status()).toBe(403);
+    expect(logs).toContain("live proxy: the re-resolve produced no address");
+    expect(logs.join("\n")).toContain("no usable address");
+  });
+
+  it("says when an entry has no re-resolver at all", async () => {
+    // The player registers streams without a refresher; a refusal there must not look like a
+    // silent failure of the recorder's repair path.
+    const logs: string[] = [];
+    const request = vi.fn(async () => new Response("no", { status: 403 })) as unknown as typeof fetch;
+    const proxy = new HlsProxy(request, undefined, 0);
+    const token = proxy.register({ url: "https://cdn.test/player.m3u8" }).slice(LIVE_PROXY_PREFIX.length);
+    const reply = stubReply();
+    await proxy.serve(token, reply.reply, {}, undefined, (message) => logs.push(message));
+    expect(reply.status()).toBe(403);
+    expect(logs.join("\n")).toContain("no re-resolver");
+  });
 });

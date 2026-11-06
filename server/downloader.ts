@@ -923,7 +923,14 @@ export class DownloadQueue {
       const refreshStream = resolveLiveStream && refreshPageUrl
         ? async () => {
             try { return await resolveLiveStream(context, liveCamFor(candidate, refreshPageUrl, recordingMaxHeight)); }
-            catch { return undefined; }
+            catch (error) {
+              // A failed re-resolve used to be swallowed into `undefined` with no trace anywhere:
+              // the proxy then answered the playlist 403 and the capture died, with no way to tell
+              // a dead room from a broken resolver. Say which item and why before giving up.
+              this.writeLog?.("warn", "download", "Live stream re-resolve failed; the proxy will answer the refusal",
+                { itemId: item.id, error: error instanceof Error ? error.message : String(error) });
+              return undefined;
+            }
           }
         : undefined;
       const request = (await liveRecordingRequest(plugin, context, candidate, (stream) => this.recordThroughProxy(stream, captureInput, refreshStream), recordingMaxHeight))
