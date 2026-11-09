@@ -9,7 +9,7 @@ import { PluginManager } from "./plugin-manager.js";
 import {
 
   LIVE_SESSION_DEFAULTS, liveRoomOf, planSessions, probeSignature, sessionCandidates, spliceLiveSessions,
-  type LiveSessionOptions, type MediaSignature, type SessionCandidate,
+  type LiveSessionOptions, type MediaSignature, type SessionCandidate, type SessionGroup,
   cleanupSessionArtifacts,
 
 } from "./live-sessions.js";
@@ -107,6 +107,24 @@ describe("live session basics", () => {
     expect(candidates[0].file).toBe(path.join(library.mediaDir, "alice", "one.mp4"));
   });
 
+  it("marks an incomplete capture so a splice cannot hide its gap", () => {
+    const library = seedLibrary();
+    const healthy = addCapture(library, { externalId: "auto-live:alice:1", startedAt: at(0), finishedAt: at(4), relativePath: "alice/one.mp4" });
+    const short = addCapture(library, { externalId: "auto-live:alice:2", startedAt: at(6), finishedAt: at(10), relativePath: "alice/two.mp4" });
+    const oldContainer = addCapture(library, { externalId: "auto-live:alice:3", startedAt: at(12), finishedAt: at(16), relativePath: "alice/three.mp4" });
+    const oldPicture = addCapture(library, { externalId: "auto-live:alice:4", startedAt: at(18), finishedAt: at(22), relativePath: "alice/four.mp4" });
+    library.db.setItemMetadata(short.id, { incomplete: true, incompleteReason: "captured 18s of a 292s session" });
+    library.db.setItemMetadata(oldContainer.id, { truncated: true, expectedDurationSec: 292, actualDurationSec: 18 });
+    library.db.setItemMetadata(oldPicture.id, { videoTruncated: true, containerDurationSec: 118, videoTrackSec: 42 });
+
+    const candidates = sessionCandidates(library.db.listLiveItems(["completed"]), library.mediaDir);
+    const byId = new Map(candidates.map((entry) => [entry.id, entry]));
+    expect(byId.get(healthy.id)?.incomplete).toBe(false);
+    expect(byId.get(short.id)?.incomplete).toBe(true);
+    expect(byId.get(oldContainer.id)?.incomplete).toBe(true);
+    expect(byId.get(oldPicture.id)?.incomplete).toBe(true);
+  });
+
   it("measures a real file and refuses to measure a missing one", async () => {
     const library = seedLibrary();
     const absolute = path.join(library.mediaDir, "alice", "one.mp4");
@@ -173,6 +191,27 @@ describe("planSessions", () => {
       candidate("early-1", 0, 4, "chat.test:early"), candidate("early-2", 6, 4, "chat.test:early"),
     ], noRooms, OPTIONS, BASE + 900 * 60_000);
     expect(groups.map((group) => group.roomKey)).toEqual(["chat.test:early", "chat.test:late"]);
+  });
+
+  it("holds back the whole broadcast when one of its captures is incomplete", () => {
+    // Dropping only the bad segment would fold the healthy ones around a missing stretch, which
+    // is exactly the illusion this guard exists to prevent.
+    const segments = [candidate("a", 0), candidate("b", 6), { ...candidate("c", 12), incomplete: true }];
+    const held: SessionGroup[] = [];
+    const groups = planSessions(segments, noRooms, OPTIONS, BASE + 60 * 60_000, held);
+    expect(groups).toHaveLength(0);
+    expect(held).toHaveLength(1);
+    expect(held[0].segments.map((segment) => segment.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("still folds a later healthy broadcast of the same room", () => {
+    const first = [candidate("a", 0), { ...candidate("b", 6), incomplete: true }];
+    const later = [candidate("c", 90), candidate("d", 96)];
+    const held: SessionGroup[] = [];
+    const groups = planSessions([...first, ...later], noRooms, OPTIONS, BASE + 180 * 60_000, held);
+    expect(held).toHaveLength(1);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].segments.map((segment) => segment.id)).toEqual(["c", "d"]);
   });
 
   it("counts captures that overlap rather than dropping them", () => {
@@ -383,6 +422,28 @@ describe("spliceLiveSessions", () => {
     expect(report.skipped[0].reason).toContain("missing or empty");
     expect(library.db.getItem(first.id)!.status).toBe("completed");
     expect(fs.readFileSync(path.join(library.mediaDir, "alice", "one.mp4"))).toEqual(before);
+  });
+
+  it("keeps every segment on disk when a broadcast contains an incomplete capture", async () => {
+    const library = seedLibrary();
+    const first = addCapture(library, { externalId: "auto-live:alice:1", startedAt: at(0), finishedAt: at(4), relativePath: "alice/one.mp4" });
+    const second = addCapture(library, { externalId: "auto-live:alice:2", startedAt: at(6), finishedAt: at(10), relativePath: "alice/two.mp4" });
+    library.db.setItemMetadata(second.id, { incomplete: true, incompleteReason: "captured 18s of a 292s session" });
+    const before = fs.readFileSync(path.join(library.mediaDir, "alice", "one.mp4"));
+
+    const report = await spliceLiveSessions({
+      db: library.db, mediaRoot: library.mediaDir,
+      concat: async () => { throw new Error("must not run"); },
+      freeSpace: async () => 100 * 1024 ** 3,
+      probe: async () => ({ duration: 240, signature: "audio:aac,video:h264" }),
+      now: () => BASE + 60 * 60_000,
+    });
+
+    expect(report).toMatchObject({ groups: 0, spliced: 0, failed: [] });
+    expect(report.skipped[0].reason).toContain("incomplete");
+    expect(fs.readdirSync(path.join(library.mediaDir, "alice")).sort()).toEqual(["one.mp4", "two.mp4"]);
+    expect(fs.readFileSync(path.join(library.mediaDir, "alice", "one.mp4"))).toEqual(before);
+    expect(library.db.getItem(first.id)!.status).toBe("completed");
   });
 
   it("does nothing while the room is still being recorded", async () => {

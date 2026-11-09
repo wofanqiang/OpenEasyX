@@ -73,6 +73,8 @@ export type SessionCandidate = {
   publishedAt?: string;
   startMs: number;
   endMs: number;
+  /** The recorder filed this capture as shorter than the broadcast it belongs to. */
+  incomplete?: boolean;
 };
 
 export type SessionGroup = { roomKey: string; segments: SessionCandidate[] };
@@ -125,7 +127,8 @@ export function sessionCandidates(rows: DownloadItem[], mediaRoot: string): Sess
   for (const item of rows) {
     if (item.status !== "completed" || !item.storagePath) continue;
     if (!item.externalId.startsWith("auto-live:")) continue;
-    if ((item.metadata as Record<string, unknown> | undefined)?.live !== true) continue;
+    const metadata = item.metadata as Record<string, unknown> | undefined;
+    if (metadata?.live !== true) continue;
     const room = liveRoomOf(item);
     if (!room) continue;
     const startMs = Date.parse(item.downloadStartedAt ?? item.publishedAt ?? "");
@@ -136,6 +139,10 @@ export function sessionCandidates(rows: DownloadItem[], mediaRoot: string): Sess
     candidates.push({
       id: item.id, roomKey: `${item.pluginId}:${room}`, file: path.join(mediaRoot, item.storagePath),
       publishedAt: item.publishedAt, startMs, endMs,
+      // The current marker plus the two legacy flags. Startup backfills the old ones into
+      // `incomplete`, but a row written before that migration -- or before the next restart --
+      // must not slip through a splice.
+      incomplete: metadata?.incomplete === true || metadata?.truncated === true || metadata?.videoTruncated === true,
     });
   }
   return candidates;
@@ -158,8 +165,11 @@ export function activeRoomKeys(rows: DownloadItem[]): Set<string> {
  * only when it is provably over -- quiet for the settle window, or long enough that waiting for
  * that much quiet would never come -- and only ever when the quiet already exceeds the join window,
  * which is what keeps the pass idempotent.
+ *
+ * `held`, when supplied, collects the eligible broadcasts that were NOT planned because one of
+ * their captures is incomplete, so the caller can report why they stay in segments.
  */
-export function planSessions(candidates: SessionCandidate[], activeRooms: ReadonlySet<string>, options: LiveSessionOptions, now: number): SessionGroup[] {
+export function planSessions(candidates: SessionCandidate[], activeRooms: ReadonlySet<string>, options: LiveSessionOptions, now: number, held?: SessionGroup[]): SessionGroup[] {
   const byRoom = new Map<string, SessionCandidate[]>();
   for (const candidate of candidates) {
     const list = byRoom.get(candidate.roomKey);
@@ -178,8 +188,14 @@ export function planSessions(candidates: SessionCandidate[], activeRooms: Readon
       const quietMs = now - openEnd;
       const settled = quietMs >= options.settleSeconds * 1000;
       const tooLong = open.length >= options.longBroadcastSegments;
-      if (open.length >= 2 && quietMs >= options.joinGapSeconds * 1000 && (settled || tooLong)) {
-        groups.push({ roomKey, segments: open });
+      const eligible = open.length >= 2 && quietMs >= options.joinGapSeconds * 1000 && (settled || tooLong);
+      if (eligible) {
+        // A capture the recorder filed as short is a HOLE in the broadcast. Folding the healthy
+        // pieces around it would present that hole as one continuous recording -- and the warning
+        // would disappear together with the original files. Keep the whole broadcast in segments,
+        // badge and all, so the gap stays visible; a later healthy broadcast is still folded.
+        if (open.some((segment) => segment.incomplete === true)) held?.push({ roomKey, segments: open });
+        else groups.push({ roomKey, segments: open });
       }
       open = [];
     };
@@ -401,8 +417,12 @@ export async function spliceLiveSessions(deps: LiveSessionDeps): Promise<SpliceR
   const rows = deps.db.listLiveItems([...ACTIVE_ITEM_STATUSES, "completed"]);
   const candidates = sessionCandidates(rows, deps.mediaRoot);
   if (candidates.length < 2) return report;
-  const groups = planSessions(candidates, activeRoomKeys(rows), options, now);
+  const held: SessionGroup[] = [];
+  const groups = planSessions(candidates, activeRoomKeys(rows), options, now, held);
   report.groups = groups.length;
+  for (const group of held) {
+    report.skipped.push({ roomKey: group.roomKey, reason: "one of its captures is incomplete; the broadcast stays in segments" });
+  }
 
   for (const group of groups.slice(0, Math.max(1, options.maxGroupsPerPass))) {
     try {
