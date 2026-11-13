@@ -1183,8 +1183,18 @@ export class DownloadQueue {
       if (item.mediaType === "video" && item.metadata.live === true && !control.manualStop) {
         // Re-read from the DB: the in-memory row was fetched before setItemStatus stamped
         // download_started_at, and scheduleRetry re-stamps it per attempt.
-        const startedAt = Date.parse(this.db.getItem(item.id)?.downloadStartedAt ?? "");
-        const expectedSec = Number.isFinite(startedAt) ? Math.max(0, (Date.now() - startedAt) / 1000) : 0;
+        const row = this.db.getItem(item.id);
+        const startedAt = Date.parse(row?.downloadStartedAt ?? "");
+        const endedAt = Date.parse(row?.captureEndedAt ?? "");
+        // The session ends when ffmpeg exits, not when finalize runs. The concat/remux -- and any
+        // time the post-process gate spent waiting on a loaded box -- happened off air, so folding
+        // it into the wall clock flagged complete short captures as truncated (measured: a median
+        // of 507s of post-processing on the 1-core box). markCaptureEnded() stamps the end before
+        // the fold-in starts, so it is already available here. Fall back to the old wall clock
+        // only when no capture end was recorded, e.g. a plugin that produced MP4 directly.
+        const captureWindow = Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt
+          ? (endedAt - startedAt) / 1000 : undefined;
+        const expectedSec = captureWindow ?? (Number.isFinite(startedAt) ? Math.max(0, (Date.now() - startedAt) / 1000) : 0);
         if (expectedSec >= 60) {
           try {
             const probe = await this.probeVideo(temporary);

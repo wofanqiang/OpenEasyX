@@ -983,6 +983,74 @@ describe("recording pool size", () => {
 });
 
 describe("live recording completeness gates", () => {
+  it("does not flag a complete capture whose finalize ran long after the capture ended", async () => {
+    const dataDir = temp("easyx-postwait-data"); const mediaDir = temp("easyx-postwait-media"); const pluginDir = temp("easyx-postwait-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    // A real 120s file, long enough for the wall-clock gate (>=60s) to actually run.
+    const clip = path.join(pluginDir, "clip.mp4");
+    execFileSync("ffmpeg", [
+      "-f", "lavfi", "-i", "testsrc=duration=120:size=64x64:rate=5",
+      "-f", "lavfi", "-i", "sine=frequency=1000:duration=120",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac",
+      "-shortest", "-y", clip,
+    ], { stdio: "ignore" });
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `
+      export default { manifest: { id: "test.postwait", name: "PostWait", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] },
+        async resolveDownload() { return { kind: "command", command: "ffmpeg", filename: "live.mp4", args: ["-y", "-v", "error", "-i", ${JSON.stringify(clip)}, "-c", "copy", "{output}"] }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.postwait", { installed: true, enabled: true });
+    db.updateSettings({ autoRecordMinBytes: 0 });
+    const person = db.upsertPerformer({ externalId: "person", name: "PostWait Performer" }, "test.postwait");
+    const source = db.addSource(person.id, "test.postwait", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", filename: "live.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    const sqlite = (db as unknown as { sqlite: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).sqlite;
+    // ffmpeg stopped after 125s, but finalize sees a 625s wall clock because the concat/remux
+    // waited on a loaded box. Only the 125s were ever on air.
+    const now = Date.now();
+    sqlite.prepare("UPDATE items SET download_started_at=?,capture_ended_at=? WHERE id=?")
+      .run(new Date(now - 625_000).toISOString(), new Date(now - 500_000).toISOString(), item.id);
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    await waitFor(() => db.getItem(item.id)?.status === "completed", 60_000);
+    queue.stop();
+    const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
+    expect(metadata.truncated).toBeUndefined();
+    expect(metadata.incomplete).toBeUndefined();
+    expect(metadata.videoTruncated).toBeUndefined();
+  });
+
+  it("still flags a short capture and measures it against the capture window, not the whole wait", async () => {
+    const dataDir = temp("easyx-shortwindow-data"); const mediaDir = temp("easyx-shortwindow-media"); const pluginDir = temp("easyx-shortwindow-plugins");
+    const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
+    const template = segmentTemplateBytes();
+    const templatePath = path.join(pluginDir, "template.ts"); fs.writeFileSync(templatePath, template);
+    fs.writeFileSync(path.join(packageDir, "index.mjs"), `
+      export default { manifest: { id: "test.shortwindow", name: "ShortWindow", version: "1", description: "Test", author: "Test", capabilities: ["download-resolver"] },
+        async resolveDownload() { return { kind: "command", command: "ffmpeg", filename: "live.mp4", args: ["-y", "-v", "error", "-i", ${JSON.stringify(templatePath)}, "-c", "copy", "{output}"] }; } };`);
+    const db = new Database(dataDir); const manager = new PluginManager(db, [pluginDir]); await manager.load();
+    db.setPluginState("test.shortwindow", { installed: true, enabled: true });
+    db.updateSettings({ autoRecordMinBytes: 0 });
+    const person = db.upsertPerformer({ externalId: "person", name: "ShortWindow Performer" }, "test.shortwindow");
+    const source = db.addSource(person.id, "test.shortwindow", { externalId: "source", label: "Source", profileUrl: "https://example.test/profile", domain: "example.test" });
+    db.ingestItems(source, [{ externalId: "live", mediaType: "video", filename: "live.mp4", metadata: { live: true } }]);
+    const item = db.listItems()[0]; db.setItemStatus(item.id, "queued");
+    const sqlite = (db as unknown as { sqlite: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).sqlite;
+    // Capture window 300s, wall clock 800s, file 0.5s: a real shortfall. The expected duration
+    // must describe the 300s the room was on air, not the 800s finalize happened to span.
+    const now = Date.now();
+    sqlite.prepare("UPDATE items SET download_started_at=?,capture_ended_at=? WHERE id=?")
+      .run(new Date(now - 800_000).toISOString(), new Date(now - 500_000).toISOString(), item.id);
+    const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
+    await waitFor(() => db.getItem(item.id)?.status === "completed", 20_000);
+    queue.stop();
+    const metadata = db.getItem(item.id)?.metadata as Record<string, unknown>;
+    expect(metadata.truncated).toBe(true);
+    expect(metadata.incomplete).toBe(true);
+    expect(Number(metadata.expectedDurationSec)).toBeGreaterThanOrEqual(295);
+    expect(Number(metadata.expectedDurationSec)).toBeLessThanOrEqual(305);
+    expect(Number(metadata.actualDurationSec)).toBeLessThanOrEqual(5);
+  });
+
   it("flags a live capture whose media duration fell far short of the wall clock", async () => {
     const dataDir = temp("easyx-trunc-data"); const mediaDir = temp("easyx-trunc-media"); const pluginDir = temp("easyx-trunc-plugins");
     const packageDir = path.join(pluginDir, "test"); fs.mkdirSync(packageDir);
